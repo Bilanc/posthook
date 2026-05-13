@@ -1,0 +1,19 @@
+README.md
+  s_0924b7ee8ce5f7::t_5532d76c279e85 1-187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "e9c06f1c398c8f9d07ad2ac0e4ba88f484e65af3",
+  "prompts": {},
+  "sessions": {
+    "s_0924b7ee8ce5f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6e12b988-fd8c-49a6-bd3c-12a2e4c16e9a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    }
+  }
+}
