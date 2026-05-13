@@ -1,0 +1,22 @@
+src/commands/metrics.ts
+  s_0924b7ee8ce5f7::t_f6110a9a421eea 4-300
+src/store.ts
+  s_0924b7ee8ce5f7::t_d6a8c7c14c73b3 119-188
+  s_0924b7ee8ce5f7::t_fe609fcf5ed9cc 3-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "b8716423b252d3ebd2fbb787b0555520549a37ef",
+  "prompts": {},
+  "sessions": {
+    "s_0924b7ee8ce5f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6e12b988-fd8c-49a6-bd3c-12a2e4c16e9a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    }
+  }
+}
