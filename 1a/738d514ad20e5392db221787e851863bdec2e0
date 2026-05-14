@@ -1,0 +1,34 @@
+src/cli.ts
+  s_47ed86d883587a::t_7c4085db75b2bc 127-129
+  s_47ed86d883587a::t_6d59d896ad6f91 31
+  s_47ed86d883587a::t_c910c6213fc7b8 3
+src/commands/dash.ts
+  s_47ed86d883587a::t_bf99aac1b05d3d 1-13
+src/commands/ingest.ts
+  s_47ed86d883587a::t_6992a03a4b59e5 79-82,85-89,91-106
+README.md
+  s_47ed86d883587a::t_36bce6bf159965 439
+  s_47ed86d883587a::t_5524291556309f 443-444
+src/store.ts
+  s_47ed86d883587a::t_f3700613fc78ba 39-41
+  s_47ed86d883587a::t_bd81357251d63b 153-163
+  s_47ed86d883587a::t_4fad2333442fc2 108
+  s_47ed86d883587a::t_4a0425dfe7576f 264-344,347-351,361,363
+  s_47ed86d883587a::t_b055bad1624ec4 345-346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "1a738d514ad20e5392db221787e851863bdec2e0",
+  "prompts": {},
+  "sessions": {
+    "s_47ed86d883587a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "32b30682-ad01-483f-a5e3-0cafa8ea7005",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    }
+  }
+}
