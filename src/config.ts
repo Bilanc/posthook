@@ -12,3 +12,8 @@ export const CURSOR_HOOKS_PATH = join(HOME, ".cursor", "hooks.json");
 export const CODEX_CONFIG_PATH = join(HOME, ".codex", "config.toml");
 
 export const POSTHOOK_MARKER = "posthook ingest";
+
+// Git Notes ref used to carry line attribution data with the repo. Notes are not pushed
+// by default; the post-commit hook self-configures push/fetch refspecs for this ref on
+// remote.origin so attribution travels with the code.
+export const NOTES_REF = "refs/notes/posthook";
