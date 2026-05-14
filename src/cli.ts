@@ -1,5 +1,6 @@
 import { parseArgs } from "node:util";
 import { runBlame } from "./commands/blame.ts";
+import { runDash } from "./commands/dash.ts";
 import { runIngest } from "./commands/ingest.ts";
 import { runInit } from "./commands/init.ts";
 import { runInspect } from "./commands/inspect.ts";
@@ -27,6 +28,7 @@ Usage:
                    [--session Z] \\
                    [--since ISO] \\
                    [--limit N]           Print recent raw event payloads (default 10)
+  posthook dash                          Open the web dashboard (coming soon)
   posthook help                          Show this message
 
 Environment:
@@ -122,6 +124,9 @@ export async function run(argv: string[]): Promise<void> {
       });
       return;
     }
+    case "dash":
+      await runDash();
+      return;
     default:
       process.stderr.write(`Unknown command: ${cmd}\n\n${HELP}`);
       process.exit(2);
