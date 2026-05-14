@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   branch TEXT,
   cwd TEXT,
   started_at TEXT NOT NULL,
-  ended_at TEXT
+  ended_at TEXT,
+  engineer_email TEXT,
+  engineer_name TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_org_started ON sessions(org_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_slug);
@@ -103,7 +105,7 @@ CREATE INDEX IF NOT EXISTS idx_elr_event ON event_line_ranges(event_id);
 CREATE INDEX IF NOT EXISTS idx_elr_relpath ON event_line_ranges(rel_file_path);
 `;
 
-const VERSION = 4;
+const VERSION = 5;
 
 let cachedDb: Database | null = null;
 
@@ -147,6 +149,17 @@ function applyMigrations(db: Database): void {
     if (eventColsV3.has(dead)) {
       db.exec(`ALTER TABLE events DROP COLUMN ${dead}`);
     }
+  }
+
+  // v4 → v5: sessions gains engineer_email and engineer_name. Captured from
+  // `git config user.email` / `user.name` at session creation time so the
+  // dashboard can break down metrics by engineer.
+  const sessionColsV5 = colNames(db, "sessions");
+  if (!sessionColsV5.has("engineer_email")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN engineer_email TEXT");
+  }
+  if (!sessionColsV5.has("engineer_name")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN engineer_name TEXT");
   }
 }
 
@@ -248,6 +261,94 @@ function backfillSessionModels(db: Database): number {
   return touched;
 }
 
+// Sessions created before events were repo-resolved (or before the engineer-capture
+// migration shipped) may have NULL repo_id even when their events do. Walk those
+// sessions and pick the most common events.repo_id. Prerequisite for engineer
+// backfill, which joins sessions → commits via repo_id.
+function backfillSessionRepos(db: Database): number {
+  const sessions = db
+    .query(
+      `SELECT id FROM sessions WHERE repo_id IS NULL`,
+    )
+    .all() as Array<{ id: string }>;
+  if (sessions.length === 0) return 0;
+
+  const pickRepo = db.prepare(
+    `SELECT repo_id, COUNT(*) AS n
+     FROM events
+     WHERE session_id = ? AND repo_id IS NOT NULL
+     GROUP BY repo_id
+     ORDER BY n DESC
+     LIMIT 1`,
+  );
+  const update = db.prepare(`UPDATE sessions SET repo_id = ? WHERE id = ?`);
+
+  let touched = 0;
+  for (const s of sessions) {
+    const row = pickRepo.get(s.id) as { repo_id: string; n: number } | undefined;
+    if (!row?.repo_id) continue;
+    update.run(row.repo_id, s.id);
+    touched++;
+  }
+  return touched;
+}
+
+// Backfill engineer_email/engineer_name for sessions that pre-date the v5
+// migration (no git-config snapshot at creation time). Strategy: for each
+// NULL-engineer session, find commits in the same repo whose committed_at
+// falls inside the session's time window. If exactly one distinct author
+// shows up, attribute the session to them. If zero or more than one author
+// shows up, leave NULL — we'd rather have missing data than misattribute on
+// a shared dev box.
+function backfillSessionEngineers(db: Database): number {
+  const sessions = db
+    .query(
+      `SELECT s.id, s.repo_id, s.started_at,
+              COALESCE(s.ended_at, (SELECT MAX(ts) FROM events e WHERE e.session_id = s.id)) AS end_ts
+       FROM sessions s
+       WHERE s.engineer_email IS NULL
+         AND s.repo_id IS NOT NULL
+         AND s.started_at IS NOT NULL`,
+    )
+    .all() as Array<{
+    id: string;
+    repo_id: string;
+    started_at: string;
+    end_ts: string | null;
+  }>;
+  if (sessions.length === 0) return 0;
+
+  const findAuthors = db.prepare(
+    `SELECT author_email, author_name, COUNT(*) AS n
+     FROM commits
+     WHERE repo_id = ?
+       AND author_email IS NOT NULL
+       AND datetime(committed_at) >= datetime(?)
+       AND datetime(committed_at) <= datetime(?)
+     GROUP BY author_email, author_name`,
+  );
+  const update = db.prepare(
+    `UPDATE sessions SET engineer_email = ?, engineer_name = ? WHERE id = ?`,
+  );
+
+  let touched = 0;
+  for (const s of sessions) {
+    // Skip zero-width windows — single-event sessions with no Stop event give
+    // us no temporal signal, so any commit match would be coincidence.
+    if (!s.end_ts || s.end_ts === s.started_at) continue;
+    const authors = findAuthors.all(s.repo_id, s.started_at, s.end_ts) as Array<{
+      author_email: string;
+      author_name: string | null;
+      n: number;
+    }>;
+    if (authors.length !== 1) continue;
+    const author = authors[0]!;
+    update.run(author.author_email, author.author_name, s.id);
+    touched++;
+  }
+  return touched;
+}
+
 export function openDb(): Database {
   if (cachedDb) return cachedDb;
   mkdirSync(POSTHOOK_DIR, { recursive: true });
@@ -257,7 +358,9 @@ export function openDb(): Database {
   db.exec(SCHEMA);
   applyMigrations(db);
   backfillEventRepos(db);
+  backfillSessionRepos(db);
   backfillSessionModels(db);
+  backfillSessionEngineers(db);
   const row = db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null };
   if ((row?.v ?? 0) < VERSION) {
     db.run("INSERT INTO schema_version (version) VALUES (?)", [VERSION]);

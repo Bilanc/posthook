@@ -436,10 +436,12 @@ Honest list of things we don't do yet:
 - **Windows isn't supported yet.** The shadow uses Unix symlinks and POSIX signal numbers. Windows would need a `.cmd` wrapper and a different argv[0] strategy. Coming in a later release.
 - **MultiEdit with identical replacement strings** attributes both to the first match. Edge case — uncommon and easy to live with.
 - **Single-user, local-only.** Multi-user / team rollups are the SaaS roadmap, not in this binary. The schema is multi-tenant-ready (`org_id` column exists).
+- **Engineer identity is captured from git.** At session creation, posthook reads `git config user.email` and `user.name` from the active repo and stores them on the `sessions` row so the dashboard can break down metrics by engineer. Local-only today; will sync to the SaaS once cloud sync ships.
 
 ## Roadmap
 
-- [ ] Local web dashboard (`posthook dash`) — small Hono server, charts via Tremor
+- [ ] Local web dashboard (`posthook dash`) — opens `posthook-dash`, a separate npm-installed Next.js app that reads `~/.posthook/posthook.db` directly
+- [ ] Cloud dashboard — same `posthook-dash` codebase with a Postgres adapter, hosted at app.bilanc.co
 - [ ] Cloud sync (`posthook sync`) — push to a multi-tenant Postgres for team rollups; prompt content lives here as the SaaS value-add
 - [ ] Per-PR breakdown via `gh` / `glab` / `bb`
 - [ ] Trust-hash manifest for Codex hooks (`~/.codex/hooks.json`)
