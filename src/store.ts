@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { execSync } from "node:child_process";
 import { DB_PATH, POSTHOOK_DIR } from "./config.ts";
-import { findRepoRoot, relPathInRepo } from "./util/git.ts";
+import { parseClaudeTranscriptSync } from "./transcript.ts";
+import { findRepoRoot, gitBypassEnv, relPathInRepo } from "./util/git.ts";
 
 // org_id is "local" for the local-only MVP. When we migrate to Postgres for the
 // SaaS, the same column accepts real org UUIDs without a schema change.
@@ -35,13 +36,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   branch TEXT,
   cwd TEXT,
   started_at TEXT NOT NULL,
-  ended_at TEXT,
-  tokens_in INTEGER NOT NULL DEFAULT 0,
-  tokens_out INTEGER NOT NULL DEFAULT 0,
-  tokens_cache_read INTEGER NOT NULL DEFAULT 0,
-  tokens_cache_write INTEGER NOT NULL DEFAULT 0,
-  cost_usd REAL NOT NULL DEFAULT 0,
-  tool_calls_count INTEGER NOT NULL DEFAULT 0
+  ended_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_org_started ON sessions(org_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_slug);
@@ -60,8 +55,6 @@ CREATE TABLE IF NOT EXISTS events (
   rel_file_path TEXT,
   lines_added INTEGER,
   lines_removed INTEGER,
-  tokens_in INTEGER,
-  tokens_out INTEGER,
   payload TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_org_ts ON events(org_id, ts);
@@ -94,26 +87,67 @@ CREATE TABLE IF NOT EXISTS commit_files (
   lines_removed INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (commit_id, file_path)
 );
+
+CREATE TABLE IF NOT EXISTS event_line_ranges (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL REFERENCES events(id),
+  file_path TEXT NOT NULL,
+  rel_file_path TEXT,
+  blob_sha_after TEXT,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  new_text_lines INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_elr_event ON event_line_ranges(event_id);
+CREATE INDEX IF NOT EXISTS idx_elr_relpath ON event_line_ranges(rel_file_path);
 `;
 
-const VERSION = 2;
+const VERSION = 4;
 
 let cachedDb: Database | null = null;
 
-function applyMigrations(db: Database): void {
-  // v1 → v2: events gains repo_id and rel_file_path. SQLite ADD COLUMN is idempotent only
-  // when guarded, so we check pragma_table_info first.
-  const cols = db
-    .query<{ name: string }, []>("SELECT name FROM pragma_table_info('events')")
+function colNames(db: Database, table: string): Set<string> {
+  const rows = db
+    .query<{ name: string }, []>(`SELECT name FROM pragma_table_info('${table}')`)
     .all();
-  const names = new Set(cols.map((c) => c.name));
-  if (!names.has("repo_id")) {
+  return new Set(rows.map((c) => c.name));
+}
+
+function applyMigrations(db: Database): void {
+  // v1 → v2: events gains repo_id and rel_file_path.
+  const eventCols = colNames(db, "events");
+  if (!eventCols.has("repo_id")) {
     db.exec("ALTER TABLE events ADD COLUMN repo_id TEXT REFERENCES repositories(id)");
   }
-  if (!names.has("rel_file_path")) {
+  if (!eventCols.has("rel_file_path")) {
     db.exec("ALTER TABLE events ADD COLUMN rel_file_path TEXT");
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_events_repo ON events(repo_id)");
+
+  // v2 → v3: drop cost/token columns. Cross-agent token counts and static pricing
+  // both produced misleading numbers, so we stop tracking them at the schema level.
+  // Tokens for Claude Code still live in the on-disk transcript file and in events.payload
+  // — anything that wants them can re-parse from there.
+  const sessionCols = colNames(db, "sessions");
+  for (const dead of [
+    "tokens_in",
+    "tokens_out",
+    "tokens_cache_read",
+    "tokens_cache_write",
+    "cost_usd",
+    "tool_calls_count",
+  ]) {
+    if (sessionCols.has(dead)) {
+      db.exec(`ALTER TABLE sessions DROP COLUMN ${dead}`);
+    }
+  }
+  const eventColsV3 = colNames(db, "events");
+  for (const dead of ["tokens_in", "tokens_out"]) {
+    if (eventColsV3.has(dead)) {
+      db.exec(`ALTER TABLE events DROP COLUMN ${dead}`);
+    }
+  }
 }
 
 // Walk events with NULL repo_id, resolve their repo from cwd, and populate.
@@ -157,6 +191,7 @@ function backfillEventRepos(db: Database): number {
           try {
             remoteUrl = execSync(`git -C "${root}" config --get remote.origin.url`, {
               encoding: "utf8",
+              env: gitBypassEnv(),
             }).trim();
           } catch {
             // no remote — fine
@@ -177,6 +212,42 @@ function backfillEventRepos(db: Database): number {
   return touched;
 }
 
+// Sessions with NULL model_slug typically belong to in-flight Claude Code sessions
+// where Stop hasn't fired yet. Claude Code hook payloads don't carry `model`, so the
+// only authoritative source mid-session is the transcript JSONL. We walk each NULL
+// session, find its most recent event with a transcript_path, and parse to backfill.
+// Cheap to re-run: only touches sessions that are still NULL.
+function backfillSessionModels(db: Database): number {
+  const sessions = db
+    .query(
+      `SELECT id FROM sessions WHERE model_slug IS NULL OR model_slug = ''`,
+    )
+    .all() as Array<{ id: string }>;
+  if (sessions.length === 0) return 0;
+
+  const findTranscript = db.prepare(
+    `SELECT json_extract(payload, '$.transcript_path') AS path
+     FROM events
+     WHERE session_id = ?
+       AND json_extract(payload, '$.transcript_path') IS NOT NULL
+     ORDER BY ts DESC
+     LIMIT 1`,
+  );
+  const update = db.prepare(`UPDATE sessions SET model_slug = ? WHERE id = ?`);
+
+  let touched = 0;
+  for (const s of sessions) {
+    const row = findTranscript.get(s.id) as { path: string | null } | undefined;
+    if (!row?.path) continue;
+    const summary = parseClaudeTranscriptSync(row.path);
+    if (summary?.model) {
+      update.run(summary.model, s.id);
+      touched++;
+    }
+  }
+  return touched;
+}
+
 export function openDb(): Database {
   if (cachedDb) return cachedDb;
   mkdirSync(POSTHOOK_DIR, { recursive: true });
@@ -186,6 +257,7 @@ export function openDb(): Database {
   db.exec(SCHEMA);
   applyMigrations(db);
   backfillEventRepos(db);
+  backfillSessionModels(db);
   const row = db.query("SELECT MAX(version) AS v FROM schema_version").get() as { v: number | null };
   if ((row?.v ?? 0) < VERSION) {
     db.run("INSERT INTO schema_version (version) VALUES (?)", [VERSION]);

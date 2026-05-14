@@ -37,8 +37,8 @@ commit_windows AS (
     c.repo_id,
     c.committed_at,
     c.lines_added AS commit_lines_added,
-    (SELECT MAX(c2.committed_at) FROM commits c2
-       WHERE c2.repo_id = c.repo_id AND c2.committed_at < c.committed_at) AS prev_committed_at
+    (SELECT MAX(datetime(c2.committed_at)) FROM commits c2
+       WHERE c2.repo_id = c.repo_id AND datetime(c2.committed_at) < datetime(c.committed_at)) AS prev_committed_at
   FROM commits c
 ),
 committed_ai AS (
@@ -55,8 +55,8 @@ committed_ai AS (
   JOIN ai_edits_scored a
     ON a.repo_id = cw.repo_id
     AND a.rel_file_path = cf.file_path
-    AND a.ts < cw.committed_at
-    AND (cw.prev_committed_at IS NULL OR a.ts >= cw.prev_committed_at)
+    AND datetime(a.ts) < datetime(cw.committed_at)
+    AND (cw.prev_committed_at IS NULL OR datetime(a.ts) >= datetime(cw.prev_committed_at))
 )
 `;
 
@@ -66,9 +66,6 @@ interface BreakdownRow {
   lines_generated: number;
   lines_committed: number;
   sessions: number;
-  tokens_in: number;
-  tokens_out: number;
-  cost_usd: number;
   top_model: string | null;
 }
 
@@ -94,8 +91,7 @@ export async function runMetrics(): Promise<void> {
     sessions: number;
   };
 
-  // Working hours: prefer sessions.started_at/ended_at when populated by transcript parsing,
-  // else fall back to span of events for that session.
+  // Working hours: span of events for each session.
   const hours = db
     .query(
       `SELECT COALESCE(SUM(duration_hours), 0) AS total_hours
@@ -154,24 +150,6 @@ export async function runMetrics(): Promise<void> {
     )
     .get() as { n: number; added: number; removed: number };
 
-  const tokenTotals = db
-    .query(
-      `SELECT
-         COALESCE(SUM(tokens_in), 0) AS tokens_in,
-         COALESCE(SUM(tokens_out), 0) AS tokens_out,
-         COALESCE(SUM(tokens_cache_read), 0) AS tokens_cache_read,
-         COALESCE(SUM(tokens_cache_write), 0) AS tokens_cache_write,
-         COALESCE(SUM(cost_usd), 0) AS cost_usd
-       FROM sessions`,
-    )
-    .get() as {
-    tokens_in: number;
-    tokens_out: number;
-    tokens_cache_read: number;
-    tokens_cache_write: number;
-    cost_usd: number;
-  };
-
   const aiCodePct =
     commitTotals.added > 0
       ? Math.min(100, (summary.lines_committed / commitTotals.added) * 100)
@@ -192,10 +170,6 @@ export async function runMetrics(): Promise<void> {
   console.log(
     `  Top model                 ${topModel ? `${topModel.model_slug} (${topModel.n} edits)` : "(no data)"}`,
   );
-  console.log(
-    `  Tokens (in/out/cache R/W) ${tokenTotals.tokens_in} / ${tokenTotals.tokens_out} / ${tokenTotals.tokens_cache_read} / ${tokenTotals.tokens_cache_write}`,
-  );
-  console.log(`  Total spend               $${tokenTotals.cost_usd.toFixed(4)}`);
   console.log(`  Commits captured          ${commitTotals.n}  (+${commitTotals.added} / -${commitTotals.removed} lines)`);
   console.log("");
 
@@ -206,9 +180,8 @@ export async function runMetrics(): Promise<void> {
   console.log("Notes");
   console.log("  * AI lines committed = sum of generated lines from AI edits whose file landed in a commit");
   console.log("    in the time window after the previous commit. Approximate — overcounts when AI lines are");
-  console.log("    later rewritten before commit. AI code % uses this numerator over total commit lines added.");
-  console.log("  • Tokens / cost / session timing are populated by the Stop hook + transcript parser.");
-  console.log("  • Older events (before this metrics version) lack repo_id and won't link to commits.");
+  console.log("    later rewritten before commit. Line-level attribution (Phase 1) will replace this.");
+  console.log("  • Older events (before the v2 migration) lack repo_id and won't link to commits.");
 }
 
 function breakdownByAgent(db: ReturnType<typeof openDb>): BreakdownRow[] {
@@ -221,9 +194,6 @@ function breakdownByAgent(db: ReturnType<typeof openDb>): BreakdownRow[] {
          COALESCE(SUM(e.lines_generated), 0) AS lines_generated,
          COALESCE((SELECT SUM(ca.lines_generated) FROM committed_ai ca WHERE ca.agent_slug = e.agent_slug), 0) AS lines_committed,
          COUNT(DISTINCT e.session_id) AS sessions,
-         COALESCE((SELECT SUM(s.tokens_in) FROM sessions s WHERE s.agent_slug = e.agent_slug), 0) AS tokens_in,
-         COALESCE((SELECT SUM(s.tokens_out) FROM sessions s WHERE s.agent_slug = e.agent_slug), 0) AS tokens_out,
-         COALESCE((SELECT SUM(s.cost_usd) FROM sessions s WHERE s.agent_slug = e.agent_slug), 0) AS cost_usd,
          (
            SELECT model_slug FROM ai_edits_scored b
            WHERE b.agent_slug = e.agent_slug
@@ -246,9 +216,6 @@ function breakdownByModel(db: ReturnType<typeof openDb>): BreakdownRow[] {
          COALESCE(SUM(e.lines_generated), 0) AS lines_generated,
          COALESCE((SELECT SUM(ca.lines_generated) FROM committed_ai ca WHERE ca.model_slug = e.model_slug), 0) AS lines_committed,
          COUNT(DISTINCT e.session_id) AS sessions,
-         COALESCE((SELECT SUM(s.tokens_in) FROM sessions s WHERE s.model_slug = e.model_slug), 0) AS tokens_in,
-         COALESCE((SELECT SUM(s.tokens_out) FROM sessions s WHERE s.model_slug = e.model_slug), 0) AS tokens_out,
-         COALESCE((SELECT SUM(s.cost_usd) FROM sessions s WHERE s.model_slug = e.model_slug), 0) AS cost_usd,
          NULL AS top_model
        FROM ai_edits_scored e
        GROUP BY e.model_slug
@@ -267,9 +234,6 @@ function breakdownByRepo(db: ReturnType<typeof openDb>): BreakdownRow[] {
          COALESCE(SUM(e.lines_generated), 0) AS lines_generated,
          COALESCE((SELECT SUM(ca.lines_generated) FROM committed_ai ca WHERE ca.repo_id = e.repo_id), 0) AS lines_committed,
          COUNT(DISTINCT e.session_id) AS sessions,
-         COALESCE((SELECT SUM(s.tokens_in) FROM sessions s WHERE s.repo_id = e.repo_id), 0) AS tokens_in,
-         COALESCE((SELECT SUM(s.tokens_out) FROM sessions s WHERE s.repo_id = e.repo_id), 0) AS tokens_out,
-         COALESCE((SELECT SUM(s.cost_usd) FROM sessions s WHERE s.repo_id = e.repo_id), 0) AS cost_usd,
          (
            SELECT model_slug FROM ai_edits_scored b
            WHERE b.repo_id = e.repo_id
@@ -293,11 +257,11 @@ function printBreakdown(title: string, rows: BreakdownRow[]): void {
   const keyCol = Math.max(16, ...rows.map((r) => (r.key ?? "").length));
   const modelCol = Math.max(12, ...rows.map((r) => (r.top_model ?? "").length));
   console.log(
-    `  ${"key".padEnd(keyCol)}  ${"edits".padStart(6)}  ${"gen".padStart(7)}  ${"commit".padStart(6)}  ${"sess".padStart(4)}  ${"tok_in".padStart(8)}  ${"cost$".padStart(8)}  ${"top model".padEnd(modelCol)}`,
+    `  ${"key".padEnd(keyCol)}  ${"edits".padStart(6)}  ${"gen".padStart(7)}  ${"commit".padStart(6)}  ${"sess".padStart(4)}  ${"top model".padEnd(modelCol)}`,
   );
   for (const r of rows) {
     console.log(
-      `  ${(r.key ?? "").padEnd(keyCol)}  ${String(r.edits).padStart(6)}  ${String(r.lines_generated).padStart(7)}  ${String(r.lines_committed).padStart(6)}  ${String(r.sessions).padStart(4)}  ${String(r.tokens_in).padStart(8)}  ${r.cost_usd.toFixed(4).padStart(8)}  ${(r.top_model ?? "—").padEnd(modelCol)}`,
+      `  ${(r.key ?? "").padEnd(keyCol)}  ${String(r.edits).padStart(6)}  ${String(r.lines_generated).padStart(7)}  ${String(r.lines_committed).padStart(6)}  ${String(r.sessions).padStart(4)}  ${(r.top_model ?? "—").padEnd(modelCol)}`,
     );
   }
   console.log("");
