@@ -1,0 +1,39 @@
+src/store.ts
+  s_d53c9de75f3fc9::t_1e3462dfe5dc6a 936-940
+src/commands/metrics.ts
+  s_a11213f30350a6::t_992d987e2cf350 6-22,186-187,211,221
+src/installers/codex.ts
+  s_2d159cad5de22e::t_e77f30de513ee3 5,46-47,138-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "21d9cbefe2dbc150e3067aeb08b15c4901f50151",
+  "prompts": {},
+  "sessions": {
+    "s_2d159cad5de22e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2966-aa22-76a1-8d14-eef64a1181fc",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    },
+    "s_a11213f30350a6": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2a01-aa73-7ef1-9c83-e959b15a11a0",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    },
+    "s_d53c9de75f3fc9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "21f8f098-06e9-4933-9cd2-658c7b06bdac",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    }
+  }
+}
