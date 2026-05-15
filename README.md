@@ -247,6 +247,10 @@ Output (one block per event, separated by `---`):
 
 Filters compose. To dig into hook misfires: `posthook inspect --type hook_misfire`. To audit one session's full timeline: `posthook inspect --session <id> --limit 200`.
 
+### `posthook dash`
+
+Stub today — prints a "coming soon" pointer. The web dashboard ships as a separate npm package, `posthook-dash`, which reads the same SQLite file directly. Once `posthook-dash` is published, this command will spawn it (cloud-authed users will be routed to `app.bilanc.co` instead). In the meantime, install `posthook-dash` from its own directory and run `posthook-dash` directly. See [`posthook-dash/README.md`](../posthook-dash/README.md).
+
 ### `posthook ingest …`
 
 Called by hooks, not by you directly. Listed here for completeness.
@@ -440,7 +444,7 @@ Honest list of things we don't do yet:
 
 ## Roadmap
 
-- [ ] Local web dashboard (`posthook dash`) — opens `posthook-dash`, a separate npm-installed Next.js app that reads `~/.posthook/posthook.db` directly
+- [ ] Wire `posthook dash` to spawn `posthook-dash` — the Next.js dashboard already exists in `../posthook-dash` and reads `~/.posthook/posthook.db` directly; the CLI command is a stub today
 - [ ] Cloud dashboard — same `posthook-dash` codebase with a Postgres adapter, hosted at app.bilanc.co
 - [ ] Cloud sync (`posthook sync`) — push to a multi-tenant Postgres for team rollups; prompt content lives here as the SaaS value-add
 - [ ] Per-PR breakdown via `gh` / `glab` / `bb`
@@ -483,6 +487,7 @@ src/
     metrics.ts           Aggregations with breakdowns
     inspect.ts           Pretty-print raw payloads
     blame.ts             Per-line attribution with prompt headers
+    dash.ts              Stub for `posthook dash` — pointer to posthook-dash
 install.sh               curl-pipe installer (v0 placeholder)
 ```
 
