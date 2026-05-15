@@ -1,0 +1,19 @@
+src/commands/installShadow.ts
+  s_a1dce414e5dd3b::t_014fde8b91dac6 202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "d9a90db6f1624de1d6f79885d7effa3dfaaeb3ba",
+  "prompts": {},
+  "sessions": {
+    "s_a1dce414e5dd3b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2a24-a0fb-7633-9427-0097a44bcff7",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    }
+  }
+}
