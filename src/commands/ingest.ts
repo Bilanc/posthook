@@ -1,10 +1,15 @@
 import { execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { NOTES_REF } from "../config.ts";
-import { extractRanges } from "../lineRanges.ts";
-import { LOCAL_ORG_ID, openDb } from "../store.ts";
+import {
+  extractRanges,
+  parseApplyPatch,
+  type ApplyPatchFileEdit,
+  type LineRange,
+} from "../lineRanges.ts";
+import { LOCAL_ORG_ID, openDb, refreshCommitAttributions } from "../store.ts";
 import { parseClaudeTranscript } from "../transcript.ts";
 import { canonicalize, findRepoRoot, relPathInRepo } from "../util/git.ts";
 import { debug, warn } from "../util/log.ts";
@@ -61,17 +66,31 @@ async function ingestAgentEvent(agentSlug: string): Promise<void> {
   const db = openDb();
   const id = randomUUID();
   const ts = new Date().toISOString();
-  const eventType = pickString(payload, ["hook_event_name", "event", "type"]) ?? "unknown";
-  const sessionId = pickString(payload, ["session_id", "sessionId"]);
+  const rawEventType = pickString(payload, ["hook_event_name", "event", "type"]) ?? "unknown";
+  const eventType = normalizeEventType(rawEventType);
+  const rawSessionId = pickString(payload, ["session_id", "sessionId"]);
+  const sessionId = rawSessionId ? resolveSessionId(db, agentSlug, rawSessionId) : null;
   const cwd = pickString(payload, ["cwd"]) ?? process.cwd();
-  const filePath = extractFilePath(payload);
-  const canonicalFilePath = filePath ? canonicalize(filePath) : null;
+  const workspaceRoots = extractWorkspaceRoots(payload);
+  const applyPatchFiles = applyPatchFilesForPayload(payload);
+  const filePath = extractFilePath(payload) ?? applyPatchFiles[0]?.file_path ?? null;
+  const resolvedFilePath = filePath ? resolveEventFilePath(filePath, cwd, workspaceRoots) : null;
+  const canonicalFilePath = resolvedFilePath ? canonicalize(resolvedFilePath) : null;
   const model = pickString(payload, ["model", "model_id"]);
+  const patchLinesAdded =
+    applyPatchFiles.length > 0
+      ? applyPatchFiles.reduce((sum, file) => sum + file.lines_added, 0)
+      : null;
+  const patchLinesRemoved =
+    applyPatchFiles.length > 0
+      ? applyPatchFiles.reduce((sum, file) => sum + file.lines_removed, 0)
+      : null;
 
-  // Resolve repo from cwd (walks up looking for .git). Auto-registers if found.
+  // Resolve repo from the edited file/workspace first, then cwd. Cursor runs hooks
+  // from ~/.cursor, so cwd alone cannot identify the project being edited.
   // findRepoRoot returns the canonical path, so we canonicalize filePath before computing
   // a relative path — otherwise /var/folders/... and /private/var/... mismatch on macOS.
-  const repoRoot = findRepoRoot(cwd);
+  const repoRoot = findEventRepoRoot(cwd, canonicalFilePath, workspaceRoots);
   const repoId = repoRoot ? upsertRepositoryByCwd(db, repoRoot) : null;
   const relFilePath =
     repoRoot && canonicalFilePath ? relPathInRepo(repoRoot, canonicalFilePath) : null;
@@ -91,8 +110,8 @@ async function ingestAgentEvent(agentSlug: string): Promise<void> {
   db.run(
     `INSERT INTO events (
       id, org_id, session_id, ts, event_type, agent_slug, cwd,
-      file_path, repo_id, rel_file_path, payload
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      file_path, repo_id, rel_file_path, lines_added, lines_removed, payload
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       LOCAL_ORG_ID,
@@ -101,23 +120,29 @@ async function ingestAgentEvent(agentSlug: string): Promise<void> {
       eventType,
       agentSlug,
       cwd,
-      canonicalFilePath ?? filePath ?? null,
+      canonicalFilePath ?? resolvedFilePath ?? filePath ?? null,
       repoId,
       relFilePath ?? null,
+      patchLinesAdded,
+      patchLinesRemoved,
       raw,
     ],
   );
   debug(`ingested ${agentSlug} event ${eventType} (session=${sessionId ?? "?"})`);
 
   // Capture line ranges for AI edits. Fail-soft: any failure here must not block ingest.
-  if (eventType === "PostToolUse" && canonicalFilePath) {
-    const toolName = readPayloadString(payload, ["tool_name"]);
-    if (toolName && EDIT_TOOLS.has(toolName)) {
-      try {
-        captureLineRanges(db, id, canonicalFilePath, relFilePath, toolName, payload);
-      } catch (err) {
-        warn(`line-range capture failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+  const lineRangeToolName = lineRangeToolForEvent(agentSlug, eventType, payload);
+  if (eventType === "PostToolUse" && applyPatchFiles.length > 0) {
+    try {
+      captureApplyPatchLineRanges(db, id, applyPatchFiles, cwd, workspaceRoots);
+    } catch (err) {
+      warn(`line-range capture failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } else if (lineRangeToolName && canonicalFilePath) {
+    try {
+      captureLineRanges(db, id, canonicalFilePath, relFilePath, lineRangeToolName, payload);
+    } catch (err) {
+      warn(`line-range capture failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -161,14 +186,61 @@ function captureLineRanges(
     return;
   }
   const content = readFileSync(filePath, "utf8");
-  const toolInput = payload.tool_input;
-  if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return;
+  const toolInput = lineRangeToolInput(payload);
+  if (!toolInput) return;
 
   const { ranges, unlocated } = extractRanges(
     toolName,
     toolInput as Parameters<typeof extractRanges>[1],
     content,
   );
+  insertLineRanges(db, eventId, filePath, relFilePath, content, toolName, ranges, unlocated);
+}
+
+function captureApplyPatchLineRanges(
+  db: ReturnType<typeof openDb>,
+  eventId: string,
+  files: ApplyPatchFileEdit[],
+  cwd: string,
+  workspaceRoots: string[],
+): void {
+  for (const file of files) {
+    if (file.edits.length === 0) continue;
+
+    const resolvedFilePath = resolveEventFilePath(file.file_path, cwd, workspaceRoots);
+    const canonicalFilePath = canonicalize(resolvedFilePath);
+    if (!existsSync(canonicalFilePath)) {
+      debug(`line-range: file gone, skipping (${canonicalFilePath})`);
+      continue;
+    }
+
+    const repoRoot = findEventRepoRoot(cwd, canonicalFilePath, workspaceRoots);
+    const relFilePath = repoRoot ? relPathInRepo(repoRoot, canonicalFilePath) : null;
+    const content = readFileSync(canonicalFilePath, "utf8");
+    const { ranges, unlocated } = extractRanges("MultiEdit", { edits: file.edits }, content);
+    insertLineRanges(
+      db,
+      eventId,
+      canonicalFilePath,
+      relFilePath,
+      content,
+      "apply_patch",
+      ranges,
+      unlocated,
+    );
+  }
+}
+
+function insertLineRanges(
+  db: ReturnType<typeof openDb>,
+  eventId: string,
+  filePath: string,
+  relFilePath: string | null,
+  content: string,
+  toolName: string,
+  ranges: LineRange[],
+  unlocated: number,
+): void {
   if (ranges.length === 0) {
     if (unlocated > 0) debug(`line-range: ${unlocated} edits unlocated in ${filePath}`);
     return;
@@ -199,12 +271,71 @@ function captureLineRanges(
   );
 }
 
+function applyPatchFilesForPayload(payload: Record<string, unknown>): ApplyPatchFileEdit[] {
+  if (readPayloadString(payload, ["tool_name"]) !== "apply_patch") return [];
+  const toolInput = payload.tool_input;
+  if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return [];
+  const command = (toolInput as Record<string, unknown>).command;
+  return typeof command === "string" ? parseApplyPatch(command) : [];
+}
+
+function lineRangeToolForEvent(
+  agentSlug: string,
+  eventType: string,
+  payload: Record<string, unknown>,
+): string | null {
+  if (eventType === "PostToolUse") {
+    const toolName = readPayloadString(payload, ["tool_name"]);
+    if (agentSlug === "cursor" && toolName && EDIT_TOOLS.has(toolName)) {
+      return null;
+    }
+    return toolName && EDIT_TOOLS.has(toolName) ? toolName : null;
+  }
+
+  if (eventType !== "afterFileEdit") return null;
+  if (Array.isArray(payload.edits)) return "MultiEdit";
+  if (typeof payload.new_string === "string") return "Edit";
+  if (typeof payload.content === "string") return "Write";
+  return null;
+}
+
+function lineRangeToolInput(
+  payload: Record<string, unknown>,
+): Parameters<typeof extractRanges>[1] | null {
+  const toolInput = payload.tool_input;
+  if (toolInput && typeof toolInput === "object" && !Array.isArray(toolInput)) {
+    return toolInput as Parameters<typeof extractRanges>[1];
+  }
+
+  const synthesized: Record<string, unknown> = {};
+  for (const key of ["file_path", "old_string", "new_string", "content"] as const) {
+    const value = payload[key];
+    if (typeof value === "string") synthesized[key] = value;
+  }
+  if (Array.isArray(payload.edits)) synthesized.edits = payload.edits;
+  return Object.keys(synthesized).length > 0
+    ? (synthesized as Parameters<typeof extractRanges>[1])
+    : null;
+}
+
 function readPayloadString(obj: Record<string, unknown>, keys: string[]): string | null {
   for (const k of keys) {
     const v = obj[k];
     if (typeof v === "string" && v.length > 0) return v;
   }
   return null;
+}
+
+function resolveSessionId(
+  db: ReturnType<typeof openDb>,
+  agentSlug: string,
+  rawSessionId: string,
+): string {
+  const existing = db
+    .query("SELECT agent_slug FROM sessions WHERE id = ?")
+    .get(rawSessionId) as { agent_slug: string } | undefined;
+  if (!existing || existing.agent_slug === agentSlug) return rawSessionId;
+  return `${agentSlug}:${rawSessionId}`;
 }
 
 function recordHookMisfire(agentSlug: string): void {
@@ -328,13 +459,17 @@ async function ingestGitCommit(opts: IngestOptions): Promise<void> {
   for (const f of perFile) {
     insertFile.run(finalCommitId, f.path, f.added, f.removed);
   }
+  const attributedSessions = refreshCommitAttributions(db, finalCommitId);
   debug(`ingested commit ${sha.slice(0, 7)} in ${repoName} (+${added}/-${removed})`);
+  if (attributedSessions > 0) {
+    debug(`attributed commit ${sha.slice(0, 7)} to ${attributedSessions} session(s)`);
+  }
 
   // Serialize AI line ranges into refs/notes/posthook so blame works for teammates
   // who clone the repo. Only metadata (line ranges, agent, session ID, model, ts) —
   // not prompt content. Failures here are non-fatal: blame still works from local SQLite.
   try {
-    writeNoteForCommit(db, repoRoot, repoId, sha);
+    writeNoteForCommit(db, repoRoot, repoId, sha, finalCommitId);
   } catch (err) {
     warn(`note write failed for ${sha.slice(0, 7)}: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -355,30 +490,36 @@ function writeNoteForCommit(
   repoRoot: string,
   repoId: string,
   sha: string,
+  commitId: string,
 ): void {
-  // Pull all AI line ranges that resolve to this commit (event ts < commit ts, no later commit between).
+  // Pull AI line ranges whose edited file resolves to this commit. The attribution
+  // boundary is the next commit for the same file, not merely the next repo commit.
   const ranges = db
     .query(
-      `WITH file_ranges AS (
-         SELECT elr.rel_file_path, e.session_id, e.agent_slug, e.ts AS event_ts,
-                s.model_slug, elr.start_line, elr.end_line
-         FROM event_line_ranges elr
-         JOIN events e ON e.id = elr.event_id
-         LEFT JOIN sessions s ON s.id = e.session_id
-         WHERE e.repo_id = ? AND elr.rel_file_path IS NOT NULL
-       )
-       SELECT fr.rel_file_path, fr.session_id, fr.agent_slug, fr.model_slug,
-              fr.event_ts, fr.start_line, fr.end_line
-       FROM file_ranges fr
-       WHERE (
-         SELECT c.sha FROM commits c
-         WHERE c.repo_id = ?
-           AND datetime(c.committed_at) >= datetime(fr.event_ts)
-         ORDER BY datetime(c.committed_at) ASC LIMIT 1
-       ) = ?
-       ORDER BY fr.rel_file_path, fr.start_line`,
+      `SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
+              e.ts AS event_ts, elr.start_line, elr.end_line
+       FROM commits c
+       JOIN commit_files cf ON cf.commit_id = c.id
+       JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
+       JOIN events e ON e.id = elr.event_id
+       LEFT JOIN sessions s ON s.id = e.session_id
+       WHERE c.id = ?
+         AND c.repo_id = ?
+         AND e.repo_id = c.repo_id
+         AND elr.rel_file_path IS NOT NULL
+         AND datetime(c.committed_at) >= datetime(e.ts)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM commits c2
+           JOIN commit_files cf2 ON cf2.commit_id = c2.id
+           WHERE c2.repo_id = c.repo_id
+             AND cf2.file_path = cf.file_path
+             AND datetime(c2.committed_at) >= datetime(e.ts)
+             AND datetime(c2.committed_at) < datetime(c.committed_at)
+         )
+       ORDER BY elr.rel_file_path, elr.start_line`,
     )
-    .all(repoId, repoId, sha) as NoteRangeRow[];
+    .all(commitId, repoId) as NoteRangeRow[];
   if (ranges.length === 0) {
     debug(`note: no AI ranges for ${sha.slice(0, 7)}, skipping`);
     return;
@@ -456,6 +597,17 @@ function pickString(obj: Record<string, unknown>, keys: string[]): string | null
   return null;
 }
 
+function normalizeEventType(eventType: string): string {
+  switch (eventType) {
+    case "preToolUse":
+      return "PreToolUse";
+    case "postToolUse":
+      return "PostToolUse";
+    default:
+      return eventType;
+  }
+}
+
 function extractFilePath(payload: Record<string, unknown>): string | null {
   // Claude Code: tool_input.file_path; Cursor: file_paths[0]; Codex: varies.
   const ti = payload.tool_input;
@@ -468,4 +620,35 @@ function extractFilePath(payload: Record<string, unknown>): string | null {
   const fp = payload.file_path;
   if (typeof fp === "string") return fp;
   return null;
+}
+
+function extractWorkspaceRoots(payload: Record<string, unknown>): string[] {
+  const roots = payload.workspace_roots;
+  if (!Array.isArray(roots)) return [];
+  return roots.filter((root): root is string => typeof root === "string" && root.length > 0);
+}
+
+function resolveEventFilePath(filePath: string, cwd: string, workspaceRoots: string[]): string {
+  if (isAbsolute(filePath)) return filePath;
+
+  const cwdRepo = findRepoRoot(cwd);
+  const bases = cwdRepo ? [cwd, ...workspaceRoots] : [...workspaceRoots, cwd];
+  const candidates = bases.map((base) => resolve(base, filePath));
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0] ?? filePath;
+}
+
+function findEventRepoRoot(
+  cwd: string,
+  canonicalFilePath: string | null,
+  workspaceRoots: string[],
+): string | null {
+  const fileRepo = canonicalFilePath ? findRepoRoot(canonicalFilePath) : null;
+  if (fileRepo) return fileRepo;
+
+  for (const root of workspaceRoots) {
+    const workspaceRepo = findRepoRoot(root);
+    if (workspaceRepo) return workspaceRepo;
+  }
+
+  return findRepoRoot(cwd);
 }

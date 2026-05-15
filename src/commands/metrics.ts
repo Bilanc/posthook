@@ -15,48 +15,68 @@ WITH ai_edits AS (
     e.cwd,
     e.repo_id,
     e.rel_file_path,
+    json_extract(e.payload, '$.tool_name') AS tool_name,
     COALESCE(s.model_slug, json_extract(e.payload, '$.model'), 'unknown') AS model_slug,
     COALESCE(json_extract(e.payload, '$.tool_input.new_string'), '') AS new_string,
     COALESCE(json_extract(e.payload, '$.tool_input.old_string'), '') AS old_string,
-    COALESCE(json_extract(e.payload, '$.tool_input.content'), '') AS content
+    COALESCE(json_extract(e.payload, '$.tool_input.content'), '') AS content,
+    COALESCE(e.lines_added, 0) AS event_lines_added,
+    COALESCE(e.lines_removed, 0) AS event_lines_removed,
+    COALESCE((
+      SELECT SUM(elr.new_text_lines)
+      FROM event_line_ranges elr
+      WHERE elr.event_id = e.id
+    ), 0) AS line_range_lines
   FROM events e
   LEFT JOIN sessions s ON s.id = e.session_id
-  WHERE e.event_type = 'PostToolUse'
-    AND json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit')
+  WHERE (
+    (
+      e.event_type IN ('PostToolUse', 'postToolUse')
+      AND json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
+      AND NOT (
+        e.agent_slug = 'cursor'
+        AND EXISTS (
+          SELECT 1
+          FROM events afe
+          WHERE afe.agent_slug = 'cursor'
+            AND afe.event_type = 'afterFileEdit'
+            AND afe.file_path = e.file_path
+            AND (
+              afe.session_id = e.session_id
+              OR (afe.session_id IS NULL AND e.session_id IS NULL)
+            )
+            AND ABS((julianday(afe.ts) - julianday(e.ts)) * 86400.0) <= 5
+        )
+      )
+    )
+    OR e.event_type = 'afterFileEdit'
+  )
 ),
 ai_edits_scored AS (
   SELECT
     *,
-    ${NL("new_string")} + ${NL("content")} AS lines_generated,
-    ${NL("old_string")} AS lines_replaced
+    CASE
+      WHEN line_range_lines > 0 THEN line_range_lines
+      WHEN tool_name = 'apply_patch' THEN event_lines_added
+      ELSE ${NL("new_string")} + ${NL("content")}
+    END AS lines_generated,
+    CASE
+      WHEN tool_name = 'apply_patch' THEN event_lines_removed
+      ELSE ${NL("old_string")}
+    END AS lines_replaced
   FROM ai_edits
-),
-commit_windows AS (
-  SELECT
-    c.id AS commit_id,
-    c.repo_id,
-    c.committed_at,
-    c.lines_added AS commit_lines_added,
-    (SELECT MAX(datetime(c2.committed_at)) FROM commits c2
-       WHERE c2.repo_id = c.repo_id AND datetime(c2.committed_at) < datetime(c.committed_at)) AS prev_committed_at
-  FROM commits c
 ),
 committed_ai AS (
   SELECT
-    cw.commit_id,
-    cw.repo_id,
-    cw.commit_lines_added,
-    a.agent_slug,
-    a.model_slug,
-    a.session_id,
-    a.lines_generated
-  FROM commit_windows cw
-  JOIN commit_files cf ON cf.commit_id = cw.commit_id
-  JOIN ai_edits_scored a
-    ON a.repo_id = cw.repo_id
-    AND a.rel_file_path = cf.file_path
-    AND datetime(a.ts) < datetime(cw.committed_at)
-    AND (cw.prev_committed_at IS NULL OR datetime(a.ts) >= datetime(cw.prev_committed_at))
+    cs.commit_id,
+    c.repo_id,
+    c.lines_added AS commit_lines_added,
+    cs.agent_slug,
+    COALESCE(cs.model_slug, 'unknown') AS model_slug,
+    cs.session_id,
+    cs.lines_attributed AS lines_generated
+  FROM commit_sessions cs
+  JOIN commits c ON c.id = cs.commit_id
 )
 `;
 
@@ -160,7 +180,7 @@ export async function runMetrics(): Promise<void> {
   console.log("");
   console.log("Overall");
   console.log(`  AI edit events            ${summary.edits}`);
-  console.log(`  AI lines generated        ${summary.lines_generated}  (raw new_string + content)`);
+  console.log(`  AI lines generated        ${summary.lines_generated}  (ranges + tool payload)`);
   console.log(`  AI lines replaced         ${summary.lines_replaced}`);
   console.log(`  AI lines committed*       ${summary.lines_committed}`);
   console.log(`  AI code %*                ${aiCodePct.toFixed(1)}%`);
@@ -178,9 +198,8 @@ export async function runMetrics(): Promise<void> {
   printBreakdown("By repo", breakdownByRepo(db));
 
   console.log("Notes");
-  console.log("  * AI lines committed = sum of generated lines from AI edits whose file landed in a commit");
-  console.log("    in the time window after the previous commit. Approximate — overcounts when AI lines are");
-  console.log("    later rewritten before commit. Line-level attribution (Phase 1) will replace this.");
+  console.log("  * AI lines committed = sum of AI line ranges attributed to captured commits.");
+  console.log("    Attribution links commits to sessions by file-level next-commit ownership.");
   console.log("  • Older events (before the v2 migration) lack repo_id and won't link to commits.");
 }
 
