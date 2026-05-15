@@ -9,7 +9,6 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { detectRealGitPath, loadRealGitPath, saveRealGitPath } from "../proxy/realGit.ts";
-import { gitBypassEnv } from "../util/git.ts";
 import { info, warn } from "../util/log.ts";
 
 // Health snapshot of the git shadow installation. Used by `posthook status` to
@@ -200,7 +199,7 @@ function resolveWhichGit(): string | null {
   try {
     // `which` itself isn't subject to recursion — we just want to know what the
     // shell would resolve `git` to right now. No bypass needed; this is fast.
-    const out = execSync("which git 2>/dev/null", { encoding: "utf8", env: gitBypassEnv() }).trim();
+    const out = execSync("which git 2>/dev/null", { encoding: "utf8" }).trim();
     return out.length > 0 ? out : null;
   } catch {
     return null;
