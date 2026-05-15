@@ -23,7 +23,15 @@ interface ToolInput {
   old_string?: string;
   new_string?: string;
   content?: string;
+  command?: string;
   edits?: Array<{ old_string?: string; new_string?: string }>;
+}
+
+export interface ApplyPatchFileEdit {
+  file_path: string;
+  edits: Array<{ new_string: string }>;
+  lines_added: number;
+  lines_removed: number;
 }
 
 // Count lines that `text` occupies. A trailing newline doesn't add an extra line
@@ -120,4 +128,60 @@ export function extractRanges(
     default:
       return { ranges: [], unlocated: 0 };
   }
+}
+
+export function parseApplyPatch(command: string): ApplyPatchFileEdit[] {
+  const files: ApplyPatchFileEdit[] = [];
+  let current: ApplyPatchFileEdit | null = null;
+  let addedBlock: string[] = [];
+
+  const flushAddedBlock = () => {
+    if (!current || addedBlock.length === 0) return;
+    const newString = addedBlock.join("\n");
+    if (newString.length > 0) current.edits.push({ new_string: newString });
+    addedBlock = [];
+  };
+
+  for (const line of command.replace(/\r\n/g, "\n").split("\n")) {
+    if (line.startsWith("*** Add File: ") || line.startsWith("*** Update File: ")) {
+      flushAddedBlock();
+      current = {
+        file_path: line.replace(/^\*\*\* (?:Add|Update) File: /, ""),
+        edits: [],
+        lines_added: 0,
+        lines_removed: 0,
+      };
+      files.push(current);
+      continue;
+    }
+
+    if (line.startsWith("*** Delete File: ")) {
+      flushAddedBlock();
+      current = null;
+      continue;
+    }
+
+    if (line.startsWith("*** Move to: ")) {
+      if (current) current.file_path = line.slice("*** Move to: ".length);
+      continue;
+    }
+
+    if (line.startsWith("*** ")) {
+      flushAddedBlock();
+      continue;
+    }
+
+    if (!current) continue;
+
+    if (line.startsWith("+")) {
+      current.lines_added++;
+      addedBlock.push(line.slice(1));
+    } else {
+      flushAddedBlock();
+      if (line.startsWith("-")) current.lines_removed++;
+    }
+  }
+
+  flushAddedBlock();
+  return files.filter((file) => file.file_path.length > 0);
 }

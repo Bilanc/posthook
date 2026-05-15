@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
@@ -19,6 +20,11 @@ interface MatcherBlock {
   hooks?: HookEntry[];
 }
 
+interface HookStateEntry {
+  enabled?: boolean;
+  trusted_hash?: string;
+}
+
 export async function detectCodex(): Promise<boolean> {
   const codexDir = CODEX_CONFIG_PATH.replace(/\/config\.toml$/, "");
   return existsSync(codexDir);
@@ -38,9 +44,11 @@ export async function installCodexHooks(binaryPath: string): Promise<InstallResu
   config.features = features;
 
   // Ensure [hooks] table with our command in the catch-all block of each event.
-  const hooksTable = (config.hooks as Record<string, MatcherBlock[]> | undefined) ?? {};
+  const hooksTable = (config.hooks as Record<string, unknown> | undefined) ?? {};
   for (const event of HOOK_EVENTS) {
-    const blocks: MatcherBlock[] = Array.isArray(hooksTable[event]) ? hooksTable[event]! : [];
+    const blocks: MatcherBlock[] = Array.isArray(hooksTable[event])
+      ? (hooksTable[event] as MatcherBlock[])
+      : [];
 
     // Strip posthook command from non-catch-all blocks.
     for (const block of blocks) {
@@ -79,6 +87,12 @@ export async function installCodexHooks(binaryPath: string): Promise<InstallResu
       return true;
     });
 
+    const groupIdx = blocks.indexOf(catchAll);
+    const handlerIdx = catchAll.hooks.findIndex(
+      (h) => typeof h.command === "string" && isPosthookCommand(h.command, AGENT_SLUG),
+    );
+
+    trustCodexHook(hooksTable, path, event, groupIdx, handlerIdx, desiredCmd);
     hooksTable[event] = blocks;
   }
   config.hooks = hooksTable;
@@ -93,4 +107,67 @@ export async function installCodexHooks(binaryPath: string): Promise<InstallResu
     path,
     message: changed ? `Codex CLI: hooks installed in ${path}` : `Codex CLI: already up to date`,
   };
+}
+
+function trustCodexHook(
+  hooksTable: Record<string, unknown>,
+  configPath: string,
+  event: (typeof HOOK_EVENTS)[number],
+  groupIdx: number,
+  handlerIdx: number,
+  command: string,
+): void {
+  if (groupIdx < 0 || handlerIdx < 0) return;
+
+  const state =
+    hooksTable.state && typeof hooksTable.state === "object" && !Array.isArray(hooksTable.state)
+      ? (hooksTable.state as Record<string, HookStateEntry>)
+      : {};
+  hooksTable.state = state;
+
+  const eventName = eventNameToSnakeCase(event);
+  const stateKey = `${configPath}:${eventName}:${groupIdx}:${handlerIdx}`;
+  state[stateKey] = {
+    enabled: true,
+    trusted_hash: computeTrustHash(eventName, command),
+  };
+}
+
+function eventNameToSnakeCase(event: (typeof HOOK_EVENTS)[number]): string {
+  switch (event) {
+    case "PreToolUse":
+      return "pre_tool_use";
+    case "PostToolUse":
+      return "post_tool_use";
+    case "Stop":
+      return "stop";
+  }
+}
+
+function computeTrustHash(eventName: string, command: string): string {
+  const identity = canonicalJson({
+    event_name: eventName,
+    hooks: [
+      {
+        async: false,
+        command,
+        timeout: 600,
+        type: "command",
+      },
+    ],
+  });
+  const hash = createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+  return `sha256:${hash}`;
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      out[key] = canonicalJson((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
 }
