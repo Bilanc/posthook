@@ -95,15 +95,34 @@ async function ingestAgentEvent(agentSlug: string): Promise<void> {
   const relFilePath =
     repoRoot && canonicalFilePath ? relPathInRepo(repoRoot, canonicalFilePath) : null;
 
+  // `git config --get` already resolves local → global, so one call per key.
+  const engineerEmail = repoRoot ? safeGit(["config", "--get", "user.email"], repoRoot) : null;
+  const engineerName = repoRoot ? safeGit(["config", "--get", "user.name"], repoRoot) : null;
+
   if (sessionId) {
     db.run(
-      `INSERT INTO sessions (id, org_id, agent_slug, model_slug, repo_id, cwd, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO sessions (
+         id, org_id, agent_slug, model_slug, repo_id, cwd, started_at,
+         engineer_email, engineer_name
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
-         model_slug = COALESCE(excluded.model_slug, sessions.model_slug),
-         repo_id = COALESCE(sessions.repo_id, excluded.repo_id),
-         cwd = COALESCE(sessions.cwd, excluded.cwd)`,
-      [sessionId, LOCAL_ORG_ID, agentSlug, model ?? null, repoId, cwd, ts],
+         model_slug     = COALESCE(excluded.model_slug, sessions.model_slug),
+         repo_id        = COALESCE(sessions.repo_id, excluded.repo_id),
+         cwd            = COALESCE(sessions.cwd, excluded.cwd),
+         engineer_email = COALESCE(sessions.engineer_email, excluded.engineer_email),
+         engineer_name  = COALESCE(sessions.engineer_name, excluded.engineer_name)`,
+      [
+        sessionId,
+        LOCAL_ORG_ID,
+        agentSlug,
+        model ?? null,
+        repoId,
+        cwd,
+        ts,
+        engineerEmail,
+        engineerName,
+      ],
     );
   }
 
