@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
-import { CODEX_CONFIG_PATH } from "../config.ts";
+import { CODEX_CONFIG_PATH, POSTHOOK_DIR } from "../config.ts";
 import { writeAtomic } from "../util/atomic.ts";
 import { type InstallResult, isPosthookCommand, posthookCommandFor } from "./base.ts";
 
@@ -42,6 +42,8 @@ export async function installCodexHooks(binaryPath: string): Promise<InstallResu
   features.hooks = true;
   delete features.codex_hooks; // migrate legacy flag
   config.features = features;
+
+  ensurePosthookWritableRoot(config);
 
   // Ensure [hooks] table with our command in the catch-all block of each event.
   const hooksTable = (config.hooks as Record<string, unknown> | undefined) ?? {};
@@ -131,6 +133,26 @@ function trustCodexHook(
     enabled: true,
     trusted_hash: computeTrustHash(eventName, command),
   };
+}
+
+function ensurePosthookWritableRoot(config: Record<string, unknown>): void {
+  const workspaceWrite =
+    config.sandbox_workspace_write &&
+    typeof config.sandbox_workspace_write === "object" &&
+    !Array.isArray(config.sandbox_workspace_write)
+      ? (config.sandbox_workspace_write as Record<string, unknown>)
+      : {};
+
+  const roots = Array.isArray(workspaceWrite.writable_roots)
+    ? workspaceWrite.writable_roots.filter((root): root is string => typeof root === "string")
+    : [];
+
+  if (!roots.includes(POSTHOOK_DIR)) {
+    roots.push(POSTHOOK_DIR);
+  }
+
+  workspaceWrite.writable_roots = roots;
+  config.sandbox_workspace_write = workspaceWrite;
 }
 
 function eventNameToSnakeCase(event: (typeof HOOK_EVENTS)[number]): string {

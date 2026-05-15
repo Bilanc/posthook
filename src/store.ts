@@ -933,6 +933,11 @@ export function openDb(): Database {
   mkdirSync(POSTHOOK_DIR, { recursive: true });
   const db = new Database(DB_PATH, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
+  // Hooks fire concurrently (codex parallel-dispatches tool calls; each tool
+  // spawns its own posthook ingest process). Without busy_timeout, writers
+  // racing for the WAL lock fail instantly with SQLITE_BUSY and exit 1 —
+  // which codex surfaces as "PreToolUse/PostToolUse hook (failed)".
+  db.exec("PRAGMA busy_timeout = 5000;");
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(SCHEMA);
   applyMigrations(db);
