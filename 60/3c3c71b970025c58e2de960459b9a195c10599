@@ -1,0 +1,63 @@
+src/lineRanges.ts
+  s_d9a8a3bbac3fb5::t_a6332f72f38f75 26,30-36,132-186
+src/installers/codex.ts
+  s_d9a8a3bbac3fb5::t_f87cef0043b4fe 1,23-27,47,49-51,90-95,111-172
+src/commands/ingest.ts
+  s_591c4f859d0ac1::t_765e18dd486e1d 71-72,329-338
+  s_591c4f859d0ac1::t_f6f58853d0c2f8 282-286,289-291
+  s_d9a8a3bbac3fb5::t_32e53e25ef6fc4 6-11,75-76,80-87,199,209,216,233
+  s_591c4f859d0ac1::t_0c1f58c6cb5e8b 4,69-70,74,77-78,89-90,93,600-610,624-653
+  s_aa6385452cdbb9::t_8686e8129f03c4 12,462,464-466,472,493,495-496,499-520,522
+  s_d9a8a3bbac3fb5::t_efc9ddc5702d39 113-114,123,126-127,134-144,197-198,200-208,210-215,217-232,234-243,274-280
+  s_591c4f859d0ac1::t_360d8b9ce1f07f 145,189-190,281,287-288,292-318
+src/store.ts
+  s_591c4f859d0ac1::t_a8fa7e95670b14 297-420,861,871
+  s_aa6385452cdbb9::t_4ed54c288d6356 199
+  s_aa6385452cdbb9::t_4063afbff5075a 859,862,878-880
+  s_aa6385452cdbb9::t_65301a3c190083 184-198,200-260,269-288
+  s_591c4f859d0ac1::t_bce0b3e63e2727 692-721,866,874,876
+  s_aa6385452cdbb9::t_4d78e42600307d 261-268
+  s_591c4f859d0ac1::t_89a0bbb434bbf6 4,9,289-296,421,426,428-432,434-439,452,455,460-464,466-471,473-483,485-486,488,495-514,747-766,769-786,860,867
+  s_d9a8a3bbac3fb5::t_6f2b2065ae4383 7,456-459,599-691,731-744,787-811,865,875
+  s_591c4f859d0ac1::t_070a44cfbe30f9 453
+  s_aa6385452cdbb9::t_62ada444028212 515-533,863
+  s_591c4f859d0ac1::t_ed5488008f970d 767-768
+  s_591c4f859d0ac1::t_622ad02e9cc5f4 2-3,534-598,722-730,745-746,864,869-870,872-873,877
+  s_aa6385452cdbb9::t_978e09b2cc0617 92-121,137
+src/commands/metrics.ts
+  s_591c4f859d0ac1::t_75aabdc17e4e96 22,25-29,32-34,36-53,58-59,61-62
+  s_d9a8a3bbac3fb5::t_f685abb975d100 18,23-24,35,60,63-66,183
+  s_aa6385452cdbb9::t_296c7b553dbca0 69,71,74-79,201-202
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "603c3c71b970025c58e2de960459b9a195c10599",
+  "prompts": {},
+  "sessions": {
+    "s_591c4f859d0ac1": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e28ff-fadc-7593-87d9-5c468bfc60ba",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    },
+    "s_aa6385452cdbb9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2901-0854-7a41-807c-041cce011f64",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    },
+    "s_d9a8a3bbac3fb5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e2932-96c1-70b3-8b80-339e9e6fc856",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Samuel Akinwunmi <sammygfx@googlemail.com>"
+    }
+  }
+}
