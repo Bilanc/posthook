@@ -3,6 +3,23 @@ import { openDb } from "../store.ts";
 // SQLite expression: count newlines in a TEXT column.
 // length(s) - length(replace(s, char(10), '')) counts '\n' chars.
 const NL = (col: string) => `(length(${col}) - length(replace(${col}, char(10), '')))`;
+const ACTIVE_REPO_EXISTS = `(
+  EXISTS (
+    SELECT 1 FROM events active_events
+    WHERE active_events.repo_id = c.repo_id
+      AND active_events.event_type != 'hook_misfire'
+  )
+  OR EXISTS (
+    SELECT 1 FROM sessions active_sessions
+    WHERE active_sessions.repo_id = c.repo_id
+  )
+  OR EXISTS (
+    SELECT 1
+    FROM commit_sessions active_cs
+    JOIN commits active_c ON active_c.id = active_cs.commit_id
+    WHERE active_c.repo_id = c.repo_id
+  )
+)`;
 
 // Reusable CTE: every AI edit event with parsed payload fields + linked session.
 const AI_EDITS_CTE = `
@@ -166,7 +183,8 @@ export async function runMetrics(): Promise<void> {
          COUNT(*) AS n,
          COALESCE(SUM(lines_added), 0) AS added,
          COALESCE(SUM(lines_removed), 0) AS removed
-       FROM commits`,
+       FROM commits c
+       WHERE ${ACTIVE_REPO_EXISTS}`,
     )
     .get() as { n: number; added: number; removed: number };
 
@@ -190,7 +208,7 @@ export async function runMetrics(): Promise<void> {
   console.log(
     `  Top model                 ${topModel ? `${topModel.model_slug} (${topModel.n} edits)` : "(no data)"}`,
   );
-  console.log(`  Commits captured          ${commitTotals.n}  (+${commitTotals.added} / -${commitTotals.removed} lines)`);
+  console.log(`  Commits analyzed          ${commitTotals.n}  (+${commitTotals.added} / -${commitTotals.removed} lines)`);
   console.log("");
 
   printBreakdown("By agent", breakdownByAgent(db));
@@ -200,6 +218,7 @@ export async function runMetrics(): Promise<void> {
   console.log("Notes");
   console.log("  * AI lines committed = sum of AI line ranges attributed to captured commits.");
   console.log("    Attribution links commits to sessions by file-level next-commit ownership.");
+  console.log("  • Commit totals exclude clone/test-only repos with no sessions, events, or AI attribution.");
   console.log("  • Older events (before the v2 migration) lack repo_id and won't link to commits.");
 }
 
