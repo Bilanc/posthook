@@ -1,0 +1,49 @@
+{
+  "name": "posthook-dash",
+  "version": "0.1.0",
+  "description": "Local web dashboard for posthook AI usage metrics. Reads ~/.posthook/posthook.db and renders KPIs, breakdowns, and session detail.",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "posthook-dash": "./bin/posthook-dash.mjs"
+  },
+  "files": [
+    "bin",
+    ".next/standalone",
+    ".next/static",
+    "public",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev --port 3847",
+    "build": "next build",
+    "start": "node .next/standalone/server.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "date-fns": "^4.1.0",
+    "echarts": "^5.5.1",
+    "echarts-for-react": "^3.0.2",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.13.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0-beta.7",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.9.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.15.0",
+    "eslint-config-next": "^15.0.0",
+    "tailwindcss": "^4.0.0-beta.7",
+    "typescript": "^5.6.0"
+  }
+}

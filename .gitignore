@@ -1,6 +1,10 @@
-node_modules
-dist
-*.tsbuildinfo
+dist/
+posthook
+posthook.exe
+posthook.db
+posthook.db-wal
+posthook.db-shm
 .DS_Store
+*.log
 .env
 .env.local
