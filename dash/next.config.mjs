@@ -1,8 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
-  // better-sqlite3 is a native binding; Next must not bundle it.
-  serverExternalPackages: ["better-sqlite3"],
+  // The DB driver is node:sqlite, a Node built-in — Next externalizes `node:`
+  // imports automatically, so there's nothing native to exclude from bundling.
 };
 
 export default nextConfig;

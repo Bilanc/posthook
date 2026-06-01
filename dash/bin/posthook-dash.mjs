@@ -32,7 +32,9 @@ console.log(`  db:   ${dbPath}`);
 console.log(`  url:  ${url}`);
 console.log();
 
-const child = spawn(process.execPath, [standaloneServer], {
+// --disable-warning silences node:sqlite's ExperimentalWarning (the DB driver);
+// it's a stable enough API for our read-only use and the notice only confuses.
+const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", standaloneServer], {
   cwd: root,
   env: { ...process.env, POSTHOOK_DB: dbPath, PORT: port, HOSTNAME: hostname },
   stdio: "inherit",

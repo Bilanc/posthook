@@ -60,6 +60,12 @@ release:
     name: posthook
   draft: false
   prerelease: auto
+  # The platform-independent dashboard bundle, built by the `dashboard` CI job on
+  # Node 24 and handed to this job as an artifact (see release.yml). Attaching it
+  # here keeps a single GitHub Release that owns both the CLI archives and the
+  # dashboard. install.sh downloads this alongside the matching binary.
+  extra_files:
+    - glob: ./posthook-dash.tar.gz
 
 changelog:
   use: github
