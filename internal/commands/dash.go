@@ -99,7 +99,7 @@ func ensureDashRunning(cfg dashConfig) (dashStatus, error) {
 
 	node, err := exec.LookPath("node")
 	if err != nil {
-		return dashStarted, fmt.Errorf("the dashboard needs Node.js (>=20) on PATH, but `node` was not found. Install Node and retry")
+		return dashStarted, fmt.Errorf("the dashboard needs Node.js (>=24, for the built-in node:sqlite driver) on PATH, but `node` was not found. Install Node and retry")
 	}
 
 	if err := startDashDaemon(node, cfg); err != nil {
@@ -170,7 +170,9 @@ func startDashDaemon(node string, cfg dashConfig) error {
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(node, paths.DashServer())
+	// --disable-warning silences node:sqlite's ExperimentalWarning (the dashboard
+	// DB driver) so the detached server's log stays clean.
+	cmd := exec.Command(node, "--disable-warning=ExperimentalWarning", paths.DashServer())
 	cmd.Dir = paths.DashDir()
 	cmd.Env = append(os.Environ(),
 		"POSTHOOK_DB="+paths.DBPath(),

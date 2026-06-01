@@ -16,7 +16,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "scripts": {
     "dev": "next dev --port 3847",
@@ -26,7 +26,6 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "better-sqlite3": "^11.5.0",
     "date-fns": "^4.1.0",
     "echarts": "^5.5.1",
     "echarts-for-react": "^3.0.2",
@@ -37,8 +36,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.0.0-beta.7",
-    "@types/better-sqlite3": "^7.6.11",
-    "@types/node": "^22.9.0",
+    "@types/node": "^24.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "eslint": "^9.15.0",

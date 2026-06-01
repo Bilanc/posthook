@@ -21,12 +21,56 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # Build the dashboard once, on Node 24, into a single platform-independent
+  # bundle. node:sqlite (the DB driver) is a Node built-in, so there's no native
+  # code and no per-OS/arch matrix — one tarball runs everywhere Node 24 does.
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: dash/package-lock.json
+
+      - name: Build dashboard
+        working-directory: dash
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage standalone bundle
+        # Mirror exactly what install.sh used to stage into ~/.posthook/dash:
+        # the standalone server + the static assets and public dir Next does not
+        # copy into standalone. Lay it out so `tar xzf` into ~/.posthook/dash
+        # drops server.js at the root, where `posthook dash` expects it.
+        run: |
+          stage="$RUNNER_TEMP/dash"
+          mkdir -p "$stage/.next/static"
+          cp -R dash/.next/standalone/. "$stage"/
+          cp -R dash/.next/static/. "$stage/.next/static"/
+          [ -d dash/public ] && cp -R dash/public "$stage/public" || true
+          tar -czf "$GITHUB_WORKSPACE/posthook-dash.tar.gz" -C "$stage" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: posthook-dash
+          path: posthook-dash.tar.gz
+
   goreleaser:
+    needs: dashboard # wait for the dashboard bundle, then attach it via extra_files
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # full history so the changelog can diff against the previous tag
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: posthook-dash
+          path: . # lands posthook-dash.tar.gz at repo root for the extra_files glob
 
       - uses: actions/setup-go@v5
         with:
