@@ -8,6 +8,7 @@ func NewRootCmd() *cobra.Command {
 		Use:           "posthook",
 		Short:         "Local hook installer and event store",
 		Long:          longHelp,
+		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -23,6 +24,7 @@ func NewRootCmd() *cobra.Command {
 		newBlameCmd(),
 		newDashCmd(),
 		newSyncCmd(),
+		newVersionCmd(),
 	)
 	return root
 }
