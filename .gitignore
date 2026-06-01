@@ -4,6 +4,10 @@ dist/
 # entire CLI entrypoint — a fresh clone wouldn't build.)
 /posthook
 /posthook.exe
+# The dashboard bundle the release workflow downloads into the repo root before
+# goreleaser runs. Ignored so it doesn't make the tree "dirty" (goreleaser refuses
+# to release otherwise); extra_files still reads it by path to attach it.
+/posthook-dash.tar.gz
 posthook.db
 posthook.db-wal
 posthook.db-shm
