@@ -1,0 +1,71 @@
+# GoReleaser config for posthook.
+#
+# Cuts a GitHub Release with prebuilt binaries on every `v*` tag push (driven by
+# .github/workflows/release.yml). The CLI is pure Go (modernc.org/sqlite, no
+# CGO), so CGO_ENABLED=0 cross-compiles cleanly to every target below from a
+# single Linux runner.
+#
+# The dashboard is NOT built here — it ships as a separate platform-independent
+# `posthook-dash.tar.gz` asset uploaded by the dashboard CI job (Phase 2). The
+# network installer (install.sh) downloads both.
+#
+# Asset names are stable and parsed by install.sh:
+#   posthook_<version>_<os>_<arch>.tar.gz   (version has no leading "v")
+#   os   ∈ {darwin, linux}
+#   arch ∈ {amd64, arm64}
+# Local check:  goreleaser check  &&  goreleaser release --snapshot --clean
+version: 2
+
+project_name: posthook
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: posthook
+    main: ./cmd/posthook
+    binary: posthook
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/bilanc/posthook/internal/commands.version={{ .Version }}
+      - -X github.com/bilanc/posthook/internal/commands.commit={{ .ShortCommit }}
+      - -X github.com/bilanc/posthook/internal/commands.date={{ .Date }}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: posthook
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: Bilanc
+    name: posthook
+  draft: false
+  prerelease: auto
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

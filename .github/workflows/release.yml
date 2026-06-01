@@ -1,0 +1,35 @@
+name: release
+
+# Tag a release and binaries publish themselves:
+#   git tag v0.1.0 && git push origin v0.1.0
+# GoReleaser cross-compiles every target in .goreleaser.yaml and attaches the
+# archives + checksums.txt to a GitHub Release. GITHUB_TOKEN is provided by
+# Actions automatically; `contents: write` lets it create the release.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the changelog can diff against the previous tag
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
