@@ -33,10 +33,9 @@ Posthook answers these without changing your workflow. You keep using your edito
 ## Quickstart
 
 ```bash
-# 1. Build and install the CLI + dashboard. install.sh builds both;
-#    the dashboard build is skipped (with a warning) if Node.js is absent —
-#    the CLI still installs and works on its own.
-./install.sh
+# 1. Install the latest release (prebuilt CLI + dashboard) into ~/.local/bin.
+#    No Go or Node needed to install — it downloads a static binary.
+curl -fsSL https://raw.githubusercontent.com/Bilanc/posthook/main/install.sh | sh
 
 # 2. Make sure ~/.local/bin precedes the real git on your PATH (usually /usr/bin):
 export PATH="$HOME/.local/bin:$PATH"
@@ -48,7 +47,7 @@ posthook init
 posthook status                 # is everything wired up and capturing?
 posthook metrics                # AI vs. human, by agent/model/repo
 posthook blame path/to/file.ts  # per-line attribution
-posthook dash                   # open the web dashboard
+posthook dash                   # open the web dashboard (needs Node >=24)
 ```
 
 `posthook init` installs (a) hook entries in each detected agent's global config and (b) a `git` symlink alongside the posthook binary that intercepts every git command. There's no per-repo setup — clones, new repos, and existing repos all just work.
@@ -57,9 +56,9 @@ posthook dash                   # open the web dashboard
 
 ### Requirements
 
-- **Go 1.23+** to build the CLI.
-- **Node.js 20+** (optional) to build the web dashboard. Without it, every CLI command still works — you just won't have `posthook dash`.
-- macOS or Linux. (Windows isn't supported yet — see [Limitations](#limitations).)
+- **macOS or Linux.** (Windows isn't supported yet — see [Limitations](#limitations).) The installer downloads a prebuilt, statically-linked binary — no toolchain required.
+- **Node.js 24+** (optional) to run `posthook dash`. The dashboard reads your SQLite file through Node's built-in `node:sqlite`. Without Node, every CLI command still works — you just won't have the web dashboard.
+- Building from source (contributors only) needs **Go 1.23+** — see [Building from source](#building-from-source).
 
 ## What gets captured
 
@@ -91,13 +90,14 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 
 ## Commands
 
-- `posthook init` — install hooks + shadow + template fallback, then auto-start the web dashboard in the background. Idempotent. (Set `POSTHOOK_DASH_AUTOSTART=0` to skip the dashboard; it's also skipped silently if the dashboard isn't built.)
+- `posthook init` — install hooks + shadow + template fallback, then auto-start the web dashboard in the background. Idempotent. (Set `POSTHOOK_DASH_AUTOSTART=0` to skip the dashboard; it's also skipped silently if the dashboard bundle or Node >=24 isn't present.)
 - `posthook status` — counts, shadow health, hook misfires, recent commits. **Run this first** to confirm everything is wired up.
 - `posthook metrics` — AI metrics with breakdowns by agent, model, and repo: edit events, lines generated/replaced/committed, AI code %, working hours, distinct and max-concurrent sessions.
 - `posthook blame <file>` — per-line attribution with prompt headers.
 - `posthook inspect [--agent X] [--type Y] [--session Z] [--since ISO] [--limit N]` — raw event payloads.
 - `posthook dash` — open the local web dashboard. Starts the bundled server (reading `~/.posthook/posthook.db`) if it isn't running, waits for it, then opens your browser. `--no-open` starts it headless; `--stop` shuts it down. Binds `127.0.0.1:3847` by default.
 - `posthook sync` — flush local rows to a cloud endpoint (see [Team / cloud](#team--cloud)). `--loop` flushes continuously, `--status` shows pending counts and last-flush state, `--set-endpoint/--set-token/--set-enabled` write `~/.posthook/config.json`.
+- `posthook service install|uninstall|status` — manage a background daemon (launchd on macOS, systemd `--user` on Linux) that runs `posthook sync --loop` so a connected machine keeps flushing across reboots. The team installer sets this up automatically.
 - `posthook track <repo-path>` — install the fallback per-repo `post-commit` hook for an existing repo.
 - `posthook install-shadow` / `posthook uninstall-shadow` — manage the `git` symlink directly.
 - `posthook ingest …` — read an agent or git payload from stdin and record it. Called by the hooks; you won't run it by hand.
@@ -132,6 +132,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 - `POSTHOOK_DASH_PORT` / `POSTHOOK_DASH_HOSTNAME` — override where `posthook dash` binds (default `127.0.0.1:3847`). Read by both the Go command and the dashboard server so they always agree.
 - `POSTHOOK_DASH_AUTOSTART=0` — skip the automatic dashboard start at the end of `posthook init`.
 - `POSTHOOK_CLOUD_ENDPOINT` / `POSTHOOK_CLOUD_TOKEN` / `POSTHOOK_CLOUD_ENABLED` / `POSTHOOK_CLOUD_FLUSH_SECS` — override cloud-sync settings without editing `config.json` (handy for pointing one binary at a staging endpoint).
+- `POSTHOOK_API_KEY` / `POSTHOOK_VERSION` / `POSTHOOK_INSTALL_DIR` — read by `install.sh`: a team install key enables cloud sync + the background daemon, `POSTHOOK_VERSION` pins a release (default: latest), and `POSTHOOK_INSTALL_DIR` chooses the install directory (default `~/.local/bin`).
 
 ## Privacy
 
@@ -152,11 +153,17 @@ Nothing in the local database is encrypted at rest — treat it like any local g
 
 ## Team / cloud
 
-Posthook has a hosted team version, live at **[posthook.bilanc.co](https://posthook.bilanc.co)**. It rolls the same local data up across your whole team — org-wide AI-adoption metrics, per-engineer and per-repo breakdowns, and shared attribution — without anyone changing their workflow.
+Posthook has a hosted team version (by Bilanc) that rolls the same local data up across your whole team — org-wide AI-adoption metrics, per-engineer and per-repo breakdowns, and shared attribution — without anyone changing their workflow.
 
-When you connect a machine to the cloud, the same OSS binary in this repo flushes its rows upstream via `posthook sync`: it reads rows changed since the last flush and POSTs them to your team's ingest endpoint with a Bearer token, recording per-table state you can inspect with `posthook sync --status`. The local SQLite store stays authoritative — sync is a faithful, append-only replica with no redaction or schema rewrites. Until you enable it, posthook never sends anything anywhere.
+Onboarding is one shared link. A manager mints an install link for the team, then each engineer runs it once:
 
-Access is currently invite-based. **[Talk to the team](https://posthook.bilanc.co)** to get set up.
+```bash
+curl -fsSL "https://api.bilanc.co/posthook/install.sh?apiKey=<team-key>" | sh
+```
+
+That installs posthook exactly as in the [Quickstart](#quickstart), and additionally: writes the team key into `~/.posthook/config.json`, runs `posthook init`, and installs the background sync daemon (`posthook service`). From then on the same OSS binary in this repo flushes rows upstream via `posthook sync` — reading rows changed since the last flush and POSTing them to your team's ingest endpoint with a Bearer token (inspect state with `posthook sync --status`). The local SQLite store stays authoritative; sync is a faithful, append-only replica with no redaction or schema rewrites. Until you install with a key, posthook never sends anything anywhere.
+
+Access is invite-based — **[talk to the team](https://bilanc.co)** to get set up.
 
 ## Architecture
 
@@ -182,6 +189,7 @@ internal/
   transcript/                    Claude Code JSONL parser + prompt extraction
   store/                         SQLite schema, migrations, backfill passes, attribution
   sync/                          Cloud flush: per-row synced_at cursor, batched POST, sync_state
+  service/                       launchd / systemd unit manager for the background sync daemon
   proxy/                         Git shadow: spawn real git, forward stdio/signals,
                                  intercept commit + clone for capture
   installers/                    Per-agent hook installers (idempotent merge/dedup)
@@ -192,8 +200,9 @@ internal/
     githook.go                   per-repo post-commit hook + global template + notes transport
   ingest/                        Event + commit capture core
   commands/                      Cobra command implementations
-dash/                            Web dashboard (Next.js), staged into ~/.posthook/dash by install.sh
-install.sh                       Build + install the CLI and dashboard
+dash/                            Web dashboard (Next.js), downloaded into ~/.posthook/dash by install.sh
+install.sh                       Network installer: downloads the release binary + dashboard bundle
+.goreleaser.yaml                 Release build (CGO_ENABLED=0 cross-compile to darwin/linux × amd64/arm64)
 ```
 
 ## Limitations
@@ -202,6 +211,23 @@ install.sh                       Build + install the CLI and dashboard
 - **The shadow only intercepts `commit` and `clone`.** Other history-changing commands (rebase, cherry-pick, amend, reset, push, fetch) pass through without capture.
 - **`MultiEdit` with identical replacement strings** attributes both edits to the first match.
 - **Windows isn't supported yet.** The shadow relies on Unix symlinks and POSIX signal numbers.
+
+## Building from source
+
+You only need a toolchain to hack on posthook — installing uses a prebuilt binary.
+
+```bash
+git clone https://github.com/Bilanc/posthook && cd posthook
+
+# CLI -> ~/.local/bin/posthook
+go build -o ~/.local/bin/posthook ./cmd/posthook
+go test ./...
+
+# Dashboard (optional; needs Node >=24):
+cd dash && npm ci && npm run build
+```
+
+`posthook dash` runs the dashboard from `~/.posthook/dash`, which `install.sh` fills from the release. To run a from-source dashboard, stage the standalone build there: copy `dash/.next/standalone/.`, `dash/.next/static` (into `.next/static`), and `dash/public` into `~/.posthook/dash`.
 
 ## Contributing
 
