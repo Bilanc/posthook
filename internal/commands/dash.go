@@ -20,6 +20,11 @@ import (
 const (
 	defaultDashPort = "3847"
 	defaultDashHost = "127.0.0.1"
+
+	// minNodeMajor is the minimum Node.js major the dashboard needs at runtime:
+	// the standalone server reads the DB via Node's built-in node:sqlite, which
+	// is available (unflagged) from Node 24.
+	minNodeMajor = 24
 )
 
 // dashConfig resolves the host/port the dashboard binds to, honouring the same
@@ -88,7 +93,7 @@ func ensureDashRunning(cfg dashConfig) (dashStatus, error) {
 	// Need the staged standalone build and a database to read.
 	if _, err := os.Stat(paths.DashServer()); err != nil {
 		return dashStarted, fmt.Errorf(
-			"dashboard not built at %s\n  Re-run ./install.sh (it builds and stages the dashboard), or build it manually:\n    cd dash && npm ci && npm run build",
+			"dashboard bundle not found at %s\n  Re-run the installer to download it (curl -fsSL https://raw.githubusercontent.com/Bilanc/posthook/main/install.sh | sh),\n  or build it from source: cd dash && npm ci && npm run build",
 			paths.DashServer())
 	}
 	if _, err := os.Stat(paths.DBPath()); err != nil {
@@ -100,6 +105,9 @@ func ensureDashRunning(cfg dashConfig) (dashStatus, error) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		return dashStarted, fmt.Errorf("the dashboard needs Node.js (>=24, for the built-in node:sqlite driver) on PATH, but `node` was not found. Install Node and retry")
+	}
+	if ok, ver := nodeVersionOK(node); !ok {
+		return dashStarted, fmt.Errorf("the dashboard needs Node.js >=%d (for the built-in node:sqlite driver), but found %s. Upgrade Node and retry", minNodeMajor, ver)
 	}
 
 	if err := startDashDaemon(node, cfg); err != nil {
@@ -139,11 +147,16 @@ func autostartDashboard() {
 	// Treat "not built" / "no Node" as expected on a CLI-only install — inform,
 	// don't warn, and don't attempt a start that would error.
 	if _, err := os.Stat(paths.DashServer()); err != nil {
-		logx.Info("  dashboard not built; skipping auto-start (run ./install.sh with Node.js to enable `posthook dash`)")
+		logx.Info("  dashboard bundle not present; skipping auto-start (re-run install.sh to fetch it)")
 		return
 	}
-	if _, err := exec.LookPath("node"); err != nil {
+	node, err := exec.LookPath("node")
+	if err != nil {
 		logx.Info("  Node.js not found; skipping auto-start")
+		return
+	}
+	if ok, ver := nodeVersionOK(node); !ok {
+		logx.Infof("  the dashboard needs Node.js >=%d; found %s — skipping auto-start", minNodeMajor, ver)
 		return
 	}
 
@@ -158,6 +171,28 @@ func autostartDashboard() {
 	} else {
 		logx.Infof("  started at %s (open it with: posthook dash)", cfg.url())
 	}
+}
+
+// nodeVersionOK reports whether `node` satisfies minNodeMajor, returning the
+// detected version string for messaging. If the version can't be determined (an
+// exec error or unexpected `node --version` output), it returns ok=true so we
+// don't block the dashboard on a parsing quirk — the server itself surfaces a
+// clear error if node:sqlite really is missing.
+func nodeVersionOK(node string) (ok bool, version string) {
+	out, err := exec.Command(node, "--version").Output()
+	if err != nil {
+		return true, ""
+	}
+	version = strings.TrimSpace(string(out)) // e.g. "v24.3.0"
+	major := strings.TrimPrefix(version, "v")
+	if i := strings.IndexByte(major, '.'); i >= 0 {
+		major = major[:i]
+	}
+	n, err := strconv.Atoi(major)
+	if err != nil {
+		return true, version
+	}
+	return n >= minNodeMajor, version
 }
 
 // startDashDaemon spawns the standalone Next.js server fully detached from this

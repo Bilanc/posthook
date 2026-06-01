@@ -5,6 +5,16 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// The dashboard reads the DB via Node's built-in node:sqlite, available from
+// Node 24. Fail fast with a clear message rather than crashing mid-startup with
+// an opaque "No such built-in module: node:sqlite".
+const nodeMajor = Number(process.versions.node.split(".")[0]);
+if (nodeMajor < 24) {
+  console.error(`posthook-dash: needs Node >=24 (for the built-in node:sqlite driver), but this is ${process.version}.`);
+  console.error("  Upgrade Node and retry.");
+  process.exit(1);
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = resolve(__dirname, "..");
 const standaloneServer = resolve(root, ".next/standalone/server.js");
