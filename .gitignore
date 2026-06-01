@@ -1,6 +1,9 @@
 dist/
-posthook
-posthook.exe
+# Anchored to repo root: ignore the built binary `./posthook`, NOT the
+# `cmd/posthook/` source directory. (Unanchored `posthook` silently ignored the
+# entire CLI entrypoint — a fresh clone wouldn't build.)
+/posthook
+/posthook.exe
 posthook.db
 posthook.db-wal
 posthook.db-shm

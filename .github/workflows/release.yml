@@ -13,6 +13,13 @@ on:
 permissions:
   contents: write
 
+# The action wrappers (checkout/setup-go/goreleaser-action) still ship Node 20,
+# which GitHub deprecates and force-migrates to Node 24 on 2026-06-16. Opt in now
+# so the run is on Node 24 and the deprecation warning goes away. (Runtime only —
+# unrelated to the Go build or the dashboard's Node version.)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
