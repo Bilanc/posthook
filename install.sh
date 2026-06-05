@@ -16,11 +16,17 @@
 #      (best-effort; `posthook dash` needs Node >=24 at runtime).
 #   3. If POSTHOOK_API_KEY is set: configure cloud sync.
 #   4. Run `posthook init` (agent hooks + git shadow).
-#   5. If POSTHOOK_API_KEY is set: install the background sync daemon.
+#   5. If POSTHOOK_API_KEY is set: set up the engineer identity (work email) —
+#      detects a default from git config and confirms it on the terminal, so
+#      the team dashboard can attribute sessions to people. Non-fatal when
+#      there's no TTY; finish later with `posthook identity --setup`.
+#   6. If POSTHOOK_API_KEY is set: install the background sync daemon.
 #
 # Env overrides:
 #   POSTHOOK_API_KEY        team ingest key — enables cloud sync + daemon
 #   POSTHOOK_CLOUD_ENDPOINT ingest base URL (default https://api.bilanc.co)
+#   POSTHOOK_ENGINEER_EMAIL work email to attribute sessions to (skips the prompt)
+#   POSTHOOK_ENGINEER_NAME  display name to go with the email
 #   POSTHOOK_VERSION        pin a release, e.g. 0.1.0 (default: latest)
 #   POSTHOOK_INSTALL_DIR    where to put the binary (default ~/.local/bin)
 
@@ -142,7 +148,19 @@ info "Setting up agent hooks + git shadow..."
 "$BIN" init
 
 # ---------------------------------------------------------------------------
-# 5. Install the background sync daemon (only with a team key)
+# 5. Engineer identity (only with a team key)
+# ---------------------------------------------------------------------------
+# The identity prompt reads /dev/tty directly inside the Go binary, so it
+# works even though this script's stdin is the curl pipe. Never fatal.
+if [ -n "${POSTHOOK_API_KEY:-}" ]; then
+  info ""
+  info "Setting up engineer identity (attributes your sessions on the team dashboard)..."
+  "$BIN" identity --setup \
+    || warn "Identity not set. Finish later with: posthook identity --setup"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Install the background sync daemon (only with a team key)
 # ---------------------------------------------------------------------------
 if [ -n "${POSTHOOK_API_KEY:-}" ]; then
   info ""

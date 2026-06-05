@@ -1,10 +1,12 @@
 // Package config loads and saves the posthook user-level config from
-// ~/.posthook/config.json. The only thing it carries today is cloud-sync
-// settings — endpoint, install token, enabled flag, flush interval.
+// ~/.posthook/config.json. It carries cloud-sync settings — endpoint, install
+// token, enabled flag, flush interval — and the engineer identity stamped on
+// every session.
 //
 // Env vars override the on-disk file so devs can point a single binary at a
 // staging endpoint without rewriting their config: POSTHOOK_CLOUD_ENDPOINT,
-// POSTHOOK_CLOUD_TOKEN, POSTHOOK_CLOUD_ENABLED, POSTHOOK_CLOUD_FLUSH_SECS.
+// POSTHOOK_CLOUD_TOKEN, POSTHOOK_CLOUD_ENABLED, POSTHOOK_CLOUD_FLUSH_SECS,
+// POSTHOOK_ENGINEER_EMAIL, POSTHOOK_ENGINEER_NAME.
 package config
 
 import (
@@ -27,7 +29,20 @@ const defaultFlushSeconds = 5
 // Config is the on-disk shape of ~/.posthook/config.json. Add fields as the
 // product grows; unknown JSON fields are ignored on load.
 type Config struct {
-	Cloud CloudConfig `json:"cloud"`
+	Cloud    CloudConfig    `json:"cloud"`
+	Engineer EngineerConfig `json:"engineer"`
+}
+
+// EngineerConfig identifies the human behind this machine's sessions. Email is
+// the canonical identity key — the cloud joins it against PR/commit data — so
+// it should be the work email, confirmed by the person via `posthook identity
+// --setup` rather than inferred. It takes precedence over per-repo git config
+// (which is often unset, or a personal address on side repos). GitHubLogin is
+// captured best-effort from the gh CLI as a secondary join key.
+type EngineerConfig struct {
+	Email       string `json:"email,omitempty"`
+	Name        string `json:"name,omitempty"`
+	GitHubLogin string `json:"github_login,omitempty"`
 }
 
 // CloudConfig holds everything the sync command needs to flush data upstream.
@@ -69,6 +84,12 @@ func Load() (Config, error) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.Cloud.FlushIntervalSecs = n
 		}
+	}
+	if v := os.Getenv("POSTHOOK_ENGINEER_EMAIL"); v != "" {
+		c.Engineer.Email = v
+	}
+	if v := os.Getenv("POSTHOOK_ENGINEER_NAME"); v != "" {
+		c.Engineer.Name = v
 	}
 	if c.Cloud.FlushIntervalSecs <= 0 {
 		c.Cloud.FlushIntervalSecs = defaultFlushSeconds

@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bilanc/posthook/internal/config"
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/lineranges"
 	"github.com/bilanc/posthook/internal/logx"
@@ -120,11 +121,23 @@ func AgentEvent(agentSlug string) error {
 		}
 	}
 
+	// Engineer identity: the confirmed identity in ~/.posthook/config.json wins
+	// (set via `posthook identity --setup`); per-repo git config is the
+	// fallback — it's often unset, or a personal address on side repos. A third
+	// fallback (commit-author matching) runs later in backfill.
 	engineerEmail := ""
 	engineerName := ""
+	if cfg, err := config.Load(); err == nil {
+		engineerEmail = cfg.Engineer.Email
+		engineerName = cfg.Engineer.Name
+	}
 	if repoRoot != "" {
-		engineerEmail = gitx.Run(repoRoot, "config", "--get", "user.email")
-		engineerName = gitx.Run(repoRoot, "config", "--get", "user.name")
+		if engineerEmail == "" {
+			engineerEmail = gitx.Run(repoRoot, "config", "--get", "user.email")
+		}
+		if engineerName == "" {
+			engineerName = gitx.Run(repoRoot, "config", "--get", "user.name")
+		}
 	}
 
 	if sessionID != "" {

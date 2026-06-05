@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/bilanc/posthook/internal/config"
 	"github.com/bilanc/posthook/internal/store"
 
 	"github.com/spf13/cobra"
@@ -45,6 +46,7 @@ func runStatus() error {
 	fmt.Printf("  sessions:     %d\n", totals.sessions)
 	fmt.Printf("  commits:      %d\n", totals.commits)
 	fmt.Printf("  repositories: %d\n", totals.repos)
+	printIdentityLine()
 	fmt.Println()
 
 	printShadowHealth(CheckShadowHealth())
@@ -164,6 +166,30 @@ func runStatus() error {
 		}
 	}
 	return nil
+}
+
+// printIdentityLine shows who sessions are attributed to. When cloud sync is
+// on and no identity is configured, attribution upstream depends on per-repo
+// git config being right — worth a loud nudge.
+func printIdentityLine() {
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	if cfg.Engineer.Email != "" {
+		who := cfg.Engineer.Email
+		if cfg.Engineer.Name != "" {
+			who = cfg.Engineer.Name + " <" + cfg.Engineer.Email + ">"
+		}
+		fmt.Printf("  identity:     %s\n", who)
+		return
+	}
+	fmt.Printf("  identity:     — not set\n")
+	if cfg.Cloud.Enabled {
+		fmt.Println()
+		fmt.Println("  ⚠ Cloud sync is on but no engineer identity is set — sessions may sync")
+		fmt.Println("    unattributed. Fix: posthook identity --setup")
+	}
 }
 
 func printShadowHealth(h ShadowHealth) {
