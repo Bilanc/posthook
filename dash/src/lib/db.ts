@@ -27,6 +27,16 @@ export function dbPath(): string {
   return process.env.POSTHOOK_DB ?? resolve(homedir(), ".posthook", "posthook.db");
 }
 
+// node:sqlite hands back rows as null-prototype objects, which React refuses to
+// serialize from Server to Client Components ("Only plain objects ... can be
+// passed to Client Components. Classes or null prototypes are not supported").
+// Row values are always primitives (string|number|null), so a shallow spread is
+// enough to rehydrate them as plain objects. get() returning undefined for "no
+// row" must survive untouched — callers rely on it (`?? null` patterns).
+function plain(row: unknown): unknown {
+  return row === undefined ? undefined : { ...(row as Record<string, unknown>) };
+}
+
 export function db(): DB {
   if (!cached) {
     cached = new DatabaseSync(dbPath(), { readOnly: true });
@@ -34,7 +44,11 @@ export function db(): DB {
   const conn = cached;
   return {
     prepare(sql: string): Statement {
-      return conn.prepare(sql) as unknown as Statement;
+      const stmt = conn.prepare(sql);
+      return {
+        get: (...params: unknown[]) => plain(stmt.get(...(params as never[]))),
+        all: (...params: unknown[]) => stmt.all(...(params as never[])).map(plain),
+      };
     },
   };
 }
