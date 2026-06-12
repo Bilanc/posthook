@@ -36,6 +36,16 @@ if (!existsSync(standaloneServer)) {
   process.exit(1);
 }
 
+// The standalone server serves /_next/static/* only from inside its own
+// folder; `next build` doesn't put it there, the build script's copy step
+// does. Without it every JS chunk 404s and the charts render blank.
+const standaloneStatic = resolve(root, ".next/standalone/.next/static");
+if (!existsSync(standaloneStatic)) {
+  console.error(`posthook-dash: static assets missing at ${standaloneStatic}`);
+  console.error("  Charts won't render without them. Re-run `npm run build`.");
+  process.exit(1);
+}
+
 const url = `http://${hostname}:${port}`;
 console.log(`posthook-dash`);
 console.log(`  db:   ${dbPath}`);
