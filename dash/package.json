@@ -22,6 +22,7 @@
     "dev": "next dev --port 3847",
     "build": "next build",
     "start": "node .next/standalone/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "lint": "next lint"
   },
