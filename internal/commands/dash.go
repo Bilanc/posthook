@@ -52,21 +52,36 @@ func (c dashConfig) url() string  { return fmt.Sprintf("http://%s", c.addr()) }
 
 func newDashCmd() *cobra.Command {
 	var stop bool
+	var restart bool
 	var noOpen bool
 	cmd := &cobra.Command{
 		Use:   "dash",
-		Short: "Open the local web dashboard",
+		Short: "Open the local web dashboard (--stop / --restart to manage it)",
 		Long: "Start the posthook web dashboard (if it isn't already running) and open it in your browser.\n" +
 			"The dashboard is a local Next.js server reading ~/.posthook/posthook.db; it binds to\n" +
-			"127.0.0.1:3847 by default (override with POSTHOOK_DASH_HOSTNAME / POSTHOOK_DASH_PORT).",
+			"127.0.0.1:3847 by default (override with POSTHOOK_DASH_HOSTNAME / POSTHOOK_DASH_PORT).\n" +
+			"\n" +
+			"The server keeps running in the background after this command returns. A second\n" +
+			"`posthook dash` reuses it, so after upgrading posthook run `posthook dash --restart`\n" +
+			"to pick up the new dashboard bundle. `posthook dash --stop` shuts it down.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if stop {
 				return stopDash()
+			}
+			if restart {
+				if err := stopDash(); err != nil {
+					return err
+				}
+				cfg := resolveDashConfig()
+				if !waitForPortClosed(cfg.addr(), 5*time.Second) {
+					return fmt.Errorf("something is still listening on %s after stop — it wasn't started by posthook (no tracked pid).\n  Find it with `lsof -i :%s` and stop it manually, then re-run `posthook dash`", cfg.addr(), cfg.port)
+				}
 			}
 			return runDash(noOpen)
 		},
 	}
 	cmd.Flags().BoolVar(&stop, "stop", false, "Stop the background dashboard server")
+	cmd.Flags().BoolVar(&restart, "restart", false, "Restart the background dashboard server (e.g. after upgrading posthook)")
 	cmd.Flags().BoolVar(&noOpen, "no-open", false, "Start the server but don't open a browser")
 	return cmd
 }
@@ -129,6 +144,7 @@ func runDash(noOpen bool) error {
 	}
 	if status == dashAlreadyRunning {
 		logx.Infof("Dashboard already running at %s", cfg.url())
+		logx.Info("  (restart it with: posthook dash --restart — e.g. after upgrading posthook)")
 	} else {
 		logx.Infof("Dashboard started at %s", cfg.url())
 	}
@@ -287,6 +303,20 @@ func waitForPort(addr string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if portOpen(addr) {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+// waitForPortClosed waits for addr to stop accepting connections after a stop
+// signal — SIGTERM is asynchronous, so the old server may hold the port for a
+// moment before the replacement can bind it.
+func waitForPortClosed(addr string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !portOpen(addr) {
 			return true
 		}
 		time.Sleep(200 * time.Millisecond)

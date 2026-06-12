@@ -2,8 +2,10 @@ import { KpiCard } from "@/components/kpi-card";
 import { FilterBar } from "@/components/filter-bar";
 import { SankeyFunnel } from "@/components/sankey-funnel";
 import { BreakdownBar } from "@/components/breakdown-bar";
+import { DailyUsageChart } from "@/components/daily-usage-chart";
 import { parseFilters, resolveFilters, type SearchParams } from "@/lib/filters";
 import { overviewSummary, funnel } from "@/lib/queries/overview";
+import { dailyUsage } from "@/lib/queries/daily";
 import {
   breakdownByAgent,
   breakdownByModel,
@@ -37,6 +39,7 @@ export default async function OverviewPage({
   const options = filterOptions();
   const summary = overviewSummary(filters);
   const fn = funnel(filters);
+  const daily = dailyUsage(filters);
   const byAgent = breakdownByAgent(filters);
   const byModel = breakdownByModel(filters);
   const byRepo = breakdownByRepo(filters);
@@ -83,6 +86,10 @@ export default async function OverviewPage({
           value={String(summary.max_concurrent)}
           sublabel="peak concurrent sessions"
         />
+      </section>
+
+      <section className="mb-8">
+        <DailyUsageChart from={filters.from} to={filters.to} data={daily} />
       </section>
 
       <section className="mb-8">
