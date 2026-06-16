@@ -13,6 +13,12 @@ export interface SessionRow {
   ended_at: string | null;
   engineer_email: string | null;
   engineer_name: string | null;
+  // NULL = agent doesn't report usage (Cursor); filled from the Stop-hook
+  // transcript for Claude Code and Codex. input excludes cache reads.
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
 }
 
 export interface RepositoryRow {
@@ -64,4 +70,9 @@ export interface OverviewSummary {
   commit_lines_added: number;
   commit_lines_removed: number;
   ai_code_pct: number;
+  // Session-level token sums; null when no session in range reports usage.
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
 }

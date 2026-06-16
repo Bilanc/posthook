@@ -5,7 +5,7 @@ package store
 // UUIDs without a schema change.
 const LocalOrgID = "local"
 
-const schemaVersion = 7
+const schemaVersion = 8
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   ended_at TEXT,
   engineer_email TEXT,
   engineer_name TEXT,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  cache_read_tokens INTEGER,
+  cache_creation_tokens INTEGER,
   synced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_org_started ON sessions(org_id, started_at);

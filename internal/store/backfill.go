@@ -572,6 +572,65 @@ func (db *DB) backfillSessionModels() (int, error) {
 	return touched, nil
 }
 
+// backfillSessionTokens parses the on-disk transcript (Claude JSONL or Codex
+// rollout) for sessions missing token counts. Cursor sessions never carry a
+// transcript_path so they stay NULL — "agent doesn't report usage", not zero.
+func (db *DB) backfillSessionTokens() (int, error) {
+	rows, err := db.Query(`
+		SELECT s.id, (
+			SELECT json_extract(e.payload, '$.transcript_path')
+			FROM events e
+			WHERE e.session_id = s.id
+			  AND json_extract(e.payload, '$.transcript_path') IS NOT NULL
+			ORDER BY e.ts DESC
+			LIMIT 1
+		) AS path
+		FROM sessions s
+		WHERE s.input_tokens IS NULL`)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id   string
+		path sql.NullString
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.path); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if r.path.Valid && r.path.String != "" {
+			todo = append(todo, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	touched := 0
+	for _, r := range todo {
+		summary := transcript.ParseFile(r.path.String)
+		if summary == nil || summary.Tokens == nil {
+			continue
+		}
+		t := summary.Tokens
+		if _, err := db.Exec(`
+			UPDATE sessions SET
+				input_tokens = ?, output_tokens = ?,
+				cache_read_tokens = ?, cache_creation_tokens = ?,
+				synced_at = NULL
+			WHERE id = ?`,
+			t.Input, t.Output, t.CacheRead, t.CacheCreation, r.id); err != nil {
+			return 0, err
+		}
+		touched++
+	}
+	return touched, nil
+}
+
 // backfillSessionEngineers attributes a session to an engineer by matching
 // commits whose committed_at falls inside the session's time window. If
 // exactly one distinct author shows up we use it; zero or many → leave NULL

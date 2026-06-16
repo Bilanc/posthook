@@ -180,6 +180,18 @@ func runMetrics() error {
 		return err
 	}
 
+	// Token totals come from sessions, not events: hook payloads carry no
+	// usage, so Stop-time transcript parsing fills nullable session columns.
+	// SUM over all-NULL groups yields NULL → rendered as "—" not 0.
+	var tokIn, tokOut, tokCacheRead, tokCacheCreate sql.NullInt64
+	err = db.QueryRow(`
+		SELECT SUM(input_tokens), SUM(output_tokens),
+		       SUM(cache_read_tokens), SUM(cache_creation_tokens)
+		FROM sessions`).Scan(&tokIn, &tokOut, &tokCacheRead, &tokCacheCreate)
+	if err != nil {
+		return err
+	}
+
 	var topModelSlug sql.NullString
 	var topModelN int
 	err = db.QueryRow(aiEditsCTE() + `
@@ -229,7 +241,29 @@ func runMetrics() error {
 		fmt.Println("  Top model                 (no data)")
 	}
 	fmt.Printf("  Commits analyzed          %d  (+%d / -%d lines)\n", commitN, commitAdded, commitRemoved)
+	fmt.Printf("  Tokens in / out**         %s / %s\n", fmtTokens(tokIn), fmtTokens(tokOut))
+	fmt.Printf("  Tokens cache read/write** %s / %s\n", fmtTokens(tokCacheRead), fmtTokens(tokCacheCreate))
 	fmt.Println()
+
+	if rows, err := tokensByAgent(db); err == nil && len(rows) > 0 {
+		fmt.Println("Tokens by agent")
+		keyCol := 16
+		for _, r := range rows {
+			if len(r.key) > keyCol {
+				keyCol = len(r.key)
+			}
+		}
+		fmt.Printf("  %-*s  %12s  %12s  %12s  %12s\n",
+			keyCol, "key", "in", "out", "cache read", "cache write")
+		for _, r := range rows {
+			fmt.Printf("  %-*s  %12s  %12s  %12s  %12s\n",
+				keyCol, r.key, fmtTokens(r.in), fmtTokens(r.out),
+				fmtTokens(r.cacheRead), fmtTokens(r.cacheCreate))
+		}
+		fmt.Println()
+	} else if err != nil {
+		return err
+	}
 
 	for _, b := range []struct {
 		title string
@@ -249,9 +283,58 @@ func runMetrics() error {
 	fmt.Println("Notes")
 	fmt.Println("  * AI lines committed = sum of AI line ranges attributed to captured commits.")
 	fmt.Println("    Attribution links commits to sessions by file-level next-commit ownership.")
+	fmt.Println("  ** Tokens parsed from Claude Code / Codex transcripts at session stop.")
+	fmt.Println("     '—' = agent doesn't report usage (Cursor); 'in' excludes cache reads.")
 	fmt.Println("  • Commit totals exclude clone/test-only repos with no sessions, events, or AI attribution.")
 	fmt.Println("  • Older events (before the v2 migration) lack repo_id and won't link to commits.")
 	return nil
+}
+
+type tokenRow struct {
+	key                            string
+	in, out, cacheRead, cacheCreate sql.NullInt64
+}
+
+func tokensByAgent(db *store.DB) ([]tokenRow, error) {
+	rows, err := db.Query(`
+		SELECT agent_slug, SUM(input_tokens), SUM(output_tokens),
+		       SUM(cache_read_tokens), SUM(cache_creation_tokens)
+		FROM sessions
+		GROUP BY agent_slug
+		ORDER BY SUM(output_tokens) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []tokenRow
+	for rows.Next() {
+		var r tokenRow
+		if err := rows.Scan(&r.key, &r.in, &r.out, &r.cacheRead, &r.cacheCreate); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// fmtTokens renders a nullable token sum: "—" for NULL (agent reports no
+// usage), thousands-grouped digits otherwise.
+func fmtTokens(n sql.NullInt64) string {
+	if !n.Valid {
+		return "—"
+	}
+	s := fmt.Sprintf("%d", n.Int64)
+	if len(s) <= 3 {
+		return s
+	}
+	var b []byte
+	for i, c := range []byte(s) {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b = append(b, ',')
+		}
+		b = append(b, c)
+	}
+	return string(b)
 }
 
 func breakdownByAgent(db *store.DB) ([]breakdownRow, error) {

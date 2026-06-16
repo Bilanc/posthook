@@ -166,6 +166,8 @@ export function overviewSummary(f: Filters): OverviewSummary {
   // by intersecting with the sessions table directly, not via the CTE.
   const hours = workingHours(f);
 
+  const tokens = tokenTotals(f);
+
   // Max concurrent sessions in window.
   const parallel = maxConcurrent(f);
 
@@ -207,7 +209,48 @@ export function overviewSummary(f: Filters): OverviewSummary {
     commit_lines_added: commitTotals.added,
     commit_lines_removed: commitTotals.removed,
     ai_code_pct: aiCodePct,
+    input_tokens: tokens.input_tokens,
+    output_tokens: tokens.output_tokens,
+    cache_read_tokens: tokens.cache_read_tokens,
+    cache_creation_tokens: tokens.cache_creation_tokens,
   };
+}
+
+// Token sums over sessions in the filter window. Same filter semantics as
+// workingHours (dates/agents/engineers intersect the sessions table directly).
+// SUM over all-NULL groups stays null — "no agent in range reports usage".
+function tokenTotals(f: Filters): {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  cache_creation_tokens: number | null;
+} {
+  const conn = db();
+  let sql = `SELECT
+       SUM(s.input_tokens) AS input_tokens,
+       SUM(s.output_tokens) AS output_tokens,
+       SUM(s.cache_read_tokens) AS cache_read_tokens,
+       SUM(s.cache_creation_tokens) AS cache_creation_tokens
+     FROM sessions s
+     WHERE 1=1`;
+  const params: unknown[] = [];
+  if (f.from) {
+    sql += " AND datetime(s.started_at) >= datetime(?)";
+    params.push(localDayStartIso(f.from));
+  }
+  if (f.to) {
+    sql += " AND datetime(s.started_at) <= datetime(?)";
+    params.push(localDayEndIso(f.to));
+  }
+  if (f.agents.length > 0) {
+    sql += ` AND s.agent_slug IN (${f.agents.map(() => "?").join(",")})`;
+    params.push(...f.agents);
+  }
+  if (f.engineers.length > 0) {
+    sql += ` AND s.engineer_email IN (${f.engineers.map(() => "?").join(",")})`;
+    params.push(...f.engineers);
+  }
+  return conn.prepare(sql).get(...params) as ReturnType<typeof tokenTotals>;
 }
 
 function workingHours(f: Filters): number {

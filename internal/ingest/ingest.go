@@ -199,21 +199,30 @@ func AgentEvent(agentSlug string) error {
 		}
 	}
 
-	// Stop event: parse the Claude transcript to backfill model + span.
+	// Stop event: parse the transcript (Claude JSONL or Codex rollout — both
+	// hooks pass transcript_path) to backfill model + span + token totals.
+	// Token totals are whole-transcript sums, so plain overwrite is idempotent
+	// across repeated Stops in one session.
 	if eventType == "Stop" && sessionID != "" {
 		transcriptPath := pickString(payload, "transcript_path", "transcriptPath")
 		if transcriptPath != "" {
 			if summary := transcript.ParseFile(transcriptPath); summary != nil {
+				tokens := tokenArgs(summary.Tokens)
 				if _, err := db.Exec(`
 					UPDATE sessions SET
 						model_slug = COALESCE(?, model_slug),
 						started_at = COALESCE(?, started_at),
 						ended_at   = COALESCE(?, ended_at),
+						input_tokens          = COALESCE(?, input_tokens),
+						output_tokens         = COALESCE(?, output_tokens),
+						cache_read_tokens     = COALESCE(?, cache_read_tokens),
+						cache_creation_tokens = COALESCE(?, cache_creation_tokens),
 						synced_at  = NULL
 					WHERE id = ?`,
 					nullableString(summary.Model),
 					nullableString(summary.FirstTS),
 					nullableString(summary.LastTS),
+					tokens[0], tokens[1], tokens[2], tokens[3],
 					sessionID); err != nil {
 					logx.Warnf("transcript update failed: %v", err)
 				} else {
@@ -830,6 +839,20 @@ func normalizeEventType(et string) string {
 		return "PostToolUse"
 	}
 	return et
+}
+
+// tokenArgs flattens an optional TokenUsage into four nullable SQL args
+// (input, output, cache read, cache creation). All-NULL when the transcript
+// carried no usage data, so COALESCE leaves existing values untouched.
+func tokenArgs(t *transcript.TokenUsage) [4]sql.NullInt64 {
+	var out [4]sql.NullInt64
+	if t == nil {
+		return out
+	}
+	for i, v := range []int64{t.Input, t.Output, t.CacheRead, t.CacheCreation} {
+		out[i] = sql.NullInt64{Int64: v, Valid: true}
+	}
+	return out
 }
 
 func nullableString(s string) sql.NullString {

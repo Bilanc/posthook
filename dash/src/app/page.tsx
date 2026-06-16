@@ -2,8 +2,10 @@ import { KpiCard } from "@/components/kpi-card";
 import { FilterBar } from "@/components/filter-bar";
 import { SankeyFunnel } from "@/components/sankey-funnel";
 import { BreakdownBar } from "@/components/breakdown-bar";
+import { DailyUsageChart } from "@/components/daily-usage-chart";
 import { parseFilters, resolveFilters, type SearchParams } from "@/lib/filters";
 import { overviewSummary, funnel } from "@/lib/queries/overview";
+import { dailyUsage } from "@/lib/queries/daily";
 import {
   breakdownByAgent,
   breakdownByModel,
@@ -27,6 +29,11 @@ function fmtHours(n: number): string {
   return `${n.toFixed(1)}h`;
 }
 
+const compact = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
 export default async function OverviewPage({
   searchParams,
 }: {
@@ -37,6 +44,7 @@ export default async function OverviewPage({
   const options = filterOptions();
   const summary = overviewSummary(filters);
   const fn = funnel(filters);
+  const daily = dailyUsage(filters);
   const byAgent = breakdownByAgent(filters);
   const byModel = breakdownByModel(filters);
   const byRepo = breakdownByRepo(filters);
@@ -51,7 +59,7 @@ export default async function OverviewPage({
 
       <FilterBar filters={filters} options={options} />
 
-      <section className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
+      <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-8">
         <KpiCard
           label="AI code %"
           value={fmtPct(summary.ai_code_pct)}
@@ -83,6 +91,23 @@ export default async function OverviewPage({
           value={String(summary.max_concurrent)}
           sublabel="peak concurrent sessions"
         />
+        <KpiCard
+          label="Tokens in / out"
+          value={
+            summary.input_tokens == null && summary.output_tokens == null
+              ? "—"
+              : `${compact.format(summary.input_tokens ?? 0)} / ${compact.format(summary.output_tokens ?? 0)}`
+          }
+          sublabel={
+            summary.cache_read_tokens == null
+              ? "Claude Code & Codex only"
+              : `${compact.format(summary.cache_read_tokens)} cache reads`
+          }
+        />
+      </section>
+
+      <section className="mb-8">
+        <DailyUsageChart from={filters.from} to={filters.to} data={daily} />
       </section>
 
       <section className="mb-8">
