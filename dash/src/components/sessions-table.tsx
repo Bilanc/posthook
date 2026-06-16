@@ -10,6 +10,17 @@ function fmtNum(n: number): string {
   return new Intl.NumberFormat("en-US").format(Math.round(n));
 }
 
+const compact = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
+// in/out token pair; null = agent doesn't report usage (Cursor).
+function fmtTokens(input: number | null, output: number | null): string {
+  if (input == null && output == null) return "—";
+  return `${compact.format(input ?? 0)} / ${compact.format(output ?? 0)}`;
+}
+
 function fmtDuration(hours: number | null): string {
   if (hours == null || hours === 0) return "—";
   if (hours < 1) return `${Math.round(hours * 60)}m`;
@@ -53,6 +64,7 @@ export function SessionsTable({ rows }: Props) {
             <th className="text-left px-4 py-2.5 font-medium">Engineer</th>
             <th className="text-left px-4 py-2.5 font-medium">Repo</th>
             <th className="text-right px-4 py-2.5 font-medium">Lines gen</th>
+            <th className="text-right px-4 py-2.5 font-medium">Tokens in/out</th>
             <th className="text-right px-4 py-2.5 font-medium">Edits</th>
             <th className="text-right px-4 py-2.5 font-medium">Files</th>
             <th className="text-right px-4 py-2.5 font-medium">Commits</th>
@@ -88,6 +100,9 @@ export function SessionsTable({ rows }: Props) {
               </td>
               <td className="px-4 py-2.5 text-right tabular-nums">
                 {fmtNum(r.lines_generated)}
+              </td>
+              <td className="px-4 py-2.5 text-right tabular-nums text-[var(--color-fg-muted)]">
+                {fmtTokens(r.input_tokens, r.output_tokens)}
               </td>
               <td className="px-4 py-2.5 text-right tabular-nums">{r.edits}</td>
               <td className="px-4 py-2.5 text-right tabular-nums">{r.files_touched}</td>

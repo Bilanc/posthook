@@ -101,6 +101,9 @@ func Open() (*DB, error) {
 	if _, err := db.backfillSessionEngineers(); err != nil {
 		return nil, err
 	}
+	if _, err := db.backfillSessionTokens(); err != nil {
+		return nil, err
+	}
 
 	if currentVersion < schemaVersion ||
 		eventSessionsBackfilled > 0 ||

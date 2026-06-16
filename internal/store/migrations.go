@@ -89,6 +89,25 @@ func (db *DB) applyMigrations() error {
 			return err
 		}
 	}
+
+	// v7 → v8: sessions re-gain token columns, this time NULLable. v3 dropped
+	// them because cross-agent zeros were misleading; NULL now means "agent
+	// doesn't report usage" (Cursor) while Claude Code and Codex fill them
+	// from the Stop-hook transcript. Names differ from the v3 set on purpose —
+	// the v3 drop block above still removes the old names on every open.
+	sessionColsV8, err := db.columnSet("sessions")
+	if err != nil {
+		return err
+	}
+	for _, col := range []string{
+		"input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+	} {
+		if !sessionColsV8[col] {
+			if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE sessions ADD COLUMN %s INTEGER`, col)); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

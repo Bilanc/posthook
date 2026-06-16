@@ -16,6 +16,11 @@ function fmtNum(n: number): string {
   return new Intl.NumberFormat("en-US").format(Math.round(n));
 }
 
+const compact = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
 function fmtDateTime(iso: string | null): string {
   if (!iso) return "—";
   try {
@@ -76,7 +81,7 @@ export default async function SessionDetailPage({
       </div>
 
       {/* Header KPIs */}
-      <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-8">
+      <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-8">
         <Kpi label="Agent" value={session.agent_slug} />
         <Kpi label="Model" value={session.model_slug ?? "—"} />
         <Kpi
@@ -85,6 +90,14 @@ export default async function SessionDetailPage({
         />
         <Kpi label="Repo" value={session.repo_name ?? "—"} />
         <Kpi label="Lines generated" value={fmtNum(session.lines_generated)} />
+        <Kpi
+          label="Tokens in / out"
+          value={
+            session.input_tokens == null && session.output_tokens == null
+              ? "—"
+              : `${compact.format(session.input_tokens ?? 0)} / ${compact.format(session.output_tokens ?? 0)}`
+          }
+        />
         <Kpi
           label="Duration"
           value={fmtDuration(session.started_at, session.ended_at)}

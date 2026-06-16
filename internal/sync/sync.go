@@ -88,7 +88,7 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 		keys []map[string]any
 	}
 	pending := map[string]pendingRows{}
-	payload := ingestPayload{SchemaVersion: 7, Tables: map[string][]map[string]any{}}
+	payload := ingestPayload{SchemaVersion: 8, Tables: map[string][]map[string]any{}}
 
 	for _, table := range store.SyncableTables {
 		rows, keys, err := selectPending(db, table, defaultBatchSize)

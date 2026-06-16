@@ -29,6 +29,11 @@ function fmtHours(n: number): string {
   return `${n.toFixed(1)}h`;
 }
 
+const compact = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+
 export default async function OverviewPage({
   searchParams,
 }: {
@@ -54,7 +59,7 @@ export default async function OverviewPage({
 
       <FilterBar filters={filters} options={options} />
 
-      <section className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
+      <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-8">
         <KpiCard
           label="AI code %"
           value={fmtPct(summary.ai_code_pct)}
@@ -85,6 +90,19 @@ export default async function OverviewPage({
           label="Max parallel agents"
           value={String(summary.max_concurrent)}
           sublabel="peak concurrent sessions"
+        />
+        <KpiCard
+          label="Tokens in / out"
+          value={
+            summary.input_tokens == null && summary.output_tokens == null
+              ? "—"
+              : `${compact.format(summary.input_tokens ?? 0)} / ${compact.format(summary.output_tokens ?? 0)}`
+          }
+          sublabel={
+            summary.cache_read_tokens == null
+              ? "Claude Code & Codex only"
+              : `${compact.format(summary.cache_read_tokens)} cache reads`
+          }
         />
       </section>
 

@@ -1,15 +1,21 @@
-// Package transcript parses Claude Code session transcript JSONL files for
-// model and timestamp metadata, and for prompt extraction during posthook
-// blame.
+// Package transcript parses agent session transcript JSONL files for model,
+// timestamp, and token-usage metadata, and for prompt extraction during
+// posthook blame. Two shapes are recognized, per-line, in a single pass:
 //
-// Each line is a record like:
+// Claude Code (~/.claude/projects/**.jsonl):
 //
-//	{type: "assistant", message: {model, role, content}, timestamp}
+//	{type: "assistant", message: {id, model, role, content, usage}, timestamp}
 //	{type: "user",      message: {role, content}, timestamp}
 //
-// Token counts are intentionally not extracted — they're only available for
-// Claude Code and presenting them per-session in metrics is misleading when
-// Cursor/Codex are zero. Anything that wants tokens can re-parse the JSONL.
+// Codex rollouts (~/.codex/sessions/**.jsonl), which the Codex Stop hook also
+// hands us via transcript_path:
+//
+//	{type: "event_msg", payload: {type: "token_count", info: {total_token_usage}}, timestamp}
+//
+// Tokens are nullable by design: Cursor exposes no usage anywhere, so a
+// session without a Tokens summary means "agent doesn't report usage", not
+// zero. (Session token columns were dropped in schema v3 because cross-agent
+// zeros were misleading; v8 re-adds them as NULLable for exactly this reason.)
 package transcript
 
 import (
@@ -18,23 +24,61 @@ import (
 	"strings"
 )
 
+// TokenUsage is a whole-session token total. Input is uncached input tokens;
+// cache reads/writes are broken out so the two never double-count. For Codex,
+// input_tokens includes cached_input_tokens upstream — we subtract so Input
+// means the same thing for both agents. Codex has no cache-write concept, so
+// CacheCreation stays 0 there.
+type TokenUsage struct {
+	Input         int64
+	Output        int64
+	CacheRead     int64
+	CacheCreation int64
+}
+
 type Summary struct {
 	Model                  string
 	AssistantMessageCount  int
 	FirstTS                string
 	LastTS                 string
+	Tokens                 *TokenUsage // nil when the transcript carries no usage data
 }
 
 type record struct {
-	Type      string          `json:"type"`
-	Timestamp string          `json:"timestamp"`
+	Type      string           `json:"type"`
+	Timestamp string           `json:"timestamp"`
 	Message   *messageEnvelope `json:"message"`
+	Payload   *codexPayload    `json:"payload"`
 }
 
 type messageEnvelope struct {
+	ID      string          `json:"id"`
 	Model   string          `json:"model"`
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	Usage   *claudeUsage    `json:"usage"`
+}
+
+type claudeUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+}
+
+type codexPayload struct {
+	Type string     `json:"type"`
+	Info *codexInfo `json:"info"`
+}
+
+type codexInfo struct {
+	TotalTokenUsage *codexUsage `json:"total_token_usage"`
+}
+
+type codexUsage struct {
+	InputTokens       int64 `json:"input_tokens"`
+	CachedInputTokens int64 `json:"cached_input_tokens"`
+	OutputTokens      int64 `json:"output_tokens"`
 }
 
 // ParseFile reads a Claude transcript JSONL and returns model + timestamp
@@ -54,6 +98,14 @@ func parseString(raw string) *Summary {
 	modelCounts := map[string]int{}
 	out := &Summary{}
 
+	// Claude repeats one API message across several JSONL lines (one per
+	// content block), each carrying the same usage — dedup by message id so a
+	// 3-block reply doesn't count 3x. Codex's total_token_usage is cumulative,
+	// so the last token_count event IS the session total.
+	claudeByMsgID := map[string]claudeUsage{}
+	var claudeNoID []claudeUsage
+	var codexTotal *codexUsage
+
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -70,12 +122,25 @@ func parseString(raw string) *Summary {
 				out.LastTS = rec.Timestamp
 			}
 		}
+		if rec.Type == "event_msg" && rec.Payload != nil &&
+			rec.Payload.Type == "token_count" &&
+			rec.Payload.Info != nil && rec.Payload.Info.TotalTokenUsage != nil {
+			codexTotal = rec.Payload.Info.TotalTokenUsage
+			continue
+		}
 		if rec.Type != "assistant" || rec.Message == nil {
 			continue
 		}
 		out.AssistantMessageCount++
 		if rec.Message.Model != "" {
 			modelCounts[rec.Message.Model]++
+		}
+		if u := rec.Message.Usage; u != nil {
+			if rec.Message.ID != "" {
+				claudeByMsgID[rec.Message.ID] = *u
+			} else {
+				claudeNoID = append(claudeNoID, *u)
+			}
 		}
 	}
 
@@ -88,7 +153,35 @@ func parseString(raw string) *Summary {
 		}
 	}
 	out.Model = top
+	out.Tokens = sumTokens(claudeByMsgID, claudeNoID, codexTotal)
 	return out
+}
+
+func sumTokens(byMsgID map[string]claudeUsage, noID []claudeUsage, codexTotal *codexUsage) *TokenUsage {
+	if codexTotal != nil {
+		return &TokenUsage{
+			Input:     codexTotal.InputTokens - codexTotal.CachedInputTokens,
+			Output:    codexTotal.OutputTokens,
+			CacheRead: codexTotal.CachedInputTokens,
+		}
+	}
+	if len(byMsgID) == 0 && len(noID) == 0 {
+		return nil
+	}
+	t := &TokenUsage{}
+	add := func(u claudeUsage) {
+		t.Input += u.InputTokens
+		t.Output += u.OutputTokens
+		t.CacheRead += u.CacheReadInputTokens
+		t.CacheCreation += u.CacheCreationInputTokens
+	}
+	for _, u := range byMsgID {
+		add(u)
+	}
+	for _, u := range noID {
+		add(u)
+	}
+	return t
 }
 
 // FindPromptBefore returns the text of the most recent user-role message in
