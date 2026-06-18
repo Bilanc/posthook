@@ -5,7 +5,12 @@ package store
 // UUIDs without a schema change.
 const LocalOrgID = "local"
 
-const schemaVersion = 8
+// schemaVersion gates one-time migration + backfill work in Open(). Bump it
+// whenever a new migration or backfill must run on upgrade. v9 carries no
+// column changes — the bump exists so the move to gated (non-per-open)
+// maintenance triggers one final backfill+attribution pass on first upgrade,
+// after which Open() takes the fast connect-only path.
+const schemaVersion = 9
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns

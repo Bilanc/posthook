@@ -24,6 +24,7 @@ func NewRootCmd() *cobra.Command {
 		newBlameCmd(),
 		newDashCmd(),
 		newSyncCmd(),
+		newWorkerCmd(),
 		newIdentityCmd(),
 		newServiceCmd(),
 		newVersionCmd(),

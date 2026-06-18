@@ -11,9 +11,14 @@ import (
 
 const cursorAgentSlug = "cursor"
 
+// postToolUse + afterFileEdit carry the edits we attribute; beforeSubmitPrompt
+// marks session/prompt boundaries. preToolUse fired on every tool call with no
+// data we keep, so it's dropped and stripped on install.
 var cursorHookTypes = []string{
-	"preToolUse", "postToolUse", "beforeSubmitPrompt", "afterFileEdit",
+	"postToolUse", "beforeSubmitPrompt", "afterFileEdit",
 }
+
+var cursorDeprecatedHookTypes = []string{"preToolUse"}
 
 func DetectCursor() bool {
 	dir := filepath.Dir(paths.CursorHooksPath())
@@ -83,6 +88,30 @@ func InstallCursorHooks(binaryPath string) (Result, error) {
 			deduped = append(deduped, h)
 		}
 		hooksObj[hookType] = deduped
+	}
+
+	// Retire event types we no longer register: drop our command (and any
+	// hook-type left empty), keeping user hooks intact.
+	for _, hookType := range cursorDeprecatedHookTypes {
+		arr, ok := hooksObj[hookType].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(arr))
+		for _, h := range arr {
+			hm, ok := h.(map[string]any)
+			if ok {
+				if cmd, _ := hm["command"].(string); IsPosthookCommand(cmd, cursorAgentSlug) {
+					continue
+				}
+			}
+			kept = append(kept, h)
+		}
+		if len(kept) == 0 {
+			delete(hooksObj, hookType)
+		} else {
+			hooksObj[hookType] = kept
+		}
 	}
 
 	afterJSON, _ := json.Marshal(after)

@@ -11,7 +11,16 @@ import (
 
 const claudeAgentSlug = "claude-code"
 
-var claudeHookTypes = []string{"PreToolUse", "PostToolUse", "SessionStart", "Stop"}
+// claudeHookTypes are the events posthook actually needs: PostToolUse carries
+// the file edits we attribute, Stop carries the transcript (model + tokens).
+// PreToolUse and SessionStart fired on every tool call / session with no data
+// we keep, doubling hook spawns for nothing — they're now stripped on install.
+var claudeHookTypes = []string{"PostToolUse", "Stop"}
+
+// claudeDeprecatedHookTypes are events posthook used to register but no longer
+// does. On (re)install we remove our command from these so upgraded users stop
+// firing redundant hooks.
+var claudeDeprecatedHookTypes = []string{"PreToolUse", "SessionStart"}
 
 // DetectClaudeCode reports whether ~/.claude/ exists.
 func DetectClaudeCode() bool {
@@ -133,6 +142,12 @@ func InstallClaudeCodeHooks(binaryPath string) (Result, error) {
 		hooksObj[hookType] = blocks
 	}
 
+	// Remove our command from event types we no longer register, so upgraded
+	// installs stop firing redundant hooks. User hooks under these types stay.
+	for _, hookType := range claudeDeprecatedHookTypes {
+		stripClaudeHook(hooksObj, hookType)
+	}
+
 	afterJSON, _ := json.Marshal(after)
 	changed := string(beforeJSON) != string(afterJSON)
 	if changed {
@@ -145,6 +160,48 @@ func InstallClaudeCodeHooks(binaryPath string) (Result, error) {
 		msg = fmt.Sprintf("Claude Code: hooks installed in %s", path)
 	}
 	return Result{Changed: changed, Path: path, Message: msg}, nil
+}
+
+// stripClaudeHook removes posthook's command from every block under a hook
+// type, dropping blocks left empty and the hook-type key if no blocks remain.
+// No-op when the type isn't present. Used to retire deprecated event types.
+func stripClaudeHook(hooksObj map[string]any, hookType string) {
+	blocks, ok := hooksObj[hookType].([]any)
+	if !ok {
+		return
+	}
+	keptBlocks := make([]any, 0, len(blocks))
+	for _, b := range blocks {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			keptBlocks = append(keptBlocks, b)
+			continue
+		}
+		inner, _ := bm["hooks"].([]any)
+		kept := make([]any, 0, len(inner))
+		for _, h := range inner {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				kept = append(kept, h)
+				continue
+			}
+			cmd, _ := hm["command"].(string)
+			if !IsPosthookCommand(cmd, claudeAgentSlug) {
+				kept = append(kept, h)
+			}
+		}
+		// Drop a block that only ever held our (now-removed) command.
+		if len(kept) == 0 {
+			continue
+		}
+		bm["hooks"] = kept
+		keptBlocks = append(keptBlocks, bm)
+	}
+	if len(keptBlocks) == 0 {
+		delete(hooksObj, hookType)
+		return
+	}
+	hooksObj[hookType] = keptBlocks
 }
 
 func getOrMakeMap(parent map[string]any, key string) map[string]any {

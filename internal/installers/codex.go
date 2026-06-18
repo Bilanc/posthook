@@ -18,7 +18,11 @@ import (
 
 const codexAgentSlug = "codex"
 
-var codexHookEvents = []string{"PreToolUse", "PostToolUse", "Stop"}
+// PostToolUse carries edits, Stop carries the transcript. PreToolUse fired on
+// every tool call with no data we keep — dropped and stripped on install.
+var codexHookEvents = []string{"PostToolUse", "Stop"}
+
+var codexDeprecatedHookEvents = []string{"PreToolUse"}
 
 func DetectCodex() bool {
 	dir := filepath.Dir(paths.CodexConfigPath())
@@ -165,6 +169,12 @@ func InstallCodexHooks(binaryPath string) (Result, error) {
 		hooksTable[event] = blocks
 	}
 
+	// Retire event types we no longer register: strip our command (and any
+	// now-empty blocks) plus their trust-state entries.
+	for _, event := range codexDeprecatedHookEvents {
+		stripCodexHook(hooksTable, path, event)
+	}
+
 	afterJSON, _ := json.Marshal(config)
 	changed := string(beforeJSON) != string(afterJSON)
 	if changed {
@@ -181,6 +191,53 @@ func InstallCodexHooks(binaryPath string) (Result, error) {
 		msg = fmt.Sprintf("Codex CLI: hooks installed in %s", path)
 	}
 	return Result{Changed: changed, Path: path, Message: msg}, nil
+}
+
+// stripCodexHook removes posthook's command from a deprecated event type:
+// it filters our command out of every block, drops blocks left empty, removes
+// the event key if nothing remains, and clears matching trust-state entries.
+func stripCodexHook(hooksTable map[string]any, configPath, event string) {
+	if blocks, ok := hooksTable[event].([]any); ok {
+		kept := make([]any, 0, len(blocks))
+		for _, b := range blocks {
+			bm, ok := b.(map[string]any)
+			if !ok {
+				kept = append(kept, b)
+				continue
+			}
+			inner, _ := bm["hooks"].([]any)
+			keptInner := make([]any, 0, len(inner))
+			for _, h := range inner {
+				hm, ok := h.(map[string]any)
+				if ok {
+					if cmd, _ := hm["command"].(string); IsPosthookCommand(cmd, codexAgentSlug) {
+						continue
+					}
+				}
+				keptInner = append(keptInner, h)
+			}
+			if len(keptInner) == 0 {
+				continue
+			}
+			bm["hooks"] = keptInner
+			kept = append(kept, bm)
+		}
+		if len(kept) == 0 {
+			delete(hooksTable, event)
+		} else {
+			hooksTable[event] = kept
+		}
+	}
+
+	// Drop trust-state entries for this event (keyed configPath:event_name:…).
+	if state, ok := hooksTable["state"].(map[string]any); ok {
+		prefix := configPath + ":" + eventNameToSnakeCase(event) + ":"
+		for k := range state {
+			if strings.HasPrefix(k, prefix) {
+				delete(state, k)
+			}
+		}
+	}
 }
 
 func trustCodexHook(

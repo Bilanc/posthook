@@ -27,6 +27,7 @@ import (
 	"github.com/bilanc/posthook/internal/lineranges"
 	"github.com/bilanc/posthook/internal/logx"
 	"github.com/bilanc/posthook/internal/paths"
+	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 	"github.com/bilanc/posthook/internal/transcript"
 	"github.com/google/uuid"
@@ -36,21 +37,40 @@ var editTools = map[string]bool{
 	"Edit": true, "Write": true, "MultiEdit": true,
 }
 
-// AgentEvent reads an agent hook payload from stdin and ingests it.
-func AgentEvent(agentSlug string) error {
-	db, err := store.Open()
-	if err != nil {
-		return err
-	}
+// SpoolAgentEvent is the synchronous hook path: capture the payload + cwd and
+// hand them to the spool, then return. It deliberately does no DB or git work
+// so the hook stays fast and can't pile up under tool-call bursts — the worker
+// drains the spool and does the real ingest via ProcessAgentEnvelope.
+func SpoolAgentEvent(agentSlug string) error {
 	raw, err := readStdin()
 	if err != nil {
 		return err
 	}
+	cwd, _ := os.Getwd()
+	return spool.Write(spool.Envelope{
+		Agent:      agentSlug,
+		Cwd:        cwd,
+		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Payload:    raw,
+	})
+}
+
+// ProcessAgentEnvelope ingests one spooled agent event into the store. This is
+// the heavy path (DB + git + transcript parsing) and runs in the background
+// worker, not in the hook. cwd comes from the envelope (captured at fire time)
+// because the worker runs in a different working directory.
+func ProcessAgentEnvelope(env spool.Envelope) error {
+	db, err := store.Open()
+	if err != nil {
+		return err
+	}
+	agentSlug := env.Agent
+	raw := env.Payload
 	if strings.TrimSpace(string(raw)) == "" {
 		// Hook fired with no payload — usually a misconfigured agent or a
 		// hook invoked outside its expected flow. Record it so `posthook
 		// status` surfaces data-quality issues.
-		if err := recordHookMisfire(db, agentSlug); err != nil {
+		if err := recordHookMisfire(db, agentSlug, env.Cwd); err != nil {
 			return err
 		}
 		logx.Debugf("ingest --agent %s: no stdin payload, recorded misfire", agentSlug)
@@ -78,7 +98,9 @@ func AgentEvent(agentSlug string) error {
 	}
 	cwd := pickString(payload, "cwd")
 	if cwd == "" {
-		cwd, _ = os.Getwd()
+		// Fall back to the cwd captured by the hook at fire time (env.Cwd),
+		// not the worker's own cwd which is unrelated.
+		cwd = env.Cwd
 	}
 	workspaceRoots := extractWorkspaceRoots(payload)
 	applyPatchFiles := applyPatchFilesForPayload(payload)
@@ -236,8 +258,10 @@ func AgentEvent(agentSlug string) error {
 	return nil
 }
 
-func recordHookMisfire(db *store.DB, agentSlug string) error {
-	cwd, _ := os.Getwd()
+func recordHookMisfire(db *store.DB, agentSlug, cwd string) error {
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 	root := gitx.FindRepoRoot(cwd)
 	var repoID sql.NullString
 	if root != "" {

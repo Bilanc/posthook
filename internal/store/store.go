@@ -55,77 +55,87 @@ func Open() (*DB, error) {
 	sqlDB.SetMaxOpenConns(1)
 
 	db := &DB{DB: sqlDB}
-	if _, err := db.Exec(schemaSQL); err != nil {
-		return nil, fmt.Errorf("apply schema: %w", err)
-	}
-	if err := db.applyMigrations(); err != nil {
-		return nil, fmt.Errorf("apply migrations: %w", err)
-	}
 
-	currentVersion := db.currentSchemaVersion()
-	if err := db.normalizeEventTypes(); err != nil {
-		return nil, err
-	}
-
-	eventSessionsBackfilled, err := db.backfillEventSessions()
-	if err != nil {
-		return nil, err
-	}
-	eventReposBackfilled, err := db.backfillEventRepos()
-	if err != nil {
-		return nil, err
-	}
-	lineRangeRelPathsBackfilled, err := db.backfillLineRangeRelPaths()
-	if err != nil {
-		return nil, err
-	}
-	afterFileEditRangesBackfilled, err := db.backfillAfterFileEditLineRanges()
-	if err != nil {
-		return nil, err
-	}
-	applyPatchRangesBackfilled, err := db.backfillApplyPatchLineRanges()
-	if err != nil {
-		return nil, err
-	}
-	duplicateCursorRangesDeleted, err := db.deleteDuplicateCursorPostToolUseEditRanges()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.backfillSessionRepos(); err != nil {
-		return nil, err
-	}
-	sessionModelsBackfilled, err := db.backfillSessionModels()
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.backfillSessionEngineers(); err != nil {
-		return nil, err
-	}
-	if _, err := db.backfillSessionTokens(); err != nil {
-		return nil, err
-	}
-
-	if currentVersion < schemaVersion ||
-		eventSessionsBackfilled > 0 ||
-		eventReposBackfilled > 0 ||
-		lineRangeRelPathsBackfilled > 0 ||
-		afterFileEditRangesBackfilled > 0 ||
-		applyPatchRangesBackfilled > 0 ||
-		duplicateCursorRangesDeleted > 0 ||
-		sessionModelsBackfilled > 0 {
-		if _, err := db.RefreshCommitAttributions(""); err != nil {
-			return nil, err
-		}
-	}
-
-	if currentVersion < schemaVersion {
-		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
+	// Steady-state fast path. The schema apply, migrations, full-table
+	// backfills, and attribution refresh are one-time *upgrade* work, not
+	// per-open work — running them on every `posthook ingest` was scanning the
+	// whole DB on every agent tool call and, under hook spawn-bursts, piling up
+	// processes that saturated the CPU. Once the on-disk schema matches this
+	// binary, opening the DB is just connect + pragmas. Maintenance re-runs only
+	// when the binary is newer than the DB (a version bump below forces exactly
+	// one pass after an upgrade).
+	if db.currentSchemaVersion() < schemaVersion {
+		if err := db.migrate(); err != nil {
+			cached = nil
+			_ = sqlDB.Close()
 			return nil, err
 		}
 	}
 
 	cached = db
 	return cached, nil
+}
+
+// migrate brings an out-of-date database up to the current schemaVersion: it
+// applies the schema + idempotent column migrations, runs the data-repair
+// backfills, refreshes attribution, and records the new version. Gated by
+// Open() so it runs once per upgrade rather than on every ingest.
+func (db *DB) migrate() error {
+	if _, err := db.Exec(schemaSQL); err != nil {
+		return fmt.Errorf("apply schema: %w", err)
+	}
+	if err := db.applyMigrations(); err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+
+	currentVersion := db.currentSchemaVersion()
+	if err := db.normalizeEventTypes(); err != nil {
+		return err
+	}
+
+	if _, err := db.backfillEventSessions(); err != nil {
+		return err
+	}
+	if _, err := db.backfillEventRepos(); err != nil {
+		return err
+	}
+	if _, err := db.backfillLineRangeRelPaths(); err != nil {
+		return err
+	}
+	if _, err := db.backfillAfterFileEditLineRanges(); err != nil {
+		return err
+	}
+	if _, err := db.backfillApplyPatchLineRanges(); err != nil {
+		return err
+	}
+	if _, err := db.deleteDuplicateCursorPostToolUseEditRanges(); err != nil {
+		return err
+	}
+	if _, err := db.backfillSessionRepos(); err != nil {
+		return err
+	}
+	if _, err := db.backfillSessionModels(); err != nil {
+		return err
+	}
+	if _, err := db.backfillSessionEngineers(); err != nil {
+		return err
+	}
+	if _, err := db.backfillSessionTokens(); err != nil {
+		return err
+	}
+
+	// The backfills above only touch rows that need repair; on a one-shot
+	// upgrade pass we simply refresh attribution once to fold them in.
+	if _, err := db.RefreshCommitAttributions(""); err != nil {
+		return err
+	}
+
+	if currentVersion < schemaVersion {
+		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (db *DB) currentSchemaVersion() int {
