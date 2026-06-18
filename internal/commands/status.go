@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bilanc/posthook/internal/config"
+	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 
 	"github.com/spf13/cobra"
@@ -48,6 +49,8 @@ func runStatus() error {
 	fmt.Printf("  repositories: %d\n", totals.repos)
 	printIdentityLine()
 	fmt.Println()
+
+	printIngestQueue()
 
 	printShadowHealth(CheckShadowHealth())
 
@@ -190,6 +193,32 @@ func printIdentityLine() {
 		fmt.Println("  ⚠ Cloud sync is on but no engineer identity is set — sessions may sync")
 		fmt.Println("    unattributed. Fix: posthook identity --setup")
 	}
+}
+
+// printIngestQueue surfaces the async ingest path: agent hooks drop events in
+// the spool and a background worker drains them into the store. A persistently
+// non-empty spool with no worker means events aren't landing — worth flagging.
+func printIngestQueue() {
+	pending, err := spool.Pending()
+	if err != nil {
+		return
+	}
+	running := workerRunning()
+	if pending == 0 && running {
+		return // healthy and quiet
+	}
+	fmt.Println("Ingest queue:")
+	fmt.Printf("  spooled events: %d\n", pending)
+	if running {
+		fmt.Println("  worker:         running")
+	} else {
+		fmt.Println("  worker:         not running")
+		if pending > 0 {
+			fmt.Println("  ⚠ Events are queued but no worker is draining them. A worker auto-starts")
+			fmt.Println("    on the next agent tool call, or start one now: posthook worker")
+		}
+	}
+	fmt.Println()
 }
 
 func printShadowHealth(h ShadowHealth) {

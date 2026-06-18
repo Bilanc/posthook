@@ -64,11 +64,13 @@ posthook dash                   # open the web dashboard (needs Node >=24)
 
 | Source | How | What |
 |---|---|---|
-| **Claude Code** | hooks in `~/.claude/settings.json` (`PreToolUse`, `PostToolUse`, `SessionStart`, `Stop`) | every tool call (Edit, Write, Bash, Read, …), full payload, session start/end, model |
-| **Cursor** | hooks in `~/.cursor/hooks.json` (`preToolUse`, `postToolUse`, `beforeSubmitPrompt`, `afterFileEdit`) | every tool call + prompt submission |
-| **Codex CLI** | inline hooks in `~/.codex/config.toml` (`PreToolUse`, `PostToolUse`, `Stop`) + `features.hooks = true` | every tool call + session end |
+| **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call, full payload, session end, model |
+| **Cursor** | hooks in `~/.cursor/hooks.json` (`postToolUse`, `beforeSubmitPrompt`, `afterFileEdit`) | every tool call + prompt submission |
+| **Codex CLI** | inline hooks in `~/.codex/config.toml` (`PostToolUse`, `Stop`) + `features.hooks = true` | every tool call + session end |
 | **Git (shadow)** | `~/.local/bin/git` symlink → posthook binary, intercepts every git command on every repo | every successful `git commit` and `git clone`. All other git commands pass through with zero overhead. Line-attribution metadata is written to `refs/notes/posthook`. |
 | **Git (fallback)** | per-repo `post-commit` hook (auto-installed in new repos via `init.templateDir`, manual `posthook track` for existing repos) | same as the shadow. Coexists safely — commit ingest is idempotent via `UNIQUE(repo_id, sha)`. |
+
+Agent hooks fire on the critical path of every tool call, so they do the bare minimum: each `posthook ingest` captures the payload to an append-only spool (`~/.posthook/spool/`) and returns in milliseconds. A single background worker (`posthook worker`, auto-started by the hooks and self-terminating when idle) drains the spool into SQLite — so the heavy work (DB writes, git lookups, transcript parsing) happens once, off the hot path, and bursts of tool calls can never pile up. Check the queue with `posthook status`.
 
 For Claude Code, the `Stop` hook parses the session transcript at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` to backfill the model name and session timespan. For all three agents, when a `PostToolUse` event arrives for an `Edit`/`Write`/`MultiEdit`, posthook reads the post-edit file and records the exact line range the AI wrote.
 
@@ -101,7 +103,8 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 - `posthook service install|uninstall|status` — manage a background daemon (launchd on macOS, systemd `--user` on Linux) that runs `posthook sync --loop` so a connected machine keeps flushing across reboots. The team installer sets this up automatically.
 - `posthook track <repo-path>` — install the fallback per-repo `post-commit` hook for an existing repo.
 - `posthook install-shadow` / `posthook uninstall-shadow` — manage the `git` symlink directly.
-- `posthook ingest …` — read an agent or git payload from stdin and record it. Called by the hooks; you won't run it by hand.
+- `posthook ingest …` — read an agent or git payload from stdin. Called by the hooks; you won't run it by hand. Agent events are spooled and drained asynchronously; git commits are recorded synchronously.
+- `posthook worker` — background daemon that drains the agent-event spool into the store. Auto-started by the hooks (singleton; idle-exits). You won't normally run it by hand.
 
 ## The dashboard
 
@@ -141,7 +144,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 By default, everything stays in `~/.posthook/posthook.db` on your machine. No HTTP calls, no telemetry, no account.
 
 **What's stored locally:**
-- **Tool-call payloads, verbatim**, in `events.payload`. For `Edit` calls this includes `old_string` and `new_string`; for `Bash` calls, the command. If your environment requires redaction, the place to add it is `internal/ingest/ingest.go` (see `AgentEvent`).
+- **Tool-call payloads, verbatim**, in `events.payload`. For `Edit` calls this includes `old_string` and `new_string`; for `Bash` calls, the command. If your environment requires redaction, the place to add it is `internal/ingest/ingest.go` (see `ProcessAgentEnvelope`).
 - Absolute file paths, plus a derived repo-relative path.
 - Commit metadata (author email, message subject, file paths) from your local git.
 
