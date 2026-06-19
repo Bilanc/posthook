@@ -27,6 +27,7 @@ func NewRootCmd() *cobra.Command {
 		newWorkerCmd(),
 		newIdentityCmd(),
 		newServiceCmd(),
+		newUpdateCmd(),
 		newVersionCmd(),
 	)
 	return root
