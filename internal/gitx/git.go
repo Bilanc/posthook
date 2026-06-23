@@ -81,3 +81,14 @@ func Run(cwd string, args ...string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// Output runs `git <args>` in cwd with POSTHOOK_BYPASS=1 and returns the raw,
+// untrimmed stdout. Unlike Run, it preserves exact bytes (trailing newlines,
+// leading whitespace) — required when parsing diff hunks or hashing blob
+// content, where trimming would change line counts and content hashes.
+func Output(cwd string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	cmd.Env = BypassEnv()
+	return cmd.Output()
+}
