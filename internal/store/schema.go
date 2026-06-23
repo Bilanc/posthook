@@ -10,7 +10,11 @@ const LocalOrgID = "local"
 // column changes — the bump exists so the move to gated (non-per-open)
 // maintenance triggers one final backfill+attribution pass on first upgrade,
 // after which Open() takes the fast connect-only path.
-const schemaVersion = 9
+//
+// v10 carries no column changes either: it forces one attribution refresh so
+// the new committed-diff-intersection logic (attribution.go) recomputes every
+// commit's lines_attributed, replacing the old churn-summing values.
+const schemaVersion = 10
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
@@ -171,39 +175,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 `
 
-// attributedRangesCTE is the workhorse query for joining commits to AI line
-// ranges. The boundary for attribution is the next commit that touches the
-// same file (NOT the next repo commit), so back-to-back commits on different
-// files don't steal attribution from each other.
-const attributedRangesCTE = `
-WITH attributed_ranges AS (
-  SELECT
-    c.id AS commit_id,
-    cf.file_path AS rel_file_path,
-    e.id AS event_id,
-    e.session_id,
-    e.agent_slug,
-    COALESCE(s.model_slug, json_extract(e.payload, '$.model')) AS model_slug,
-    e.ts AS event_ts,
-    elr.new_text_lines
-  FROM commits c
-  JOIN commit_files cf ON cf.commit_id = c.id
-  JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
-  JOIN events e ON e.id = elr.event_id
-  JOIN sessions s ON s.id = e.session_id
-  WHERE e.repo_id = c.repo_id
-    AND e.session_id IS NOT NULL
-    AND elr.rel_file_path IS NOT NULL
-    AND datetime(c.committed_at) >= datetime(e.ts)
-    AND (? IS NULL OR c.id = ?)
-    AND NOT EXISTS (
-      SELECT 1
-      FROM commits c2
-      JOIN commit_files cf2 ON cf2.commit_id = c2.id
-      WHERE c2.repo_id = c.repo_id
-        AND cf2.file_path = cf.file_path
-        AND datetime(c2.committed_at) >= datetime(e.ts)
-        AND datetime(c2.committed_at) < datetime(c.committed_at)
-    )
-)
-`
+// Commit -> AI line-range attribution now lives in attribution.go
+// (RefreshCommitAttributions), which intersects AI ranges against each commit's
+// actual `git diff` added hunks instead of summing edit churn over a time
+// window. The window/boundary SQL it relies on is built inline there.
