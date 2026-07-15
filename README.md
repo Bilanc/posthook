@@ -161,6 +161,8 @@ Nothing in the local database is encrypted at rest — treat it like any local g
 
 Posthook has a hosted team version (by Bilanc) that rolls the same local data up across your whole team — org-wide AI-adoption metrics, per-engineer and per-repo breakdowns, and shared attribution — without anyone changing their workflow.
 
+**What team sync sends:** the local tables above are replicated to your team's Bilanc workspace as-is — sessions, events (including verbatim tool-call payloads), commits, attribution, and the prompts you type to your agents, which power the session viewer in the team dashboard. Solo mode sends nothing.
+
 Onboarding is one shared link. A manager mints an install link for the team, then each engineer runs it once:
 
 ```bash
