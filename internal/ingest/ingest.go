@@ -221,6 +221,17 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		}
 	}
 
+	// Cursor's beforeSubmitPrompt hook carries the typed prompt directly —
+	// there is no readable transcript on Stop for Cursor, so this is the only
+	// moment the prompt is available.
+	if eventType == "beforeSubmitPrompt" && sessionID != "" {
+		if promptText := pickString(payload, "prompt"); promptText != "" {
+			if err := db.AppendHookPrompt(sessionID, agentSlug, ts, promptText); err != nil {
+				logx.Warnf("prompt capture failed: %v", err)
+			}
+		}
+	}
+
 	// Stop event: parse the transcript (Claude JSONL or Codex rollout — both
 	// hooks pass transcript_path) to backfill model + span + token totals.
 	// Token totals are whole-transcript sums, so plain overwrite is idempotent
@@ -250,6 +261,16 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 				} else {
 					logx.Debugf("updated session %s from transcript: model=%s messages=%d",
 						sessionID, summary.Model, summary.AssistantMessageCount)
+				}
+			}
+			// The transcript is also the only place Claude Code / Codex expose
+			// the engineer's typed prompts. Extraction is idempotent per
+			// (session, seq), so each Stop just appends the new tail.
+			if prompts := transcript.ExtractUserPrompts(transcriptPath); len(prompts) > 0 {
+				if n, err := db.UpsertSessionPrompts(sessionID, agentSlug, "transcript", prompts); err != nil {
+					logx.Warnf("prompt capture failed: %v", err)
+				} else if n > 0 {
+					logx.Debugf("captured %d new prompts for session %s", n, sessionID)
 				}
 			}
 		}

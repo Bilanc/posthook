@@ -52,6 +52,7 @@ var tablePrimaryKeys = map[string][]string{
 	"commit_sessions":      {"commit_id", "session_id"},
 	"commit_session_files": {"commit_id", "session_id", "file_path"},
 	"event_line_ranges":    {"id"},
+	"session_prompts":      {"id"},
 }
 
 // Result is the per-flush summary surfaced by `posthook sync --once`.
@@ -88,7 +89,8 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 		keys []map[string]any
 	}
 	pending := map[string]pendingRows{}
-	payload := ingestPayload{SchemaVersion: 8, Tables: map[string][]map[string]any{}}
+	// v9: adds the session_prompts table (typed prompts per session).
+	payload := ingestPayload{SchemaVersion: 9, Tables: map[string][]map[string]any{}}
 
 	for _, table := range store.SyncableTables {
 		rows, keys, err := selectPending(db, table, defaultBatchSize)

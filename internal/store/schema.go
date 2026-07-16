@@ -14,7 +14,11 @@ const LocalOrgID = "local"
 // v10 carries no column changes either: it forces one attribution refresh so
 // the new committed-diff-intersection logic (attribution.go) recomputes every
 // commit's lines_attributed, replacing the old churn-summing values.
-const schemaVersion = 10
+//
+// v11 adds session_prompts (the engineer's typed prompts, extracted from the
+// Stop-hook transcript for Claude Code/Codex and from beforeSubmitPrompt for
+// Cursor) and backfills it for existing sessions from their transcripts.
+const schemaVersion = 11
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
@@ -28,6 +32,7 @@ var SyncableTables = []string{
 	"commit_sessions",
 	"commit_session_files",
 	"event_line_ranges",
+	"session_prompts",
 }
 
 const schemaSQL = `
@@ -165,6 +170,22 @@ CREATE TABLE IF NOT EXISTS event_line_ranges (
 );
 CREATE INDEX IF NOT EXISTS idx_elr_event ON event_line_ranges(event_id);
 CREATE INDEX IF NOT EXISTS idx_elr_relpath ON event_line_ranges(rel_file_path);
+
+CREATE TABLE IF NOT EXISTS session_prompts (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL DEFAULT 'local',
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  ts TEXT,
+  seq INTEGER NOT NULL,
+  agent_slug TEXT,
+  source TEXT NOT NULL DEFAULT 'transcript',
+  prompt_text TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  synced_at TEXT,
+  UNIQUE(session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_session_prompts_session ON session_prompts(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_prompts_synced ON session_prompts(synced_at);
 
 CREATE TABLE IF NOT EXISTS sync_state (
   table_name      TEXT PRIMARY KEY,

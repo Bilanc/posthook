@@ -45,10 +45,12 @@ type Summary struct {
 }
 
 type record struct {
-	Type      string           `json:"type"`
-	Timestamp string           `json:"timestamp"`
-	Message   *messageEnvelope `json:"message"`
-	Payload   *codexPayload    `json:"payload"`
+	Type        string           `json:"type"`
+	Timestamp   string           `json:"timestamp"`
+	Message     *messageEnvelope `json:"message"`
+	Payload     *codexPayload    `json:"payload"`
+	IsMeta      bool             `json:"isMeta"`
+	IsSidechain bool             `json:"isSidechain"`
 }
 
 type messageEnvelope struct {
@@ -67,8 +69,9 @@ type claudeUsage struct {
 }
 
 type codexPayload struct {
-	Type string     `json:"type"`
-	Info *codexInfo `json:"info"`
+	Type    string     `json:"type"`
+	Info    *codexInfo `json:"info"`
+	Message string     `json:"message"`
 }
 
 type codexInfo struct {
@@ -182,6 +185,86 @@ func sumTokens(byMsgID map[string]claudeUsage, noID []claudeUsage, codexTotal *c
 		add(u)
 	}
 	return t
+}
+
+// UserPrompt is one prompt the engineer typed during a session.
+type UserPrompt struct {
+	TS   string
+	Text string
+}
+
+// ExtractUserPrompts returns the engineer's typed prompts from a transcript,
+// oldest first. Claude Code JSONL: type=user lines whose content carries text
+// (tool_result-only lines flatten to "" and drop out), skipping meta/sidechain
+// lines and slash-command noise. Codex rollouts: event_msg/user_message lines,
+// which hold the typed prompt verbatim (the response_item user messages also
+// present in rollouts duplicate these plus environment-context noise, so they
+// are ignored). Returns nil on missing/unreadable file.
+func ExtractUserPrompts(path string) []UserPrompt {
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+
+	var out []UserPrompt
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec record
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+
+		// Codex rollout shape.
+		if rec.Type == "event_msg" && rec.Payload != nil && rec.Payload.Type == "user_message" {
+			if text := cleanPromptText(rec.Payload.Message); text != "" {
+				out = append(out, UserPrompt{TS: rec.Timestamp, Text: text})
+			}
+			continue
+		}
+
+		// Claude Code shape.
+		if rec.Type != "user" || rec.Message == nil || rec.Message.Role != "user" {
+			continue
+		}
+		if rec.IsMeta || rec.IsSidechain {
+			continue
+		}
+		if text := cleanPromptText(stringifyContent(rec.Message.Content)); text != "" {
+			out = append(out, UserPrompt{TS: rec.Timestamp, Text: text})
+		}
+	}
+	return out
+}
+
+// promptNoisePrefixes mark user-role lines that are tooling artifacts, not
+// typed prompts: slash-command envelopes and the resumed-session caveat from
+// Claude Code, and the environment context Codex injects as a user message.
+var promptNoisePrefixes = []string{
+	"<command-name>",
+	"<command-message>",
+	"<local-command-stdout>",
+	"<local-command-stderr>",
+	"<environment_context>",
+	"Caveat: the messages below were generated",
+}
+
+func cleanPromptText(s string) string {
+	// Codex prefixes prompts replayed into rollouts with a "❯ " marker.
+	s = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(s), "❯"))
+	if s == "" {
+		return ""
+	}
+	for _, noise := range promptNoisePrefixes {
+		if strings.HasPrefix(s, noise) {
+			return ""
+		}
+	}
+	return s
 }
 
 // FindPromptBefore returns the text of the most recent user-role message in

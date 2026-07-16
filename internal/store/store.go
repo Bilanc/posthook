@@ -123,6 +123,9 @@ func (db *DB) migrate() error {
 	if _, err := db.backfillSessionTokens(); err != nil {
 		return err
 	}
+	if _, err := db.backfillSessionPrompts(); err != nil {
+		return err
+	}
 
 	// The backfills above only touch rows that need repair; on a one-shot
 	// upgrade pass we simply refresh attribution once to fold them in.
