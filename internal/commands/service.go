@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"errors"
+
 	"github.com/bilanc/posthook/internal/config"
 	"github.com/bilanc/posthook/internal/logx"
 	"github.com/bilanc/posthook/internal/service"
@@ -16,6 +18,7 @@ func newServiceCmd() *cobra.Command {
 the background so a connected machine keeps flushing to the cloud across reboots.
 
   posthook service install     install + start the daemon (launchd on macOS, systemd --user on Linux)
+  posthook service restart     restart it so an upgraded binary takes over (no-op if not installed)
   posthook service uninstall   stop + remove it
   posthook service status      show whether it's installed and running
 
@@ -46,6 +49,26 @@ anything — the install.sh team installer wires that up before calling this.`,
 		},
 	}
 
+	restart := &cobra.Command{
+		Use:   "restart",
+		Short: "Restart the background sync daemon so an upgraded binary takes over",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := service.Restart(); err != nil {
+				// Exit 0 so upgrade scripts can call this unconditionally on
+				// machines that never had a daemon installed.
+				if errors.Is(err, service.ErrNotInstalled) {
+					logx.Info("No background sync daemon installed — nothing to restart.")
+					return nil
+				}
+				return err
+			}
+			logx.Info("Background sync daemon restarted.")
+			logx.Infof("  status: %s", service.Status())
+			return nil
+		},
+	}
+
 	uninstall := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Stop and remove the background sync daemon",
@@ -69,6 +92,6 @@ anything — the install.sh team installer wires that up before calling this.`,
 		},
 	}
 
-	cmd.AddCommand(install, uninstall, status)
+	cmd.AddCommand(install, restart, uninstall, status)
 	return cmd
 }

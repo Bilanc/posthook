@@ -13,6 +13,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,6 +25,9 @@ import (
 
 	"github.com/bilanc/posthook/internal/paths"
 )
+
+// ErrNotInstalled is returned by Restart when no daemon unit exists.
+var ErrNotInstalled = errors.New("no background sync daemon is installed")
 
 const (
 	// launchdLabel is the launchd job label (reverse-DNS, per convention) and
@@ -62,6 +66,30 @@ func Install() error {
 			"background sync isn't auto-managed on %s yet — run `posthook sync --loop` yourself (e.g. a cron @reboot job or your init system)",
 			runtime.GOOS)
 	}
+}
+
+// Installed reports whether a daemon unit exists for this platform.
+func Installed() bool {
+	switch runtime.GOOS {
+	case "darwin":
+		return fileExists(launchdPlistPath())
+	case "linux":
+		return fileExists(systemdUnitPath())
+	default:
+		return false
+	}
+}
+
+// Restart reloads an already-installed daemon against the current binary. The
+// supervised process keeps its original code image in memory indefinitely, so
+// without a restart an upgraded posthook never takes over — tables added to
+// the sync schema after the daemon started silently never flush. Returns
+// ErrNotInstalled when no unit exists; Restart never installs one.
+func Restart() error {
+	if !Installed() {
+		return ErrNotInstalled
+	}
+	return Install()
 }
 
 // Uninstall stops the daemon and removes the unit. Safe to call when nothing is
@@ -215,6 +243,13 @@ WantedBy=default.target
 		return err
 	}
 	if err := userctl("enable", "--now", systemdUnit); err != nil {
+		return err
+	}
+	// enable --now is a no-op for an already-running unit, and that process
+	// keeps executing the binary image it started with — restart so a reinstall
+	// with an upgraded binary actually takes over (launchd gets the same via
+	// bootout+bootstrap above).
+	if err := userctl("restart", systemdUnit); err != nil {
 		return err
 	}
 	// Best-effort: keep the --user instance running across logout/reboot without
