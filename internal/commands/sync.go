@@ -110,6 +110,13 @@ func runSyncLoop() error {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
+	// A resident loop keeps its start-time code image forever, so after an
+	// upgrade it would keep flushing the old sync schema — tables added since
+	// (e.g. session_prompts) silently never sync. Watch the binary on disk and
+	// exit non-zero when it changes: launchd (KeepAlive) and systemd
+	// (Restart=on-failure) both relaunch us on the new version.
+	binaryChanged := watchBinary()
+
 	// Re-load config every tick so flag-flips via `posthook sync --set-*` take
 	// effect without restarting the loop.
 	flushOnce := func() {
@@ -144,8 +151,32 @@ func runSyncLoop() error {
 			fmt.Println("sync loop: stopping")
 			return nil
 		case <-tick.C:
+			if binaryChanged() {
+				fmt.Println("sync loop: posthook binary was upgraded — exiting so the service supervisor restarts on the new version")
+				os.Exit(1)
+			}
 			flushOnce()
 		}
+	}
+}
+
+// watchBinary snapshots the running executable's on-disk identity and returns
+// a check reporting whether it has since been replaced. Errors (binary
+// unresolvable, or stat racing a reinstall mid-swap) read as "unchanged" —
+// the next tick sees the settled file.
+func watchBinary() func() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return func() bool { return false }
+	}
+	orig, err := os.Stat(exe)
+	if err != nil {
+		return func() bool { return false }
+	}
+	return func() bool {
+		st, err := os.Stat(exe)
+		return err == nil &&
+			(!st.ModTime().Equal(orig.ModTime()) || st.Size() != orig.Size())
 	}
 }
 

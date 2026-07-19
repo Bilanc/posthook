@@ -20,7 +20,9 @@
 #      detects a default from git config and confirms it on the terminal, so
 #      the team dashboard can attribute sessions to people. Non-fatal when
 #      there's no TTY; finish later with `posthook identity --setup`.
-#   6. If POSTHOOK_API_KEY is set: install the background sync daemon.
+#   6. If POSTHOOK_API_KEY is set: install (or reload) the background sync
+#      daemon. Without a key, restart any already-installed daemon so an
+#      upgraded binary takes over.
 #
 # Env overrides:
 #   POSTHOOK_API_KEY        team ingest key — enables cloud sync + daemon
@@ -168,6 +170,11 @@ if [ -n "${POSTHOOK_API_KEY:-}" ]; then
   if ! "$BIN" service install; then
     warn "Could not install the background sync daemon. Sync is configured; start it yourself with: posthook sync --loop"
   fi
+else
+  # A keyless (re)install upgrades the binary but a daemon from an earlier
+  # team install keeps running the old code image until restarted — restart
+  # it so the new binary takes over. No-op when no daemon is installed.
+  "$BIN" service restart >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------
