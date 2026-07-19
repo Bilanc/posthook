@@ -18,7 +18,12 @@ const LocalOrgID = "local"
 // v11 adds session_prompts (the engineer's typed prompts, extracted from the
 // Stop-hook transcript for Claude Code/Codex and from beforeSubmitPrompt for
 // Cursor) and backfills it for existing sessions from their transcripts.
-const schemaVersion = 11
+//
+// v12 carries no column changes: it forces one deleteCursorCompatDuplicates
+// pass to purge events Cursor delivered through the Claude Code hook
+// registration (and the phantom sessions they created), then refreshes
+// attribution.
+const schemaVersion = 12
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns

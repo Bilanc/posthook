@@ -84,6 +84,18 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		payload = map[string]any{"raw": string(raw)}
 	}
 
+	// Cursor also executes Claude Code-format hooks from ~/.claude/settings.json
+	// alongside its native ~/.cursor/hooks.json, so the same Cursor event
+	// arrives twice: once as --agent cursor and once as --agent claude-code.
+	// The duplicate lands in a phantom "<agent>:<session>" session that both
+	// mislabels the agent and skips the Cursor afterFileEdit dedup. Cursor
+	// stamps every payload with cursor_version, so keep only the native
+	// delivery. (store.deleteCursorCompatDuplicates repairs old rows.)
+	if agentSlug != "cursor" && isCursorPayload(payload) {
+		logx.Debugf("ingest --agent %s: dropping cursor-compat duplicate event", agentSlug)
+		return nil
+	}
+
 	id := uuid.NewString()
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
 	rawEventType := pickString(payload, "hook_event_name", "event", "type")
@@ -865,6 +877,13 @@ func guessRepoNameFromRemote(remote string) string {
 		return m[1]
 	}
 	return remote
+}
+
+// isCursorPayload reports whether a hook payload originated from Cursor,
+// regardless of which hook registration delivered it.
+func isCursorPayload(payload map[string]any) bool {
+	v, ok := payload["cursor_version"].(string)
+	return ok && v != ""
 }
 
 func pickString(payload map[string]any, keys ...string) string {

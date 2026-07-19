@@ -93,6 +93,11 @@ func (db *DB) migrate() error {
 		return err
 	}
 
+	// Before backfillEventSessions, or the phantom sessions it would create
+	// from cursor-compat duplicate events come right back.
+	if _, err := db.deleteCursorCompatDuplicates(); err != nil {
+		return err
+	}
 	if _, err := db.backfillEventSessions(); err != nil {
 		return err
 	}
