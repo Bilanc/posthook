@@ -477,6 +477,71 @@ func (db *DB) deleteDuplicateCursorPostToolUseEditRanges() (int, error) {
 	return int(n), nil
 }
 
+// deleteCursorCompatDuplicates removes events that Cursor delivered through a
+// non-cursor hook registration (Cursor executes Claude Code-format hooks from
+// ~/.claude/settings.json alongside its native hooks.json, so every Cursor
+// event used to be ingested twice). Cursor stamps each payload with
+// cursor_version, so provenance beats the --agent flag. Sessions whose events
+// were all such duplicates are phantoms — resolveSessionID split them off as
+// "<agent>:<session>" or let them claim the bare id — and are removed along
+// with their prompts and commit attribution. Ingest now drops these payloads
+// up front (ingest.isCursorPayload); this repairs stores from before that.
+func (db *DB) deleteCursorCompatDuplicates() (int, error) {
+	const phantomEvents = `
+		SELECT id FROM events
+		WHERE agent_slug != 'cursor'
+		  AND json_extract(payload, '$.cursor_version') IS NOT NULL`
+
+	// Snapshot phantom sessions before their events are deleted: non-cursor
+	// sessions whose every event is a cursor-compat duplicate.
+	if _, err := db.Exec(`
+		CREATE TEMP TABLE phantom_sessions AS
+		SELECT s.id
+		FROM sessions s
+		WHERE s.agent_slug != 'cursor'
+		  AND EXISTS (
+			SELECT 1 FROM events e
+			WHERE e.session_id = s.id
+			  AND json_extract(e.payload, '$.cursor_version') IS NOT NULL
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM events e2
+			WHERE e2.session_id = s.id
+			  AND json_extract(e2.payload, '$.cursor_version') IS NULL
+		  )`); err != nil {
+		return 0, err
+	}
+	defer db.Exec(`DROP TABLE IF EXISTS temp.phantom_sessions`)
+
+	// Child rows first (FKs), then events, then the phantom sessions.
+	// RefreshCommitAttributions at the end of migrate() recomputes what the
+	// deleted commit_sessions rows used to over-attribute.
+	for _, stmt := range []string{
+		`DELETE FROM event_line_ranges WHERE event_id IN (` + phantomEvents + `)`,
+		`DELETE FROM session_prompts WHERE session_id IN (SELECT id FROM temp.phantom_sessions)`,
+		`DELETE FROM commit_session_files WHERE session_id IN (SELECT id FROM temp.phantom_sessions)`,
+		`DELETE FROM commit_sessions WHERE session_id IN (SELECT id FROM temp.phantom_sessions)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return 0, err
+		}
+	}
+
+	res, err := db.Exec(`DELETE FROM events WHERE id IN (` + phantomEvents + `)`)
+	if err != nil {
+		return 0, err
+	}
+	deletedEvents, _ := res.RowsAffected()
+
+	res, err = db.Exec(`DELETE FROM sessions WHERE id IN (SELECT id FROM temp.phantom_sessions)`)
+	if err != nil {
+		return 0, err
+	}
+	deletedSessions, _ := res.RowsAffected()
+
+	return int(deletedEvents + deletedSessions), nil
+}
+
 // backfillSessionRepos picks the most common events.repo_id for sessions
 // missing one.
 func (db *DB) backfillSessionRepos() (int, error) {
