@@ -89,6 +89,17 @@ func (db *DB) migrate() error {
 	}
 
 	currentVersion := db.currentSchemaVersion()
+	// Versions through v12 already completed the historical repair passes. A
+	// v12 → v13 upgrade only needs to create the new indexes above; repeating
+	// every backfill here would make a performance-only upgrade scan the whole
+	// database again.
+	if currentVersion >= 12 {
+		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	if err := db.normalizeEventTypes(); err != nil {
 		return err
 	}

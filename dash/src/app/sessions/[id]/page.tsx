@@ -5,6 +5,7 @@ import { PromptsList } from "@/components/prompts-list";
 import {
   filesTouchedInSession,
   getSessionDetail,
+  storedPromptsForSession,
   transcriptPathForSession,
 } from "@/lib/queries/sessions";
 import { commitsForSession } from "@/lib/queries/commits";
@@ -65,7 +66,11 @@ export default async function SessionDetailPage({
   const commits = commitsForSession(id);
   const files = filesTouchedInSession(id);
   const transcriptPath = transcriptPathForSession(id);
-  const prompts = transcriptPath ? readPrompts(transcriptPath) : [];
+  const transcriptPrompts = transcriptPath ? readPrompts(transcriptPath) : [];
+  const prompts =
+    transcriptPrompts.length > 0
+      ? transcriptPrompts
+      : storedPromptsForSession(id);
 
   return (
     <div>
@@ -124,7 +129,7 @@ export default async function SessionDetailPage({
         <Panel title={`Prompts ${prompts.length > 0 ? `(${prompts.length})` : ""}`}>
           <PromptsList
             prompts={prompts}
-            transcriptAvailable={transcriptPath !== null}
+            transcriptAvailable={transcriptPath !== null || prompts.length > 0}
           />
         </Panel>
 

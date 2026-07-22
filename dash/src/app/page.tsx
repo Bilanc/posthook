@@ -4,7 +4,7 @@ import { SankeyFunnel } from "@/components/sankey-funnel";
 import { BreakdownBar } from "@/components/breakdown-bar";
 import { DailyUsageChart } from "@/components/daily-usage-chart";
 import { parseFilters, resolveFilters, type SearchParams } from "@/lib/filters";
-import { overviewSummary, funnel } from "@/lib/queries/overview";
+import { overviewSummary } from "@/lib/queries/overview";
 import { dailyUsage } from "@/lib/queries/daily";
 import {
   breakdownByAgent,
@@ -43,7 +43,10 @@ export default async function OverviewPage({
   const filters = resolveFilters(parseFilters(sp));
   const options = filterOptions();
   const summary = overviewSummary(filters);
-  const fn = funnel(filters);
+  const fn = {
+    generated: summary.lines_generated,
+    committed: summary.lines_committed,
+  };
   const daily = dailyUsage(filters);
   const byAgent = breakdownByAgent(filters);
   const byModel = breakdownByModel(filters);
