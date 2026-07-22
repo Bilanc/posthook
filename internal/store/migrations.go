@@ -108,6 +108,17 @@ func (db *DB) applyMigrations() error {
 			}
 		}
 	}
+
+	// v13: dashboard event aggregation and Cursor duplicate suppression both
+	// filter events by these column combinations.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_agent_type_file_session_ts
+		ON events(agent_slug, event_type, file_path, session_id, ts)`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_events_session_type
+		ON events(session_id, event_type)`); err != nil {
+		return err
+	}
 	return nil
 }
 

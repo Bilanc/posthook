@@ -23,7 +23,10 @@ const LocalOrgID = "local"
 // pass to purge events Cursor delivered through the Claude Code hook
 // registration (and the phantom sessions they created), then refreshes
 // attribution.
-const schemaVersion = 12
+//
+// v13 adds event lookup indexes used by the local dashboard's edit aggregation
+// and Cursor duplicate suppression queries.
+const schemaVersion = 13
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
@@ -99,6 +102,10 @@ CREATE INDEX IF NOT EXISTS idx_events_org_ts ON events(org_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_repo ON events(repo_id);
+CREATE INDEX IF NOT EXISTS idx_events_agent_type_file_session_ts
+  ON events(agent_slug, event_type, file_path, session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_events_session_type
+  ON events(session_id, event_type);
 
 CREATE TABLE IF NOT EXISTS commits (
   id TEXT PRIMARY KEY,
