@@ -33,6 +33,9 @@ const LINES_GENERATED = `CASE
   ELSE ${NL("COALESCE(json_extract(e.payload, '$.tool_input.new_string'), '')")}
     + ${NL("COALESCE(json_extract(e.payload, '$.tool_input.content'), '')")}
 END`;
+// Cursor reports an edit through both PostToolUse and afterFileEdit. Keep the
+// afterFileEdit event and suppress PostToolUse when a matching afterFileEdit
+// exists for the same file/session within five seconds.
 const AI_EDIT_EVENT_CONDITION = `(
   (
     e.event_type IN ('PostToolUse', 'postToolUse')
@@ -78,13 +81,19 @@ export function listSessions(
   // Aggregate per-session edit stats and attributed commit counts in a single query so
   // pagination still works.
   const sql = `
-    WITH per_session_edits AS (
+    WITH filtered_sessions AS (
+      SELECT s.id
+      FROM sessions s
+      WHERE 1=1${fchunk.sql}
+    ),
+    per_session_edits AS (
       SELECT
         e.session_id,
         COUNT(*) AS edits,
         COUNT(DISTINCT e.rel_file_path) AS files_touched,
         SUM(${LINES_GENERATED}) AS lines_generated
       FROM events e
+      JOIN filtered_sessions fs ON fs.id = e.session_id
       WHERE ${AI_EDIT_EVENT_CONDITION}
       GROUP BY e.session_id
     ),
@@ -122,7 +131,7 @@ export function listSessions(
 
   const rows = conn
     .prepare(sql)
-    .all(...fchunk.params, perPage, offset) as SessionListRow[];
+    .all(...fchunk.params, ...fchunk.params, perPage, offset) as SessionListRow[];
   return { rows, total: totalRow.n };
 }
 
@@ -199,4 +208,20 @@ export function transcriptPathForSession(sessionId: string): string | null {
     )
     .get(sessionId) as { path: string | null } | undefined;
   return row?.path ?? null;
+}
+
+export interface StoredPrompt {
+  ts: string;
+  text: string;
+}
+
+export function storedPromptsForSession(sessionId: string): StoredPrompt[] {
+  return db()
+    .prepare(
+      "SELECT ts, prompt_text AS text " +
+        "FROM session_prompts " +
+        "WHERE session_id = ? " +
+        "ORDER BY seq",
+    )
+    .all(sessionId) as StoredPrompt[];
 }
