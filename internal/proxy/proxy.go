@@ -39,10 +39,7 @@ func Run(args []string) {
 	}
 
 	bypass := os.Getenv("POSTHOOK_BYPASS") == "1"
-	var subcommand string
-	if len(args) > 0 {
-		subcommand = args[0]
-	}
+	subcommand, subcommandArgs := splitGitInvocation(args)
 	interceptable := !bypass && (subcommand == "commit" || subcommand == "clone")
 
 	code := spawnPassthrough(realGit, args)
@@ -59,13 +56,33 @@ func Run(args []string) {
 		case "commit":
 			err = handleCommit(realGit)
 		case "clone":
-			err = handleClone(realGit, args[1:])
+			err = handleClone(realGit, subcommandArgs)
 		}
 		if err != nil {
 			logx.Warnf("proxy capture failed for %s: %v", subcommand, err)
 		}
 	}
 	os.Exit(code)
+}
+
+func splitGitInvocation(args []string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env":
+			// Skip the option (for example, `-c`) and its value (for example,
+			// `user.useConfigOnly=true`) so `commit` is recognized as the Git command.
+			i++
+			continue
+		}
+		if strings.HasPrefix(args[i], "-") {
+			// Other global options are flags or carry their value after `=`.
+			continue
+		}
+		// We found the Git command (for example, `commit`). Return it and only
+		// the arguments that come after it.
+		return args[i], args[i+1:]
+	}
+	return "", nil
 }
 
 func spawnPassthrough(realGit string, args []string) int {
