@@ -14,11 +14,9 @@ Posthook installs hooks into the AI coding tools you already use (Claude Code, C
 
 Everything runs on your laptop by default. No account, no network calls, no telemetry. The data is yours, in a file you can open with any SQLite client.
 
-```
-AI agents ──────hooks──┐
-                       ├──▶  ~/.posthook/posthook.db  ──▶  blame · metrics · dashboard
-git commands ──shadow──┘
-```
+<p align="center">
+  <img src="docs/assets/hero.svg" width="900" alt="How posthook works: Claude Code, Cursor, and Codex CLI feed hooks into an event spool drained by a background worker; git commit and clone go through a PATH-shadow; both land in a local SQLite file (posthook.db) that powers posthook blame, metrics, and the dashboard, with attribution mirrored to refs/notes/posthook.">
+</p>
 
 ## Why posthook
 
@@ -29,6 +27,14 @@ As more of your code is written by AI, the basic questions get hard to answer:
 - **When something breaks, which AI session produced the line?**
 
 Posthook answers these without changing your workflow. You keep using your editor and your agents exactly as before; posthook records the trail in the background and links it to your git history. Attribution travels with the repo (in git notes), so a teammate who clones it can run `posthook blame` and see the same answers — no setup, no sync.
+
+<p align="center">
+  <img src="docs/assets/blame.svg" width="900" alt="posthook blame output: each line of a Go file tagged as AI (with model, time, and session), human (with author name), or uncommitted, with the prompt that produced each AI edit shown above its lines, and a summary line reading 6/11 lines AI-authored (54.5%).">
+</p>
+
+<p align="center">
+  <img src="docs/assets/metrics.svg" width="640" alt="posthook metrics output: overall AI edit events, lines generated and committed, AI code percentage, working hours, sessions, top model, and token totals, followed by a per-agent breakdown for claude-code, cursor, and codex.">
+</p>
 
 ## Quickstart
 
@@ -76,6 +82,10 @@ For Claude Code, the `Stop` hook parses the session transcript at `~/.claude/pro
 
 ### How attribution works
 
+<p align="center">
+  <img src="docs/assets/attribution.svg" width="900" alt="Four steps: 1) an AI edits a file and the hook records the exact lines; 2) you review and commit, captured by the git shadow; 3) posthook credits each touched file to the session that last edited it; 4) a git note pushes to origin so teammates can clone and blame. Notes carry only line ranges, agent, model, and session — never prompt text or code.">
+</p>
+
 Posthook links AI work to commits at the **file level**: when a commit lands, each touched file is attributed to the AI session(s) that most recently edited it before that commit. From there it rolls up:
 
 - **`event_line_ranges`** — the raw line ranges each AI edit produced.
@@ -110,6 +120,10 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 ## The dashboard
 
 `posthook dash` serves a local web UI over your SQLite file. The overview gives you AI-edit totals, lines generated, and working-hours estimates, with breakdowns **by agent, by model, by repo, and by engineer**, plus a drill-down into individual sessions and the commits they produced. It's read-only and bound to localhost.
+
+<p align="center">
+  <img src="docs/assets/dashboard.svg" width="900" alt="The posthook dashboard overview page: a filter bar with date range and agent/model/repo/engineer filters; KPI cards for AI code %, AI lines generated and committed, top model, working hours, max parallel agents, and tokens; a daily chart of AI lines generated (bars) vs committed (line) with a hover tooltip; and by-agent and by-engineer breakdowns with stacked committed vs not-committed bars and tables.">
+</p>
 
 ## Where data lives
 
@@ -209,6 +223,7 @@ internal/
   ingest/                        Event + commit capture core
   commands/                      Cobra command implementations
 dash/                            Web dashboard (Next.js), downloaded into ~/.posthook/dash by install.sh
+docs/assets/                     README diagrams (hand-authored SVG)
 install.sh                       Network installer: downloads the release binary + dashboard bundle
 .goreleaser.yaml                 Release build (CGO_ENABLED=0 cross-compile to darwin/linux × amd64/arm64)
 ```

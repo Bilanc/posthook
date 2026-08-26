@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="456" viewBox="0 0 900 456" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace" font-size="12.5">
+  <rect x="0.5" y="0.5" width="899" height="455" rx="12" fill="#0d1117" stroke="#30363d"/>
+
+  <!-- title bar -->
+  <circle cx="24" cy="22" r="6" fill="#ff5f57"/>
+  <circle cx="44" cy="22" r="6" fill="#febc2e"/>
+  <circle cx="64" cy="22" r="6" fill="#28c840"/>
+  <text x="450" y="26" text-anchor="middle" font-size="11.5" fill="#8b949e">posthook blame — ~/dev/posthook</text>
+  <line x1="1" y1="44" x2="899" y2="44" stroke="#21262d"/>
+
+  <text x="28" y="76" xml:space="preserve"><tspan fill="#3fb950">$ </tspan><tspan fill="#e6edf3">posthook blame internal/lineranges/extract.go</tspan></text>
+
+  <text x="28" y="120" xml:space="preserve"><tspan fill="#8b949e" font-style="italic">      ┌─ write a pure extractor: map each Edit/Write payload to the exact lines it produced</tspan></text>
+
+  <text x="28" y="142" xml:space="preserve"><tspan fill="#6e7681">   1  </tspan><tspan fill="#3fb950">AI claude-sonnet-5</tspan><tspan fill="#6e7681"> 14:32 9f2c41ab </tspan><tspan fill="#e6edf3">  func Extract(tool string, input ToolInput, post string) []Range {</tspan></text>
+  <text x="28" y="164" xml:space="preserve"><tspan fill="#6e7681">   2  </tspan><tspan fill="#3fb950">AI claude-sonnet-5</tspan><tspan fill="#6e7681"> 14:32 9f2c41ab </tspan><tspan fill="#e6edf3">      switch tool {</tspan></text>
+  <text x="28" y="186" xml:space="preserve"><tspan fill="#6e7681">   3  </tspan><tspan fill="#3fb950">AI claude-sonnet-5</tspan><tspan fill="#6e7681"> 14:32 9f2c41ab </tspan><tspan fill="#e6edf3">      case "Write":</tspan></text>
+  <text x="28" y="208" xml:space="preserve"><tspan fill="#6e7681">   4  </tspan><tspan fill="#3fb950">AI claude-sonnet-5</tspan><tspan fill="#6e7681"> 14:32 9f2c41ab </tspan><tspan fill="#e6edf3">          return []Range{{Start: 1, End: countLines(post)}}</tspan></text>
+  <text x="28" y="230" xml:space="preserve"><tspan fill="#6e7681">   5  </tspan><tspan fill="#58a6ff">human · Sam                       </tspan><tspan fill="#e6edf3">      case "Edit":</tspan></text>
+  <text x="28" y="252" xml:space="preserve"><tspan fill="#6e7681">   6  </tspan><tspan fill="#58a6ff">human · Sam                       </tspan><tspan fill="#e6edf3">          return editRanges(input, post)</tspan></text>
+
+  <text x="28" y="274" xml:space="preserve"><tspan fill="#8b949e" font-style="italic">      ┌─ add MultiEdit support — apply edits in order and track line offsets</tspan></text>
+
+  <text x="28" y="296" xml:space="preserve"><tspan fill="#6e7681">   7  </tspan><tspan fill="#3fb950">AI gpt-5-codex</tspan><tspan fill="#6e7681">     15:04 41d7ce02 </tspan><tspan fill="#e6edf3">      case "MultiEdit":</tspan></text>
+  <text x="28" y="318" xml:space="preserve"><tspan fill="#6e7681">   8  </tspan><tspan fill="#3fb950">AI gpt-5-codex</tspan><tspan fill="#6e7681">     15:04 41d7ce02 </tspan><tspan fill="#e6edf3">          return multiEditRanges(input.Edits, post)</tspan></text>
+  <text x="28" y="340" xml:space="preserve"><tspan fill="#6e7681">   9  </tspan><tspan fill="#58a6ff">human · Sam                       </tspan><tspan fill="#e6edf3">      }</tspan></text>
+  <text x="28" y="362" xml:space="preserve"><tspan fill="#6e7681">  10  </tspan><tspan fill="#d29922">uncommitted                       </tspan><tspan fill="#e6edf3">      return nil</tspan></text>
+  <text x="28" y="384" xml:space="preserve"><tspan fill="#6e7681">  11  </tspan><tspan fill="#d29922">uncommitted                       </tspan><tspan fill="#e6edf3">  }</tspan></text>
+
+  <text x="28" y="428" xml:space="preserve"><tspan fill="#3fb950">  6/11</tspan><tspan fill="#e6edf3"> lines AI-authored </tspan><tspan fill="#3fb950">(54.5%)</tspan></text>
+</svg>
