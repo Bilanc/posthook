@@ -116,9 +116,15 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	}
 	workspaceRoots := extractWorkspaceRoots(payload)
 	applyPatchFiles := applyPatchFilesForPayload(payload)
+	shellWrites := shellWritesForPayload(payload, eventType)
 	filePath := extractFilePath(payload)
 	if filePath == "" && len(applyPatchFiles) > 0 {
 		filePath = applyPatchFiles[0].FilePath
+	}
+	if filePath == "" && len(shellWrites) > 0 {
+		// A shell command that wrote a file is a file event too, so it shows
+		// under the session's files touched even when no lines are located.
+		filePath = shellWrites[0].FilePath
 	}
 	var resolvedFilePath, canonicalFilePath string
 	if filePath != "" {
@@ -223,6 +229,10 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	// Line-range capture. Fail-soft: never block ingest on these.
 	if eventType == "PostToolUse" && len(applyPatchFiles) > 0 {
 		if err := captureApplyPatchLineRanges(db, id, applyPatchFiles, cwd, workspaceRoots); err != nil {
+			logx.Warnf("line-range capture failed: %v", err)
+		}
+	} else if len(shellWrites) > 0 {
+		if err := captureShellWriteLineRanges(db, id, shellWrites, cwd, workspaceRoots); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
 	} else {
@@ -589,6 +599,84 @@ func captureApplyPatchLineRanges(
 		}
 		out := lineranges.Extract("MultiEdit", lineranges.ToolInput{Edits: file.Edits}, string(content))
 		if err := insertLineRanges(db, eventID, canonicalPath, rel, content, "apply_patch", out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shellToolNames are the tool names under which agents run shell commands:
+// Claude Code's Bash, Codex CLI's shell / exec_command, Cursor's Shell.
+var shellToolNames = map[string]bool{
+	"Bash": true, "bash": true, "shell": true, "Shell": true, "exec_command": true, "run_terminal_cmd": true,
+}
+
+// shellWritesForPayload returns the files a PostToolUse shell command wrote,
+// parsed from its command text. Codex passes the command as an argv array
+// (["bash", "-lc", "<script>"]); the script is the last element.
+func shellWritesForPayload(payload map[string]any, eventType string) []lineranges.ShellWrite {
+	if eventType != "PostToolUse" {
+		return nil
+	}
+	toolName, _ := payload["tool_name"].(string)
+	if !shellToolNames[toolName] {
+		return nil
+	}
+	ti, ok := payload["tool_input"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	command := ""
+	switch v := ti["command"].(type) {
+	case string:
+		command = v
+	case []any:
+		if len(v) > 0 {
+			command, _ = v[len(v)-1].(string)
+		}
+	}
+	if strings.TrimSpace(command) == "" {
+		return nil
+	}
+	return lineranges.ParseShellWrites(command)
+}
+
+// captureShellWriteLineRanges records line ranges for files a shell command
+// wrote. When the written text is known (heredoc, echo …) it is located in
+// the post-command file exactly like an Edit; otherwise the file is only
+// recorded as touched on the event and no lines are attributed.
+func captureShellWriteLineRanges(
+	db *store.DB,
+	eventID string,
+	writes []lineranges.ShellWrite,
+	cwd string,
+	workspaceRoots []string,
+) error {
+	for _, w := range writes {
+		if !w.Known || w.Content == "" {
+			logx.Debugf("line-range: shell wrote %s with unknown content, not attributing lines", w.FilePath)
+			continue
+		}
+		resolvedPath := resolveEventFilePath(w.FilePath, cwd, workspaceRoots)
+		canonicalPath := gitx.Canonicalize(resolvedPath)
+		if _, err := os.Stat(canonicalPath); err != nil {
+			logx.Debugf("line-range: file gone, skipping (%s)", canonicalPath)
+			continue
+		}
+		root := findEventRepoRoot(cwd, canonicalPath, workspaceRoots)
+		if root == "" {
+			continue // scratch files outside any repo carry no attribution
+		}
+		var rel sql.NullString
+		if v := gitx.RelPathInRepo(root, canonicalPath); v != "" {
+			rel = sql.NullString{String: v, Valid: true}
+		}
+		content, err := os.ReadFile(canonicalPath)
+		if err != nil {
+			continue
+		}
+		out := lineranges.Extract("ShellWrite", lineranges.ToolInput{Content: w.Content}, string(content))
+		if err := insertLineRanges(db, eventID, canonicalPath, rel, content, "shell", out); err != nil {
 			return err
 		}
 	}

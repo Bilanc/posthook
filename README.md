@@ -70,7 +70,7 @@ posthook dash                   # open the web dashboard (needs Node >=24)
 
 | Source | How | What |
 |---|---|---|
-| **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call, full payload, session end, model |
+| **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call, full payload, session end, model. `Bash` heredoc writes are line-attributed too. |
 | **Cursor** | hooks in `~/.cursor/hooks.json` (`postToolUse`, `beforeSubmitPrompt`, `afterFileEdit`) | every tool call + prompt submission |
 | **Codex CLI** | inline hooks in `~/.codex/config.toml` (`PostToolUse`, `Stop`) + `features.hooks = true` | every tool call + session end |
 | **Git (shadow)** | `~/.local/bin/git` symlink → posthook binary, intercepts every git command on every repo | every successful `git commit` and `git clone`. After a successful `git push` it also pushes `refs/notes/posthook`; after `fetch`/`pull`/`clone` it merges teammates' notes in. All other git commands pass through with zero overhead. |
@@ -233,7 +233,7 @@ install.sh                       Network installer: downloads the release binary
 
 ## Limitations
 
-- **Bash-driven edits aren't line-attributed.** Only `Edit`, `Write`, and `MultiEdit` tool calls produce line ranges.
+- **Shell-driven edits are attributed from the command text.** When an agent writes a file from the shell (Claude Code in auto mode does this constantly: `cat > file <<'EOF' … EOF`), posthook recovers the written text from heredocs, here-strings and `echo`/`printf` literals and locates it in the file like an `Edit`. Edits whose content comes from another program (`sed -i`, `go run gen > out.go`) only mark the file as touched — no lines are attributed.
 - **The shadow only intercepts `commit` and `clone`.** Other history-changing commands (rebase, cherry-pick, amend, reset, push, fetch) pass through without capture.
 - **`MultiEdit` with identical replacement strings** attributes both edits to the first match.
 - **Windows isn't supported yet.** The shadow relies on Unix symlinks and POSIX signal numbers.
