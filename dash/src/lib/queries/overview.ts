@@ -55,7 +55,11 @@ WITH ai_edits AS (
   WHERE (
     (
       e.event_type IN ('PostToolUse', 'postToolUse')
-      AND json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
+      AND (
+        json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
+        -- shell commands (Bash heredocs …) count once lines were located in the file
+        OR EXISTS (SELECT 1 FROM event_line_ranges selr WHERE selr.event_id = e.id)
+      )
       AND NOT (
         e.agent_slug = 'cursor'
         AND EXISTS (

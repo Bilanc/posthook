@@ -8,7 +8,9 @@
 // Known limitations (Phase 1):
 //   - MultiEdit with identical new_strings attributes both to the first match.
 //   - Pure deletions (new_string empty) record no range.
-//   - Bash-driven edits aren't captured here — Phase 2 work.
+//   - Shell-driven edits are recovered from the command text (see shell.go):
+//     heredoc, here-string and echo/printf writes carry their content and are
+//     located like an Edit; `sed -i` and program output only mark the file.
 package lineranges
 
 import "strings"
@@ -145,6 +147,19 @@ func Extract(toolName string, in ToolInput, postContent string) Extracted {
 			return Extracted{Unlocated: 1}
 		}
 		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, in.NewString)}}
+
+	case "ShellWrite":
+		// Content recovered from a shell command (heredoc, echo …). A whole
+		// file write matches at offset 0; an append matches at the end, so
+		// prefer the last occurrence.
+		if in.Content == "" {
+			return Extracted{}
+		}
+		idx := strings.LastIndex(postContent, in.Content)
+		if idx == -1 {
+			return Extracted{Unlocated: 1}
+		}
+		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, in.Content)}}
 
 	case "MultiEdit":
 		var ranges []LineRange
