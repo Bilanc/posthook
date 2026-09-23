@@ -479,6 +479,9 @@ func printBlame(relPath string, lines []blameLine, matches map[int]matchedRange,
 	lineWidth := len(strconv.Itoa(len(lines)))
 	tagWidth := 28
 	prevEventID := ""
+	// One prompt usually produces many separate edits to a file; the header
+	// is only worth printing when the prompt actually changes.
+	lastPrompt := ""
 
 	for _, l := range lines {
 		match, hasMatch := matches[l.finalLine]
@@ -491,9 +494,10 @@ func printBlame(relPath string, lines []blameLine, matches map[int]matchedRange,
 			}
 			color := sessions[key].color
 			if match.eventID != prevEventID {
-				if prompt := prompts[match.eventID]; prompt != "" {
+				if prompt := prompts[match.eventID]; prompt != "" && prompt != lastPrompt {
 					fmt.Printf("  %s  %s\n", strings.Repeat(" ", lineWidth),
 						pal.paint(color+pal.bold, "┌─ "+formatPrompt(prompt)))
+					lastPrompt = prompt
 				}
 			}
 			prevEventID = match.eventID
