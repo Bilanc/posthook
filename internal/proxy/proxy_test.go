@@ -59,3 +59,63 @@ func TestSplitGitInvocation(t *testing.T) {
 		})
 	}
 }
+
+func TestRemoteFromArgs(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		flags map[string]bool
+		want  string
+	}{
+		{"bare push lets git choose", []string{}, pushFlagsWithValues, ""},
+		{"push origin main", []string{"origin", "main"}, pushFlagsWithValues, "origin"},
+		{"push -u origin main", []string{"-u", "origin", "main"}, pushFlagsWithValues, "origin"},
+		{"push --force-with-lease origin", []string{"--force-with-lease", "origin"}, pushFlagsWithValues, "origin"},
+		{"push -o value skips the option value", []string{"-o", "ci.skip", "upstream"}, pushFlagsWithValues, "upstream"},
+		{"push --repo=", []string{"--repo=fork", "main"}, pushFlagsWithValues, "fork"},
+		{"push after --", []string{"--", "fork"}, pushFlagsWithValues, "fork"},
+		{"fetch --depth 1 origin", []string{"--depth", "1", "origin"}, fetchFlagsWithValues, "origin"},
+		{"pull --rebase origin main", []string{"--rebase", "origin", "main"}, fetchFlagsWithValues, "origin"},
+		{"pull -X theirs", []string{"-X", "theirs", "upstream"}, fetchFlagsWithValues, "upstream"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := remoteFromArgs(tt.args, tt.flags); got != tt.want {
+				t.Fatalf("remoteFromArgs(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPushSkipsNotes(t *testing.T) {
+	skip := [][]string{
+		{"--dry-run"}, {"-n", "origin"}, {"origin", "--delete", "feature"},
+		{"--mirror"}, {"--tags"}, {"origin", "refs/notes/posthook:refs/notes/posthook"},
+	}
+	for _, args := range skip {
+		if !pushSkipsNotes(args) {
+			t.Errorf("expected %v to skip notes transport", args)
+		}
+	}
+	run := [][]string{{}, {"origin", "main"}, {"-u", "origin", "HEAD"}, {"--force-with-lease", "origin", "main"}}
+	for _, args := range run {
+		if pushSkipsNotes(args) {
+			t.Errorf("expected %v to run notes transport", args)
+		}
+	}
+}
+
+func TestFetchHasExplicitRefspec(t *testing.T) {
+	explicit := [][]string{{"origin", "main"}, {"--rebase", "origin", "main"}, {"-q", "origin", "main:main"}, {"--depth", "1", "origin", "main"}}
+	for _, args := range explicit {
+		if !fetchHasExplicitRefspec(args) {
+			t.Errorf("expected %v to count as an explicit refspec", args)
+		}
+	}
+	bare := [][]string{{}, {"origin"}, {"--all"}, {"-q", "origin"}, {"--rebase"}, {"--depth", "1", "origin"}}
+	for _, args := range bare {
+		if fetchHasExplicitRefspec(args) {
+			t.Errorf("expected %v to use configured refspecs", args)
+		}
+	}
+}

@@ -9,56 +9,30 @@ import (
 
 	"github.com/bilanc/posthook/internal/atomicfs"
 	"github.com/bilanc/posthook/internal/gitx"
+	"github.com/bilanc/posthook/internal/notes"
 	"github.com/bilanc/posthook/internal/paths"
 )
 
-const hookMarker = "# posthook v2"
+const hookMarker = "# posthook v3"
 
 func hookScript(binaryPath string) string {
-	// Self-healing notes transport: if the fetch/push refspecs for
-	// refs/notes/posthook are missing on origin, add them. Repos created
-	// via the global git template start syncing notes without `posthook
-	// track`. Safe to fail silently — if origin doesn't exist yet, the
-	// config lines still get added once it does.
+	// Fallback mode (no git shadow) can only observe commits, so the hook
+	// configures the notes fetch refspec here: an ordinary `git fetch` then
+	// brings teammates' notes down into the tracking ref, and `posthook
+	// blame` reads that ref directly. Pushing notes in this mode is manual
+	// (`posthook notes push`) — the shadow does it automatically.
 	return "#!/bin/sh\n" +
 		hookMarker + "\n" +
 		"# Captures commit metadata after every successful commit. Safe to fail silently.\n" +
 		`"` + binaryPath + `" ingest --kind git-commit --repo-root "$(git rev-parse --show-toplevel)" --sha "$(git rev-parse HEAD)" >/dev/null 2>&1 || true` + "\n" +
-		"{\n" +
-		"  spec='" + paths.NotesRef + ":" + paths.NotesRef + "'\n" +
-		"  if ! git config --get-all remote.origin.fetch 2>/dev/null | grep -Fxq \"$spec\"; then\n" +
-		"    git config --add remote.origin.fetch \"$spec\" 2>/dev/null || true\n" +
-		"  fi\n" +
-		"  if ! git config --get-all remote.origin.push 2>/dev/null | grep -Fxq \"$spec\"; then\n" +
-		"    git config --add remote.origin.push \"$spec\" 2>/dev/null || true\n" +
-		"  fi\n" +
-		"} >/dev/null 2>&1 || true\n"
+		`"` + binaryPath + `" notes configure "$(git rev-parse --show-toplevel)" >/dev/null 2>&1 || true` + "\n"
 }
 
-// ConfigureNotesTransport adds posthook's notes refspec to fetch and push for
-// origin. Returns true iff config was modified.
+// ConfigureNotesTransport installs posthook's notes fetch refspec on origin
+// and removes the legacy fetch/push refspecs. Returns true iff config was
+// modified. See package notes for why fetch goes through a tracking ref.
 func ConfigureNotesTransport(repoPath string) (bool, error) {
-	spec := paths.NotesRef + ":" + paths.NotesRef
-	changed := false
-	for _, key := range []string{"remote.origin.fetch", "remote.origin.push"} {
-		existing := gitx.Run(repoPath, "config", "--get-all", key)
-		has := false
-		for _, l := range strings.Split(existing, "\n") {
-			if l == spec {
-				has = true
-				break
-			}
-		}
-		if !has {
-			if got := gitx.Run(repoPath, "config", "--add", key, spec); got == "" {
-				// `git config --add` produces no output on success; the
-				// empty return here means either success or failure. We
-				// re-read to verify.
-			}
-			changed = true
-		}
-	}
-	return changed, nil
+	return notes.EnsureRefspec(repoPath, "origin"), nil
 }
 
 func writeHookFile(path, binaryPath string) (bool, error) {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/logx"
+	"github.com/bilanc/posthook/internal/notes"
 	"github.com/bilanc/posthook/internal/paths"
 	"github.com/bilanc/posthook/internal/store"
 	"github.com/bilanc/posthook/internal/transcript"
@@ -191,20 +192,27 @@ type noteBody struct {
 	Files  map[string][]noteEntry `json:"files"`
 }
 
+// readNoteForCommit reads the attribution note for sha, first from the
+// local notes ref and then from the tracking ref that plain `git fetch`
+// populates — so blame works right after a fetch even before the shadow (or
+// `posthook notes fetch`) has merged the two.
 func readNoteForCommit(repoRoot, sha string) *noteBody {
-	cmd := exec.Command("git", "notes", "--ref="+paths.NotesRef, "show", sha)
-	cmd.Dir = repoRoot
-	cmd.Env = gitx.BypassEnv()
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return nil
+	for _, ref := range []string{paths.NotesRef, notes.TrackingRef} {
+		cmd := exec.Command("git", "notes", "--ref="+ref, "show", sha)
+		cmd.Dir = repoRoot
+		cmd.Env = gitx.BypassEnv()
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil {
+			continue
+		}
+		var n noteBody
+		if err := json.Unmarshal(out.Bytes(), &n); err != nil {
+			continue
+		}
+		return &n
 	}
-	var n noteBody
-	if err := json.Unmarshal(out.Bytes(), &n); err != nil {
-		return nil
-	}
-	return &n
+	return nil
 }
 
 var lineRangeRE = regexp.MustCompile(`^(\d+)(?:-(\d+))?$`)

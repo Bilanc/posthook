@@ -2,7 +2,8 @@
 // invoked under the name "git" (via a symlink at ~/.local/bin/git), Run
 // takes over: it spawns the real git as a child, forwards stdio and signals
 // faithfully so the user sees identical behavior, and after success runs
-// our capture logic for `commit` and `clone`.
+// our capture logic for `commit` and `clone`, and our notes transport for
+// `push`, `fetch` and `pull`.
 //
 // Critical invariants:
 //   - Exit with the child's exit code (or 128+N on signal termination) so
@@ -26,6 +27,7 @@ import (
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/ingest"
 	"github.com/bilanc/posthook/internal/logx"
+	"github.com/bilanc/posthook/internal/notes"
 )
 
 // Run is the proxy entrypoint. Never returns; calls os.Exit with the
@@ -40,7 +42,7 @@ func Run(args []string) {
 
 	bypass := os.Getenv("POSTHOOK_BYPASS") == "1"
 	subcommand, subcommandArgs := splitGitInvocation(args)
-	interceptable := !bypass && (subcommand == "commit" || subcommand == "clone")
+	interceptable := !bypass && isInterceptable(subcommand)
 
 	code := spawnPassthrough(realGit, args)
 
@@ -57,12 +59,26 @@ func Run(args []string) {
 			err = handleCommit(realGit)
 		case "clone":
 			err = handleClone(realGit, subcommandArgs)
+		case "push":
+			err = handlePush(realGit, subcommandArgs)
+		case "fetch", "pull":
+			err = handleFetch(realGit, subcommandArgs)
 		}
 		if err != nil {
 			logx.Warnf("proxy capture failed for %s: %v", subcommand, err)
 		}
 	}
 	os.Exit(code)
+}
+
+func isInterceptable(subcommand string) bool {
+	switch subcommand {
+	case "commit", "clone":
+		return true
+	case "push", "fetch", "pull":
+		return notes.Enabled()
+	}
+	return false
 }
 
 func splitGitInvocation(args []string) (string, []string) {
@@ -155,11 +171,15 @@ func handleCommit(realGit string) error {
 	if sha == "" {
 		return nil
 	}
-	if err := ingest.GitCommit(gitx.Canonicalize(repoRoot), sha); err != nil {
+	root := gitx.Canonicalize(repoRoot)
+	if err := ingest.GitCommit(root, sha); err != nil {
 		return err
 	}
 	if len(sha) >= 7 {
 		logx.Debugf("proxy: captured commit %s", sha[:7])
+	}
+	if notes.Enabled() && notes.EnsureRefspec(root, "origin") {
+		logx.Debugf("proxy: configured notes fetch refspec for origin")
 	}
 	return nil
 }
@@ -178,7 +198,185 @@ func handleClone(realGit string, args []string) error {
 		return err
 	}
 	logx.Debugf("proxy: registered clone of %s", root)
+	if notes.Enabled() {
+		// The fresh clone has no refspec yet, so fetch notes explicitly once;
+		// EnsureRefspec makes every later fetch/pull carry them for free.
+		notes.EnsureRefspec(root, "origin")
+		if err := notes.Fetch(root, "origin"); err == nil {
+			logx.Debugf("proxy: fetched attribution notes for %s", root)
+		}
+	}
 	return nil
+}
+
+// handlePush runs after a successful `git push`: it merges any notes the
+// remote already has into ours, then pushes refs/notes/posthook so
+// teammates can `posthook blame` the commits that just went up.
+func handlePush(realGit string, args []string) error {
+	if pushSkipsNotes(args) {
+		return nil
+	}
+	root := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
+	if root == "" {
+		return nil
+	}
+	root = gitx.Canonicalize(root)
+	remote := remoteFromArgs(args, pushFlagsWithValues)
+	if remote == "" {
+		remote = defaultPushRemote(realGit, root)
+	}
+	if remote == "" {
+		return nil
+	}
+	notes.EnsureRefspec(root, remote)
+	if err := notes.Push(root, remote); err != nil {
+		return err
+	}
+	logx.Debugf("proxy: pushed attribution notes to %s", remote)
+	return nil
+}
+
+// handleFetch runs after a successful `git fetch` / `git pull`.
+//
+// A bare `git fetch` / `git pull` (no refspec on the command line) uses the
+// configured refspecs, so the refspec installed by EnsureRefspec already
+// brought the notes down into the tracking ref and only the local merge is
+// left. With an explicit refspec (`git pull origin main`) git ignores the
+// configured ones, so the notes are fetched explicitly — one extra
+// single-ref round trip.
+func handleFetch(realGit string, args []string) error {
+	if hasFlag(args, "--dry-run") {
+		return nil
+	}
+	root := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
+	if root == "" {
+		return nil
+	}
+	root = gitx.Canonicalize(root)
+	remote := remoteFromArgs(args, fetchFlagsWithValues)
+	if remote == "" {
+		remote = "origin"
+	}
+	refspecAdded := notes.EnsureRefspec(root, remote)
+	explicit := fetchHasExplicitRefspec(args)
+	if refspecAdded || explicit || !notes.RefExists(root, notes.TrackingRef) {
+		logx.Debugf("proxy: fetching attribution notes from %s (refspec added=%v, explicit refspec=%v)", remote, refspecAdded, explicit)
+		return notes.Fetch(root, remote)
+	}
+	logx.Debugf("proxy: merging attribution notes brought down by fetch")
+	return notes.MergeTracking(root)
+}
+
+// fetchHasExplicitRefspec reports whether a fetch/pull invocation names
+// refspecs after the remote (`git pull origin main`), in which case git does
+// not apply the configured refspecs.
+func fetchHasExplicitRefspec(args []string) bool {
+	positional := 0
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional += len(args) - i - 1
+			break
+		}
+		if strings.HasPrefix(a, "-") {
+			if fetchFlagsWithValues[a] && !strings.Contains(a, "=") {
+				i++
+			}
+			continue
+		}
+		positional++
+	}
+	return positional >= 2
+}
+
+var pushFlagsWithValues = map[string]bool{
+	"--repo": true, "-o": true, "--push-option": true,
+	"--receive-pack": true, "--exec": true, "--recurse-submodules": true,
+	"--signed": true, "--force-if-includes": false,
+}
+
+var fetchFlagsWithValues = map[string]bool{
+	"--depth": true, "--deepen": true, "--shallow-since": true,
+	"--shallow-exclude": true, "--upload-pack": true, "-o": true,
+	"--server-option": true, "--negotiation-tip": true, "--refmap": true,
+	"--recurse-submodules": true, "-j": true, "--jobs": true,
+	"--filter": true, "-s": true, "--strategy": true, "-X": true,
+	"--strategy-option": true, "--log": true, "--cleanup": true,
+	"--gpg-sign": true, "-S": true,
+}
+
+// remoteFromArgs returns the repository argument of a push/fetch/pull
+// invocation: --repo=<x> or --repo <x>, else the first positional. Empty
+// when git will pick the remote itself.
+func remoteFromArgs(args []string, flagsWithValues map[string]bool) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+		if strings.HasPrefix(a, "--repo=") {
+			return strings.TrimPrefix(a, "--repo=")
+		}
+		if strings.HasPrefix(a, "-") {
+			if flagsWithValues[a] && !strings.Contains(a, "=") {
+				i++
+			}
+			continue
+		}
+		return a
+	}
+	return ""
+}
+
+// pushSkipsNotes reports pushes that should not trigger notes transport:
+// dry runs, deletions, mirrors, and pushes where the user already handles
+// the notes ref themselves.
+func pushSkipsNotes(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "--dry-run", "-n", "--delete", "-d", "--mirror", "--all", "--branches", "--tags", "--prune":
+			return true
+		}
+		if strings.Contains(a, "refs/notes/") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultPushRemote mirrors git's own choice for a bare `git push`:
+// branch.<name>.pushRemote, remote.pushDefault, branch.<name>.remote, origin.
+func defaultPushRemote(realGit, root string) string {
+	branch := runRealGit(realGit, root, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if branch != "" {
+		if r := runRealGit(realGit, root, "config", "--get", "branch."+branch+".pushRemote"); r != "" {
+			return r
+		}
+	}
+	if r := runRealGit(realGit, root, "config", "--get", "remote.pushDefault"); r != "" {
+		return r
+	}
+	if branch != "" {
+		if r := runRealGit(realGit, root, "config", "--get", "branch."+branch+".remote"); r != "" {
+			return r
+		}
+	}
+	if runRealGit(realGit, root, "config", "--get", "remote.origin.url") != "" {
+		return "origin"
+	}
+	return ""
 }
 
 // inferCloneDest does a best-effort parse of `git clone` args. Skips known
@@ -192,10 +390,10 @@ func inferCloneDest(args []string) string {
 		"--reference": true, "--reference-if-able": true,
 		"--depth": true, "--shallow-since": true, "--shallow-exclude": true,
 		"--recurse-submodules": true,
-		"--jobs": true, "-j": true,
-		"--server-option": true,
-		"--separate-git-dir": true,
-		"--filter": true,
+		"--jobs":               true, "-j": true,
+		"--server-option":       true,
+		"--separate-git-dir":    true,
+		"--filter":              true,
 		"--sparse-checkout-set": true,
 	}
 	var positional []string
