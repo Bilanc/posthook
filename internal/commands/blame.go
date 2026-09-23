@@ -102,16 +102,53 @@ func runBlame(file, colorMode string) error {
 	cmd.Dir = repoRoot
 	cmd.Env = gitx.BypassEnv()
 	out, err := cmd.Output()
+	var lines []blameLine
 	if err != nil {
-		return fmt.Errorf("git blame failed: %w", err)
+		// git blame refuses a file git has never seen (untracked, not yet
+		// staged). Every line of such a file is uncommitted, which is
+		// exactly what a zero-sha blame line means — so synthesise those
+		// and let AI ranges match them as usual.
+		if !isUntracked(repoRoot, relPath) {
+			return fmt.Errorf("git blame failed: %w", err)
+		}
+		lines, err = uncommittedLines(absPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		lines = parsePorcelain(string(out))
 	}
-
-	lines := parsePorcelain(string(out))
 	matches, err := lookupRanges(repoRoot, relPath, lines)
 	if err != nil {
 		return err
 	}
 	return printBlame(relPath, lines, matches, newPalette(colorMode))
+}
+
+// isUntracked reports whether relPath exists on disk but is unknown to git.
+func isUntracked(repoRoot, relPath string) bool {
+	cmd := exec.Command("git", "ls-files", "--error-unmatch", "--", relPath)
+	cmd.Dir = repoRoot
+	cmd.Env = gitx.BypassEnv()
+	return cmd.Run() != nil
+}
+
+// uncommittedLines builds a blame for a file git has never seen: every line
+// carries the zero sha, exactly as git reports staged-but-uncommitted lines.
+func uncommittedLines(absPath string) ([]blameLine, error) {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, err
+	}
+	text := strings.TrimSuffix(string(data), "\n")
+	if text == "" {
+		return nil, nil
+	}
+	var lines []blameLine
+	for i, content := range strings.Split(text, "\n") {
+		lines = append(lines, blameLine{sha: zeroSha, origLine: i + 1, finalLine: i + 1, content: content})
+	}
+	return lines, nil
 }
 
 var porcelainHeaderRE = regexp.MustCompile(`^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$`)
