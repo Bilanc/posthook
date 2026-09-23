@@ -22,6 +22,7 @@ func NewRootCmd() *cobra.Command {
 		newMetricsCmd(),
 		newInspectCmd(),
 		newBlameCmd(),
+		newNotesCmd(),
 		newDashCmd(),
 		newSyncCmd(),
 		newWorkerCmd(),
@@ -42,4 +43,5 @@ single SQLite file at ~/.posthook/posthook.db.
 Environment:
   POSTHOOK_BIN     Override the binary path written into hook configs
   POSTHOOK_DEBUG   Set to 1 for verbose stderr logging
-  POSTHOOK_BYPASS  Internal: set to 1 to bypass the git shadow proxy`
+  POSTHOOK_BYPASS  Internal: set to 1 to bypass the git shadow proxy
+  POSTHOOK_NOTES_SYNC  Set to 0 to stop the shadow pushing/fetching attribution notes`

@@ -73,8 +73,8 @@ posthook dash                   # open the web dashboard (needs Node >=24)
 | **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call, full payload, session end, model |
 | **Cursor** | hooks in `~/.cursor/hooks.json` (`postToolUse`, `beforeSubmitPrompt`, `afterFileEdit`) | every tool call + prompt submission |
 | **Codex CLI** | inline hooks in `~/.codex/config.toml` (`PostToolUse`, `Stop`) + `features.hooks = true` | every tool call + session end |
-| **Git (shadow)** | `~/.local/bin/git` symlink → posthook binary, intercepts every git command on every repo | every successful `git commit` and `git clone`. All other git commands pass through with zero overhead. Line-attribution metadata is written to `refs/notes/posthook`. |
-| **Git (fallback)** | per-repo `post-commit` hook (auto-installed in new repos via `init.templateDir`, manual `posthook track` for existing repos) | same as the shadow. Coexists safely — commit ingest is idempotent via `UNIQUE(repo_id, sha)`. |
+| **Git (shadow)** | `~/.local/bin/git` symlink → posthook binary, intercepts every git command on every repo | every successful `git commit` and `git clone`. After a successful `git push` it also pushes `refs/notes/posthook`; after `fetch`/`pull`/`clone` it merges teammates' notes in. All other git commands pass through with zero overhead. |
+| **Git (fallback)** | per-repo `post-commit` hook (auto-installed in new repos via `init.templateDir`, manual `posthook track` for existing repos) | commit capture as the shadow, plus the notes fetch refspec so plain `git fetch` still brings notes down. Pushing notes is manual here (`posthook notes push`). Coexists safely — commit ingest is idempotent via `UNIQUE(repo_id, sha)`. |
 
 Agent hooks fire on the critical path of every tool call, so they do the bare minimum: each `posthook ingest` captures the payload to an append-only spool (`~/.posthook/spool/`) and returns in milliseconds. A single background worker (`posthook worker`, auto-started by the hooks and self-terminating when idle) drains the spool into SQLite — so the heavy work (DB writes, git lookups, transcript parsing) happens once, off the hot path, and bursts of tool calls can never pile up. Check the queue with `posthook status`.
 
@@ -106,6 +106,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 - `posthook status` — counts, shadow health, hook misfires, recent commits. **Run this first** to confirm everything is wired up.
 - `posthook metrics` — AI metrics with breakdowns by agent, model, and repo: edit events, lines generated/replaced/committed, AI code %, working hours, distinct and max-concurrent sessions.
 - `posthook blame <file>` — per-line attribution with prompt headers.
+- `posthook notes push|fetch|status|configure [repo]` — move `refs/notes/posthook` to and from a remote by hand. The git shadow does this automatically on `push`, `fetch`, `pull` and `clone`; these exist for the fallback install, CI, and checking what is where. `POSTHOOK_NOTES_SYNC=0` turns the automatic transport off.
 - `posthook inspect [--agent X] [--type Y] [--session Z] [--since ISO] [--limit N]` — raw event payloads.
 - `posthook dash` — open the local web dashboard. Starts the bundled server (reading `~/.posthook/posthook.db`) if it isn't running, waits for it, then opens your browser. `--no-open` starts it headless; `--stop` shuts it down; `--restart` stops and starts it (do this after upgrading posthook so it serves the new bundle). Binds `127.0.0.1:3847` by default.
 - `posthook sync` — flush local rows to a cloud endpoint (see [Team / cloud](#team--cloud)). `--loop` flushes continuously, `--status` shows pending counts and last-flush state, `--set-endpoint/--set-token/--set-enabled` write `~/.posthook/config.json`.
@@ -138,7 +139,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 | `~/.posthook/git-template/hooks/post-commit` | Fallback hook copied into every new repo by `git init`. |
 | `~/.claude/settings.json` · `~/.cursor/hooks.json` · `~/.codex/config.toml` | Agent hook entries — **merged alongside your existing hooks**, never clobbered. |
 | `~/.gitconfig` (`init.templateDir`) | Points git at the template dir above. |
-| Each tracked repo's `refs/notes/posthook` | Line-attribution metadata (no prompt text). Auto-pushed/fetched on `origin` so blame works after a clone. |
+| Each tracked repo's `refs/notes/posthook` | Line-attribution metadata (no prompt text). Pushed after every `git push` and merged in after every `fetch`/`pull`/`clone`, so blame works after a clone. Remote notes land in `refs/notes/posthook-remote` first and are merged from there. |
 
 All installers are idempotent and preserve pre-existing user hooks. Re-running `posthook init` after a binary upgrade refreshes the embedded path without disturbing anything else.
 
@@ -146,6 +147,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 
 - `POSTHOOK_BIN` — override the binary path written into hook configs (useful for dev installs).
 - `POSTHOOK_DEBUG=1` — verbose stderr logging from every command.
+- `POSTHOOK_NOTES_SYNC=0` — stop the git shadow pushing and fetching `refs/notes/posthook`. Attribution then stays local unless you run `posthook notes push` yourself.
 - `POSTHOOK_BYPASS=1` — make the git shadow pass straight through. Used internally to prevent recursion; useful manually to run a one-off command under plain-git semantics without uninstalling the shadow.
 - `POSTHOOK_DB` — override the SQLite path the dashboard reads (default `~/.posthook/posthook.db`).
 - `POSTHOOK_DASH_PORT` / `POSTHOOK_DASH_HOSTNAME` — override where `posthook dash` binds (default `127.0.0.1:3847`). Read by both the Go command and the dashboard server so they always agree.
@@ -163,10 +165,10 @@ By default, everything stays in `~/.posthook/posthook.db` on your machine. No HT
 - Absolute file paths, plus a derived repo-relative path.
 - Commit metadata (author email, message subject, file paths) from your local git.
 
-**What's written to `refs/notes/posthook` and pushed to remotes:** line ranges, agent slug, session ID, model name, event timestamp. **No prompt text. No code snippets.** To remove the auto-configured push refspec:
+**What's written to `refs/notes/posthook` and pushed to remotes:** line ranges, agent slug, session ID, model name, event timestamp. **No prompt text. No code snippets.** To keep attribution on your own machine, turn the transport off:
 
 ```bash
-git config --unset-all remote.origin.push refs/notes/posthook:refs/notes/posthook
+export POSTHOOK_NOTES_SYNC=0   # shadow stops pushing/fetching refs/notes/posthook
 ```
 
 Nothing in the local database is encrypted at rest — treat it like any local git checkout. Data only leaves your machine if you explicitly enable cloud sync.
@@ -212,14 +214,15 @@ internal/
   store/                         SQLite schema, migrations, backfill passes, attribution
   sync/                          Cloud flush: per-row synced_at cursor, batched POST, sync_state
   service/                       launchd / systemd unit manager for the background sync daemon
+  notes/                         refs/notes/posthook transport: tracking-ref fetch, merge, push
   proxy/                         Git shadow: spawn real git, forward stdio/signals,
-                                 intercept commit + clone for capture
+                                 intercept commit + clone for capture, push/fetch/pull for notes
   installers/                    Per-agent hook installers (idempotent merge/dedup)
     base.go                      Shared helpers
     claudecode.go                ~/.claude/settings.json
     cursor.go                    ~/.cursor/hooks.json
     codex.go                     ~/.codex/config.toml
-    githook.go                   per-repo post-commit hook + global template + notes transport
+    githook.go                   per-repo post-commit hook + global template
   ingest/                        Event + commit capture core
   commands/                      Cobra command implementations
 dash/                            Web dashboard (Next.js), downloaded into ~/.posthook/dash by install.sh
