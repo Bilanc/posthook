@@ -26,14 +26,24 @@ import (
 const zeroSha = "0000000000000000000000000000000000000000"
 
 func newBlameCmd() *cobra.Command {
-	return &cobra.Command{
+	var colorMode string
+	cmd := &cobra.Command{
 		Use:   "blame <file>",
 		Short: "Show per-line AI attribution for a file",
-		Args:  cobra.ExactArgs(1),
+		Long: `Show per-line AI attribution for a file.
+
+Every line is tagged human (from git blame), uncommitted, or AI — with the
+model, time and session that wrote it, and the prompt that produced it shown
+above the first line of each edit. Lines from the same agent session share a
+colour. The footer lists each session with a link into the local dashboard
+when it is running.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBlame(args[0])
+			return runBlame(args[0], colorMode)
 		},
 	}
+	cmd.Flags().StringVar(&colorMode, "color", "auto", "Colour output: auto (only on a terminal, honours NO_COLOR), always, never")
+	return cmd
 }
 
 type blameLine struct {
@@ -47,27 +57,27 @@ type blameLine struct {
 }
 
 type matchedRange struct {
-	eventID    string
-	sessionID  sql.NullString
-	agentSlug  string
-	modelSlug  sql.NullString
-	eventTS    string
-	startLine  int
-	endLine    int
+	eventID   string
+	sessionID sql.NullString
+	agentSlug string
+	modelSlug sql.NullString
+	eventTS   string
+	startLine int
+	endLine   int
 }
 
 type rangeRow struct {
-	eventID    string
-	sessionID  sql.NullString
-	agentSlug  string
-	modelSlug  sql.NullString
-	eventTS    string
-	startLine  int
-	endLine    int
-	commitSHA  sql.NullString
+	eventID   string
+	sessionID sql.NullString
+	agentSlug string
+	modelSlug sql.NullString
+	eventTS   string
+	startLine int
+	endLine   int
+	commitSHA sql.NullString
 }
 
-func runBlame(file string) error {
+func runBlame(file, colorMode string) error {
 	rawAbs, err := filepath.Abs(file)
 	if err != nil {
 		return err
@@ -101,7 +111,7 @@ func runBlame(file string) error {
 	if err != nil {
 		return err
 	}
-	return printBlame(relPath, lines, matches)
+	return printBlame(relPath, lines, matches, newPalette(colorMode))
 }
 
 var porcelainHeaderRE = regexp.MustCompile(`^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$`)
@@ -374,25 +384,128 @@ func lookupRanges(repoRoot, relPath string, lines []blameLine) (map[int]matchedR
 	return matches, nil
 }
 
-func printBlame(relPath string, lines []blameLine, matches map[int]matchedRange) error {
+// palette holds the ANSI sequences used by blame; every field is empty when
+// colour is off so the printing code needs no branches.
+type palette struct {
+	on       bool
+	reset    string
+	dim      string
+	bold     string
+	human    string
+	pending  string
+	sessions []string
+}
+
+func newPalette(mode string) palette {
+	on := false
+	switch mode {
+	case "always":
+		on = true
+	case "never":
+		on = false
+	default:
+		on = stdoutIsTerminal() && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
+	}
+	if !on {
+		return palette{}
+	}
+	return palette{
+		on:      true,
+		reset:   "\x1b[0m",
+		dim:     "\x1b[2m",
+		bold:    "\x1b[1m",
+		human:   "\x1b[2m",
+		pending: "\x1b[33m",
+		// One colour per AI session, in order of first appearance, so edits
+		// from the same session read as a block.
+		sessions: []string{"\x1b[36m", "\x1b[35m", "\x1b[32m", "\x1b[34m", "\x1b[96m", "\x1b[95m", "\x1b[92m", "\x1b[94m"},
+	}
+}
+
+func stdoutIsTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func (p palette) paint(color, text string) string {
+	if !p.on || color == "" {
+		return text
+	}
+	return color + text + p.reset
+}
+
+// sessionSummary is one row of the footer: an AI session that owns at least
+// one line of the file.
+type sessionSummary struct {
+	key      string // session id, or agent slug when the session is unknown
+	id       sql.NullString
+	agent    string
+	model    sql.NullString
+	lines    int
+	firstSeq int
+	color    string
+}
+
+func printBlame(relPath string, lines []blameLine, matches map[int]matchedRange, pal palette) error {
 	db, err := store.Open()
 	if err != nil {
 		return err
 	}
 	prompts := resolvePromptsForEvents(db, matches)
 
-	fmt.Printf("posthook blame %s\n\n", relPath)
+	// Assign each session a stable colour in order of first appearance.
+	sessions := map[string]*sessionSummary{}
+	var order []*sessionSummary
+	for _, l := range lines {
+		m, ok := matches[l.finalLine]
+		if !ok {
+			continue
+		}
+		key := m.agentSlug
+		if m.sessionID.Valid {
+			key = m.sessionID.String
+		}
+		ss, seen := sessions[key]
+		if !seen {
+			ss = &sessionSummary{key: key, id: m.sessionID, agent: m.agentSlug, model: m.modelSlug, firstSeq: len(order)}
+			if len(pal.sessions) > 0 {
+				ss.color = pal.sessions[len(order)%len(pal.sessions)]
+			}
+			sessions[key] = ss
+			order = append(order, ss)
+		}
+		ss.lines++
+		if !ss.model.Valid && m.modelSlug.Valid {
+			ss.model = m.modelSlug
+		}
+	}
+
+	fmt.Printf("%s %s\n\n", pal.paint(pal.bold, "posthook blame"), relPath)
 	lineWidth := len(strconv.Itoa(len(lines)))
 	tagWidth := 28
 	prevEventID := ""
+	// One prompt usually produces many separate edits to a file; the header
+	// is only worth printing when the prompt actually changes.
+	lastPrompt := ""
 
 	for _, l := range lines {
 		match, hasMatch := matches[l.finalLine]
+		num := pal.paint(pal.dim, fmt.Sprintf("%*d", lineWidth, l.finalLine))
 		var tag string
 		if hasMatch {
+			key := match.agentSlug
+			if match.sessionID.Valid {
+				key = match.sessionID.String
+			}
+			color := sessions[key].color
 			if match.eventID != prevEventID {
-				if prompt := prompts[match.eventID]; prompt != "" {
-					fmt.Printf("  %s  ┌─ %s\n", strings.Repeat(" ", lineWidth), formatPrompt(prompt))
+				if prompt := prompts[match.eventID]; prompt != "" && prompt != lastPrompt {
+					fmt.Printf("  %s  %s\n", strings.Repeat(" ", lineWidth),
+						pal.paint(color+pal.bold, "┌─ "+formatPrompt(prompt)))
+					lastPrompt = prompt
 				}
 			}
 			prevEventID = match.eventID
@@ -406,20 +519,23 @@ func printBlame(relPath string, lines []blameLine, matches map[int]matchedRange)
 			} else if match.sessionID.Valid {
 				session = match.sessionID.String
 			}
-			tag = fmt.Sprintf("AI %s %s %s", compactModel(match.modelSlug), ts, session)
+			plain := fmt.Sprintf("AI %s %s %s", compactModel(match.modelSlug), ts, session)
+			tag = pal.paint(color, fmt.Sprintf("%-*s", tagWidth, plain))
 		} else {
 			prevEventID = ""
+			var plain, color string
 			if l.sha == zeroSha {
-				tag = "uncommitted"
+				plain, color = "uncommitted", pal.pending
 			} else {
 				author := "?"
 				if l.author != "" {
 					author = strings.SplitN(l.author, " ", 2)[0]
 				}
-				tag = "human · " + author
+				plain, color = "human · "+author, pal.human
 			}
+			tag = pal.paint(color, fmt.Sprintf("%-*s", tagWidth, plain))
 		}
-		fmt.Printf("  %*d  %-*s  %s\n", lineWidth, l.finalLine, tagWidth, tag, l.content)
+		fmt.Printf("  %s  %s  %s\n", num, tag, l.content)
 	}
 	fmt.Println()
 	aiCount := len(matches)
@@ -428,26 +544,67 @@ func printBlame(relPath string, lines []blameLine, matches map[int]matchedRange)
 	if total > 0 {
 		pct = float64(aiCount) / float64(total) * 100
 	}
-	fmt.Printf("  %d/%d lines AI-authored (%.1f%%)\n", aiCount, total, pct)
+	fmt.Printf("  %s\n", pal.paint(pal.bold, fmt.Sprintf("%d/%d lines AI-authored (%.1f%%)", aiCount, total, pct)))
+
+	if len(order) > 0 {
+		printSessionFooter(db, order, pal)
+	}
 	return nil
 }
 
+// printSessionFooter lists every AI session that owns lines in the file,
+// with a link into the local dashboard for sessions this machine has
+// captured (a teammate's session, known only from the git note, gets no link).
+func printSessionFooter(db *store.DB, order []*sessionSummary, pal palette) {
+	dash := resolveDashConfig()
+	dashUp := portOpen(dash.addr())
+
+	fmt.Println()
+	for _, ss := range order {
+		id := "?"
+		if ss.id.Valid && len(ss.id.String) >= 8 {
+			id = ss.id.String[:8]
+		} else if ss.id.Valid {
+			id = ss.id.String
+		}
+		who := ss.agent
+		if ss.model.Valid && ss.model.String != "" {
+			who += " · " + compactModel(ss.model)
+		}
+		unit := "lines"
+		if ss.lines == 1 {
+			unit = "line"
+		}
+		row := fmt.Sprintf("  %s %s  %-34s %4d %s", pal.paint(ss.color, "■"), pal.paint(ss.color+pal.bold, id), who, ss.lines, unit)
+		if dashUp && ss.id.Valid && sessionKnownLocally(db, ss.id.String) {
+			row += "  " + pal.paint(pal.dim, dash.url()+"/sessions/"+ss.id.String)
+		}
+		fmt.Println(row)
+	}
+}
+
+func sessionKnownLocally(db *store.DB, sessionID string) bool {
+	var one int
+	return db.QueryRow(`SELECT 1 FROM sessions WHERE id = ?`, sessionID).Scan(&one) == nil
+}
+
+// resolvePromptsForEvents finds, for each matched event, the prompt the user
+// typed before it: first from the Claude Code transcript on disk, then from
+// the prompts posthook stored at session end (transcripts are pruned by the
+// agents after a while; the stored copy is not).
 func resolvePromptsForEvents(db *store.DB, matches map[int]matchedRange) map[string]string {
 	out := map[string]string{}
 	if len(matches) == 0 {
 		return out
 	}
-	idSet := map[string]bool{}
+	byID := map[string]matchedRange{}
 	for _, m := range matches {
-		idSet[m.eventID] = true
-	}
-	if len(idSet) == 0 {
-		return out
+		byID[m.eventID] = m
 	}
 
-	placeholders := make([]string, 0, len(idSet))
-	params := make([]any, 0, len(idSet))
-	for id := range idSet {
+	placeholders := make([]string, 0, len(byID))
+	params := make([]any, 0, len(byID))
+	for id := range byID {
 		placeholders = append(placeholders, "?")
 		params = append(params, id)
 	}
@@ -456,33 +613,47 @@ func resolvePromptsForEvents(db *store.DB, matches map[int]matchedRange) map[str
 		FROM events
 		WHERE id IN (%s)`, strings.Join(placeholders, ","))
 	rows, err := db.Query(q, params...)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-
-	cache := map[string]map[string]string{}
-	for rows.Next() {
-		var id, ts string
-		var path sql.NullString
-		if err := rows.Scan(&id, &ts, &path); err != nil {
-			return out
+	if err == nil {
+		cache := map[string]map[string]string{}
+		for rows.Next() {
+			var id, ts string
+			var path sql.NullString
+			if err := rows.Scan(&id, &ts, &path); err != nil {
+				break
+			}
+			if !path.Valid {
+				continue
+			}
+			perTranscript, ok := cache[path.String]
+			if !ok {
+				perTranscript = map[string]string{}
+				cache[path.String] = perTranscript
+			}
+			prompt, found := perTranscript[ts]
+			if !found {
+				prompt = transcript.FindPromptBefore(path.String, ts)
+				perTranscript[ts] = prompt
+			}
+			if prompt != "" {
+				out[id] = prompt
+			}
 		}
-		if !path.Valid {
+		rows.Close()
+	}
+
+	for id, m := range byID {
+		if out[id] != "" || !m.sessionID.Valid || m.eventTS == "" {
 			continue
 		}
-		perTranscript, ok := cache[path.String]
-		if !ok {
-			perTranscript = map[string]string{}
-			cache[path.String] = perTranscript
-		}
-		prompt, found := perTranscript[ts]
-		if !found {
-			prompt = transcript.FindPromptBefore(path.String, ts)
-			perTranscript[ts] = prompt
-		}
-		if prompt != "" {
-			out[id] = prompt
+		var text string
+		err := db.QueryRow(`
+			SELECT prompt_text FROM session_prompts
+			WHERE session_id = ? AND ts IS NOT NULL AND ts < ?
+			ORDER BY ts DESC LIMIT 1`, m.sessionID.String, m.eventTS).Scan(&text)
+		if err == nil && strings.TrimSpace(text) != "" {
+			out[id] = text
+		} else if err != nil {
+			logx.Debugf("blame: stored-prompt lookup for session %s before %s: %v", m.sessionID.String, m.eventTS, err)
 		}
 	}
 	return out
