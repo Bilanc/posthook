@@ -39,7 +39,7 @@ export default async function SessionsPage({
           : `${total} session${total === 1 ? "" : "s"} — showing page ${page} of ${totalPages}.`}
       </p>
 
-      <FilterBar filters={filters} options={options} />
+      <FilterBar filters={filters} options={options} searchable />
 
       <SessionsTable rows={rows} />
 

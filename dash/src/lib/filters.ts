@@ -7,6 +7,7 @@ export interface Filters {
   models: string[];
   repos: string[];
   engineers: string[];
+  q: string | null;      // free-text search over session id / branch / engineer / repo
 }
 
 export type SearchParams = Record<string, string | string[] | undefined>;
@@ -31,6 +32,7 @@ export function parseFilters(searchParams: SearchParams): Filters {
     models: pickMulti(searchParams.models),
     repos: pickMulti(searchParams.repos),
     engineers: pickMulti(searchParams.engineers),
+    q: pickOne(searchParams.q),
   };
 }
 
@@ -40,7 +42,7 @@ export function defaultFilters(): Filters {
   const now = new Date();
   const to = formatISO(now, { representation: "date" });
   const from = formatISO(subMonths(now, 1), { representation: "date" });
-  return { from, to, agents: [], models: [], repos: [], engineers: [] };
+  return { from, to, agents: [], models: [], repos: [], engineers: [], q: null };
 }
 
 // Resolve user-set filters against defaults: only "from"/"to" gain a default,
@@ -54,6 +56,7 @@ export function resolveFilters(parsed: Filters): Filters {
     models: parsed.models,
     repos: parsed.repos,
     engineers: parsed.engineers,
+    q: parsed.q,
   };
 }
 
@@ -117,6 +120,20 @@ export function filterSqlForSessions(f: Filters): SqlChunk {
   sql += inClause("s.model_slug", f.models, params);
   sql += inClause("s.repo_id", f.repos, params);
   sql += inClause("s.engineer_email", f.engineers, params);
+  if (f.q) {
+    const like = `%${f.q.replace(/[\\%_]/g, "\\$&")}%`;
+    const cols = [
+      "s.id",
+      "s.branch",
+      "s.engineer_email",
+      "s.engineer_name",
+      "s.agent_slug",
+      "s.model_slug",
+      "(SELECT r.name FROM repositories r WHERE r.id = s.repo_id)",
+    ];
+    sql += ` AND (${cols.map((c) => `${c} LIKE ? ESCAPE '\\'`).join(" OR ")})`;
+    params.push(...cols.map(() => like));
+  }
   return { sql, params };
 }
 
@@ -133,5 +150,6 @@ export function filtersToQueryString(f: Partial<Filters>): string {
   ] as const) {
     if (values && values.length > 0) parts.push(`${key}=${encodeURIComponent(values.join(","))}`);
   }
+  if (f.q) parts.push(`q=${encodeURIComponent(f.q)}`);
   return parts.length ? `?${parts.join("&")}` : "";
 }
