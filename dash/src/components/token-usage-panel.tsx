@@ -53,11 +53,10 @@ function cacheHitRate(b: TokenBucket): number | null {
 
 interface Props {
   summary: TokenSummary;
-  linesGenerated: number;
   breakdowns: Record<Dimension, TokenBreakdownRow[]>;
 }
 
-export function TokenUsagePanel({ summary, linesGenerated, breakdowns }: Props) {
+export function TokenUsagePanel({ summary, breakdowns }: Props) {
   const [dim, setDim] = useState<Dimension>("agent");
   const rows = breakdowns[dim];
 
@@ -65,8 +64,8 @@ export function TokenUsagePanel({ summary, linesGenerated, breakdowns }: Props) 
   const hasUsage = summary.sessions_with_usage > 0 && grand > 0;
   const hitRate = cacheHitRate(summary);
   const outPerLine =
-    summary.output_tokens != null && linesGenerated > 0
-      ? summary.output_tokens / linesGenerated
+    summary.output_tokens != null && summary.lines_generated > 0
+      ? summary.output_tokens / summary.lines_generated
       : null;
   const perSession =
     summary.sessions_with_usage > 0 ? grand / summary.sessions_with_usage : null;
@@ -146,7 +145,7 @@ export function TokenUsagePanel({ summary, linesGenerated, breakdowns }: Props) 
             <Derived
               label="Output tokens / AI line"
               value={outPerLine == null ? "—" : outPerLine.toFixed(0)}
-              hint="output tokens per generated line"
+              hint="from sessions that report usage"
             />
             <Derived
               label="Tokens / session"

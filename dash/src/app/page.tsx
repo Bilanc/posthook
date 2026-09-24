@@ -131,11 +131,7 @@ export default async function OverviewPage({
       </section>
 
       <section className="mb-8">
-        <TokenUsagePanel
-          summary={tokens}
-          linesGenerated={summary.lines_generated}
-          breakdowns={tokenBreakdowns}
-        />
+        <TokenUsagePanel summary={tokens} breakdowns={tokenBreakdowns} />
       </section>
 
       <section className="mb-8">

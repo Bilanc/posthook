@@ -1,5 +1,11 @@
 import { db } from "../db";
-import { filterSql, localDayStartIso, localDayEndIso, type Filters } from "../filters";
+import {
+  filterSql,
+  filterSqlForSessions,
+  localDayStartIso,
+  localDayEndIso,
+  type Filters,
+} from "../filters";
 import type { OverviewSummary } from "@/types/posthook";
 
 // SQLite expression: count newlines in a TEXT column.
@@ -220,41 +226,27 @@ export function overviewSummary(f: Filters): OverviewSummary {
   };
 }
 
-// Token sums over sessions in the filter window. Same filter semantics as
-// workingHours (dates/agents/engineers intersect the sessions table directly).
-// SUM over all-NULL groups stays null — "no agent in range reports usage".
+// Token sums over sessions in the filter window. Same session filter as the
+// token usage panel, including model and repo. SUM over all-NULL groups stays
+// null — "no agent in range reports usage".
 function tokenTotals(f: Filters): {
   input_tokens: number | null;
   output_tokens: number | null;
   cache_read_tokens: number | null;
   cache_creation_tokens: number | null;
 } {
-  const conn = db();
-  let sql = `SELECT
-       SUM(s.input_tokens) AS input_tokens,
-       SUM(s.output_tokens) AS output_tokens,
-       SUM(s.cache_read_tokens) AS cache_read_tokens,
-       SUM(s.cache_creation_tokens) AS cache_creation_tokens
-     FROM sessions s
-     WHERE 1=1`;
-  const params: unknown[] = [];
-  if (f.from) {
-    sql += " AND datetime(s.started_at) >= datetime(?)";
-    params.push(localDayStartIso(f.from));
-  }
-  if (f.to) {
-    sql += " AND datetime(s.started_at) <= datetime(?)";
-    params.push(localDayEndIso(f.to));
-  }
-  if (f.agents.length > 0) {
-    sql += ` AND s.agent_slug IN (${f.agents.map(() => "?").join(",")})`;
-    params.push(...f.agents);
-  }
-  if (f.engineers.length > 0) {
-    sql += ` AND s.engineer_email IN (${f.engineers.map(() => "?").join(",")})`;
-    params.push(...f.engineers);
-  }
-  return conn.prepare(sql).get(...params) as ReturnType<typeof tokenTotals>;
+  const fchunk = filterSqlForSessions(f);
+  return db()
+    .prepare(
+      `SELECT
+         SUM(s.input_tokens) AS input_tokens,
+         SUM(s.output_tokens) AS output_tokens,
+         SUM(s.cache_read_tokens) AS cache_read_tokens,
+         SUM(s.cache_creation_tokens) AS cache_creation_tokens
+       FROM sessions s
+       WHERE 1=1${fchunk.sql}`,
+    )
+    .get(...fchunk.params) as ReturnType<typeof tokenTotals>;
 }
 
 function workingHours(f: Filters): number {

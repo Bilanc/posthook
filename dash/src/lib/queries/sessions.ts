@@ -149,6 +149,23 @@ export interface SessionDetail extends SessionRow {
   files_touched: number;
 }
 
+// AI lines belonging to sessions that report token usage and match the session
+// filters (started_at, session model, session repo). Non-reporting agents such
+// as Cursor stay out, so this denominator matches session-level token sums.
+export function linesGeneratedForUsageSessions(f: Filters): number {
+  const fchunk = filterSqlForSessions(f);
+  const row = db()
+    .prepare(
+      `SELECT COALESCE(SUM(${LINES_GENERATED}), 0) AS lines_generated
+       FROM events e
+       JOIN sessions s ON s.id = e.session_id
+       WHERE s.input_tokens IS NOT NULL
+         AND ${AI_EDIT_EVENT_CONDITION}${fchunk.sql}`,
+    )
+    .get(...fchunk.params) as { lines_generated: number };
+  return row.lines_generated;
+}
+
 export function getSessionDetail(id: string): SessionDetail | null {
   const conn = db();
   const sql = `

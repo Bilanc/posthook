@@ -1,5 +1,6 @@
 import { db } from "../db";
 import { filterSqlForSessions, type Filters } from "../filters";
+import { linesGeneratedForUsageSessions } from "./sessions";
 
 // Token usage lives on the sessions table (filled from the Stop-hook
 // transcript for Claude Code and Codex; NULL for Cursor). Every query here
@@ -17,6 +18,8 @@ export interface TokenSummary extends TokenBucket {
   // Sessions in range that report usage vs. all sessions in range.
   sessions_with_usage: number;
   sessions_total: number;
+  // AI lines from the same usage-reporting sessions as the token sums.
+  lines_generated: number;
 }
 
 const BUCKET_COLS = `
@@ -27,7 +30,7 @@ const BUCKET_COLS = `
 
 export function tokenSummary(f: Filters): TokenSummary {
   const fchunk = filterSqlForSessions(f);
-  return db()
+  const row = db()
     .prepare(
       `SELECT
          ${BUCKET_COLS},
@@ -36,7 +39,8 @@ export function tokenSummary(f: Filters): TokenSummary {
        FROM sessions s
        WHERE 1=1${fchunk.sql}`,
     )
-    .get(...fchunk.params) as TokenSummary;
+    .get(...fchunk.params) as Omit<TokenSummary, "lines_generated">;
+  return { ...row, lines_generated: linesGeneratedForUsageSessions(f) };
 }
 
 export function totalTokens(b: TokenBucket): number | null {
