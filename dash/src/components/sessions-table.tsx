@@ -65,6 +65,7 @@ export function SessionsTable({ rows }: Props) {
             <th className="text-left px-4 py-2.5 font-medium">Repo</th>
             <th className="text-right px-4 py-2.5 font-medium">Lines gen</th>
             <th className="text-right px-4 py-2.5 font-medium">Tokens in/out</th>
+            <th className="text-right px-4 py-2.5 font-medium">Cache read</th>
             <th className="text-right px-4 py-2.5 font-medium">Edits</th>
             <th className="text-right px-4 py-2.5 font-medium">Files</th>
             <th className="text-right px-4 py-2.5 font-medium">Commits</th>
@@ -103,6 +104,9 @@ export function SessionsTable({ rows }: Props) {
               </td>
               <td className="px-4 py-2.5 text-right tabular-nums text-[var(--color-fg-muted)]">
                 {fmtTokens(r.input_tokens, r.output_tokens)}
+              </td>
+              <td className="px-4 py-2.5 text-right tabular-nums text-[var(--color-fg-muted)]">
+                {r.cache_read_tokens == null ? "—" : compact.format(r.cache_read_tokens)}
               </td>
               <td className="px-4 py-2.5 text-right tabular-nums">{r.edits}</td>
               <td className="px-4 py-2.5 text-right tabular-nums">{r.files_touched}</td>
