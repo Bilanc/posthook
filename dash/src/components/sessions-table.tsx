@@ -57,6 +57,7 @@ export function SessionsTable({ rows }: Props) {
       <table className="w-full text-sm">
         <thead className="bg-[var(--color-bg)] text-xs uppercase tracking-wider text-[var(--color-fg-muted)]">
           <tr>
+            <th className="text-left px-4 py-2.5 font-medium">Session</th>
             <th className="text-left px-4 py-2.5 font-medium">Started</th>
             <th className="text-left px-4 py-2.5 font-medium">Duration</th>
             <th className="text-left px-4 py-2.5 font-medium">Agent</th>
@@ -76,6 +77,11 @@ export function SessionsTable({ rows }: Props) {
               key={r.id}
               className="border-t border-[var(--color-border)] hover:bg-[var(--color-bg)]"
             >
+              <td className="px-4 py-2.5 font-mono text-xs text-[var(--color-fg-muted)]">
+                <Link href={`/sessions/${r.id}`} title={r.id} className="hover:underline">
+                  {r.id.slice(0, 8)}
+                </Link>
+              </td>
               <td className="px-4 py-2.5">
                 <Link
                   href={`/sessions/${r.id}`}

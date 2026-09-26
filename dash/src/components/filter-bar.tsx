@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { formatISO, subDays } from "date-fns";
 import type { FilterOptions } from "@/lib/queries/breakdowns";
 import type { Filters } from "@/lib/filters";
@@ -25,15 +25,20 @@ function rangeFor(days: number): { from: string; to: string } {
 interface Props {
   filters: Filters;
   options: FilterOptions;
+  // Free-text session search; only the sessions list supports it.
+  searchable?: boolean;
 }
 
-export function FilterBar({ filters, options }: Props) {
+export function FilterBar({ filters, options, searchable = false }: Props) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [, startTransition] = useTransition();
 
   const [open, setOpen] = useState<string | null>(null);
+  const [query, setQuery] = useState(filters.q ?? "");
+
+  useEffect(() => setQuery(filters.q ?? ""), [filters.q]);
 
   function apply(updates: Record<string, string | null | undefined>) {
     const next = new URLSearchParams(searchParams.toString());
@@ -41,10 +46,22 @@ export function FilterBar({ filters, options }: Props) {
       if (v == null || v === "") next.delete(k);
       else next.set(k, v);
     }
+    // Any filter change invalidates the current page offset.
+    next.delete("page");
     startTransition(() => {
       router.push(`${pathname}?${next.toString()}`);
     });
   }
+
+  // Debounce typing so each keystroke doesn't re-run the sessions query.
+  useEffect(() => {
+    if (!searchable) return;
+    const trimmed = query.trim();
+    if (trimmed === (filters.q ?? "")) return;
+    const t = setTimeout(() => apply({ q: trimmed || null }), 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, searchable, filters.q]);
 
   function toggleMulti(key: "agents" | "models" | "repos" | "engineers", val: string) {
     const current = filters[key];
@@ -121,16 +138,21 @@ export function FilterBar({ filters, options }: Props) {
           onClick={() => setOpen(open === "engineers" ? null : "engineers")}
         />
 
+        {searchable ? (
+          <SearchInput value={query} onChange={setQuery} />
+        ) : null}
+
         {(filters.agents.length ||
           filters.models.length ||
           filters.repos.length ||
           filters.engineers.length ||
           filters.from ||
-          filters.to) ? (
+          filters.to ||
+          filters.q) ? (
           <button
             type="button"
             onClick={() =>
-              apply({ from: null, to: null, agents: null, models: null, repos: null, engineers: null })
+              apply({ from: null, to: null, agents: null, models: null, repos: null, engineers: null, q: null })
             }
             className="ml-auto text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
           >
@@ -171,6 +193,40 @@ export function FilterBar({ filters, options }: Props) {
         />
       ) : null}
     </div>
+  );
+}
+
+function SearchInput({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <span className="relative flex items-center bg-[var(--color-bg)] border border-[var(--color-border)] rounded hover:border-[var(--color-fg-muted)] focus-within:border-[var(--color-accent)] transition-colors">
+      <svg
+        aria-hidden
+        viewBox="0 0 24 24"
+        className="pointer-events-none absolute left-2 h-3.5 w-3.5 text-[var(--color-fg-muted)]"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <circle cx="11" cy="11" r="7" />
+        <path d="m20 20-3.5-3.5" />
+      </svg>
+      <input
+        type="search"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="Search session ID, branch, engineer, repo…"
+        aria-label="Search sessions"
+        className="bg-transparent rounded pl-7 pr-2 py-1 text-sm text-[var(--color-fg)] outline-none w-[18rem] placeholder:text-[var(--color-fg-muted)]"
+      />
+    </span>
   );
 }
 

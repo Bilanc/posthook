@@ -29,17 +29,26 @@ export default async function SessionsPage({
   const totalPages = Math.max(1, Math.ceil(total / perPage));
   const qs = filtersToQueryString(filters);
   const qsJoin = qs ? `${qs}&` : "?";
+  const hasNarrowingFilters =
+    !!filters.q ||
+    filters.agents.length > 0 ||
+    filters.models.length > 0 ||
+    filters.repos.length > 0 ||
+    filters.engineers.length > 0;
+  const emptyMessage = hasNarrowingFilters
+    ? "No sessions match the current filters."
+    : "No sessions yet.";
 
   return (
     <div>
       <h1 className="text-2xl font-semibold mb-1">Sessions</h1>
       <p className="text-sm text-[var(--color-fg-muted)] mb-6">
         {total === 0
-          ? "No sessions yet."
+          ? emptyMessage
           : `${total} session${total === 1 ? "" : "s"} — showing page ${page} of ${totalPages}.`}
       </p>
 
-      <FilterBar filters={filters} options={options} />
+      <FilterBar filters={filters} options={options} searchable />
 
       <SessionsTable rows={rows} />
 
