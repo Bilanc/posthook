@@ -59,7 +59,7 @@ func newSyncCmd() *cobra.Command {
 
 // spoolDrainWait bounds how long a one-shot sync waits for the worker to
 // drain events that hooks spooled moments earlier (e.g. a Stop hook running
-// `posthook ingest && posthook sync`). The worker normally catches up within
+// `posthook ingest; posthook sync`). The worker normally catches up within
 // one poll interval; the bound only matters if it's wedged.
 const spoolDrainWait = 15 * time.Second
 

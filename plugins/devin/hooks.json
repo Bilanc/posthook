@@ -19,7 +19,7 @@
     {
       "matcher": "",
       "hooks": [
-        { "type": "command", "command": "posthook ingest --agent devin && posthook sync >/dev/null 2>&1", "timeout": 90 }
+        { "type": "command", "command": "posthook ingest --agent devin; posthook sync >/dev/null 2>&1", "timeout": 90 }
       ]
     }
   ]
