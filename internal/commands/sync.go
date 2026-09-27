@@ -63,6 +63,9 @@ func newSyncCmd() *cobra.Command {
 // one poll interval; the bound only matters if it's wedged.
 const spoolDrainWait = 15 * time.Second
 
+// flushDeadline bounds the whole one-shot flush, across all batches.
+const flushDeadline = 60 * time.Second
+
 // awaitSpoolDrain makes sure a worker is running and waits until the spool is
 // empty, so a one-shot flush includes rows from events that were spooled just
 // before it ran. Returns an error if records are still queued when the bound
@@ -93,7 +96,9 @@ func runSyncOnce() error {
 	return drainErr
 }
 
-// flushOnce ships whatever is already in the store, independent of the spool.
+// flushOnce ships everything already in the store, independent of the spool.
+// Flush sends one batch per table per call, so it repeats until no table
+// returns a full batch; a one-shot sync that exits zero has nothing left.
 func flushOnce() error {
 	db, err := store.Open()
 	if err != nil {
@@ -103,27 +108,41 @@ func flushOnce() error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), flushDeadline)
 	defer cancel()
-	res, err := pksync.Flush(ctx, db, cfg.Cloud)
-	if err != nil {
-		return err
-	}
-	if res.Skipped {
-		fmt.Printf("sync skipped: %s\n", res.Reason)
-		return nil
+	synced := map[string]int{}
+	var durationMS int64
+	for {
+		res, err := pksync.Flush(ctx, db, cfg.Cloud)
+		if err != nil {
+			return err
+		}
+		if res.Skipped {
+			fmt.Printf("sync skipped: %s\n", res.Reason)
+			return nil
+		}
+		for t, n := range res.Synced {
+			synced[t] += n
+		}
+		durationMS += res.DurationMS
+		if !res.More {
+			break
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("sync: rows still pending after %s", flushDeadline)
+		}
 	}
 	total := 0
-	for _, n := range res.Synced {
+	for _, n := range synced {
 		total += n
 	}
 	if total == 0 {
-		fmt.Printf("sync: nothing pending (%dms)\n", res.DurationMS)
+		fmt.Printf("sync: nothing pending (%dms)\n", durationMS)
 		return nil
 	}
-	fmt.Printf("sync: flushed %d row(s) in %dms\n", total, res.DurationMS)
+	fmt.Printf("sync: flushed %d row(s) in %dms\n", total, durationMS)
 	for _, t := range store.SyncableTables {
-		if n := res.Synced[t]; n > 0 {
+		if n := synced[t]; n > 0 {
 			fmt.Printf("  %-22s %d\n", t, n)
 		}
 	}
