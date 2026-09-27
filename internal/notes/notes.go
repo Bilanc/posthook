@@ -43,7 +43,19 @@ const (
 	// its own, e.g. `git pull origin main`; the shadow fetches notes
 	// explicitly in that case.) Forced (+) because the tracking ref is only
 	// ever written by fetch, so overwriting it is always correct.
-	FetchRefspec = "+" + paths.NotesRef + ":" + TrackingRef
+	//
+	// It is a pattern (trailing *) on purpose. Git aborts a fetch with
+	// "fatal: couldn't find remote ref" when a configured *exact* refspec
+	// names a ref the remote does not have, which is every repo until the
+	// first notes push. A pattern that matches nothing is skipped silently,
+	// and the * still matches the empty string, so refs/notes/posthook lands
+	// in refs/notes/posthook-remote exactly as before.
+	FetchRefspec = "+" + paths.NotesRef + "*:" + TrackingRef + "*"
+
+	// exactRefspec is the non-pattern form earlier releases wrote. It broke
+	// bare `git fetch` / `git pull` in every repo whose remote had no notes
+	// ref yet, so it is replaced by FetchRefspec wherever it is found.
+	exactRefspec = "+" + paths.NotesRef + ":" + TrackingRef
 
 	// legacyRefspec is what posthook <= 0.2.x added to both fetch and push.
 	// It made bare `git push` fail and `git fetch` warn once notes diverged,
@@ -60,8 +72,9 @@ func Enabled() bool {
 }
 
 // EnsureRefspec makes sure remote.<remote>.fetch carries FetchRefspec and
-// that the legacy refspec is gone from both fetch and push. Returns true iff
-// git config was modified. Purely local; never touches the network.
+// that the exact and legacy refspecs are gone (the legacy one from push
+// too). Returns true iff git config was modified. Purely local; never
+// touches the network.
 func EnsureRefspec(repoRoot, remote string) bool {
 	if remote == "" {
 		remote = "origin"
@@ -81,6 +94,10 @@ func EnsureRefspec(repoRoot, remote string) bool {
 		gitx.Run(repoRoot, "config", "--unset-all", pushKey, "^"+regexpQuote(legacyRefspec)+"$")
 		changed = true
 	}
+	if hasConfigValue(repoRoot, fetchKey, exactRefspec) {
+		gitx.Run(repoRoot, "config", "--unset-all", fetchKey, "^"+regexpQuote(exactRefspec)+"$")
+		changed = true
+	}
 	if !hasConfigValue(repoRoot, fetchKey, FetchRefspec) {
 		gitx.Run(repoRoot, "config", "--add", fetchKey, FetchRefspec)
 		changed = true
@@ -89,13 +106,15 @@ func EnsureRefspec(repoRoot, remote string) bool {
 }
 
 // Fetch pulls the remote's notes into the tracking ref and merges them into
-// the local notes ref. Safe when either side has no notes yet.
+// the local notes ref. A remote with no notes ref yet is not an error: the
+// pattern refspec simply matches nothing and no refs are created (check
+// RefExists(TrackingRef) to tell the two apart). An error means the fetch
+// itself failed, e.g. the remote was unreachable.
 func Fetch(repoRoot, remote string) error {
 	if remote == "" {
 		remote = "origin"
 	}
 	if _, err := runTimed(repoRoot, "fetch", "--quiet", "--no-tags", remote, FetchRefspec); err != nil {
-		// Most likely the remote simply has no notes ref yet.
 		logx.Debugf("notes: fetch from %s: %v", remote, err)
 		return err
 	}
@@ -135,7 +154,7 @@ func Push(repoRoot, remote string) error {
 	if !RefExists(repoRoot, paths.NotesRef) {
 		return nil
 	}
-	// Ignore fetch errors: a remote with no notes yet is the common first case.
+	// Best-effort: an unreachable remote will fail the push below anyway.
 	_ = Fetch(repoRoot, remote)
 	if _, err := runTimed(repoRoot, "push", "--quiet", remote, paths.NotesRef+":"+paths.NotesRef); err != nil {
 		logx.Debugf("notes: push to %s: %v", remote, err)
