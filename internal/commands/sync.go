@@ -64,22 +64,31 @@ func newSyncCmd() *cobra.Command {
 const spoolDrainWait = 15 * time.Second
 
 // awaitSpoolDrain makes sure a worker is running and waits until the spool is
-// empty (or the bound elapses), so a one-shot flush includes rows from events
-// that were spooled just before it ran.
-func awaitSpoolDrain() {
+// empty, so a one-shot flush includes rows from events that were spooled just
+// before it ran. Returns an error if records are still queued when the bound
+// elapses, so a zero exit never implies they were flushed.
+func awaitSpoolDrain() error {
 	ensureWorker()
 	deadline := time.Now().Add(spoolDrainWait)
-	for time.Now().Before(deadline) {
+	for {
 		p, err := spool.Pending()
-		if err != nil || p == 0 {
-			return
+		if err != nil {
+			return fmt.Errorf("spool: %w", err)
+		}
+		if p == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("spool: %d event(s) still queued after %s; worker not draining (see %s)", p, spoolDrainWait, workerLogPath())
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 }
 
 func runSyncOnce() error {
-	awaitSpoolDrain()
+	if err := awaitSpoolDrain(); err != nil {
+		return err
+	}
 	db, err := store.Open()
 	if err != nil {
 		return err
