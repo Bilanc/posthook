@@ -82,13 +82,37 @@ func TestPushWithNoLocalNotesIsANoop(t *testing.T) {
 	}
 }
 
-func TestFetchWhenRemoteHasNoNotesReturnsErrorButLeavesRepoClean(t *testing.T) {
+func TestFetchWhenRemoteHasNoNotesIsANoopAndLeavesRepoClean(t *testing.T) {
 	_, _, b := setup(t)
-	if err := Fetch(b, "origin"); err == nil {
-		t.Fatal("expected an error when the remote has no notes ref")
+	if err := Fetch(b, "origin"); err != nil {
+		t.Fatalf("a remote with no notes ref must not be an error: %v", err)
 	}
 	if RefExists(b, paths.NotesRef) || RefExists(b, TrackingRef) {
 		t.Fatal("no refs should have been created")
+	}
+}
+
+func TestFetchFromUnreachableRemoteReturnsError(t *testing.T) {
+	_, a, _ := setup(t)
+	git(t, a, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing.git"))
+	if err := Fetch(a, "origin"); err == nil {
+		t.Fatal("expected an error when the remote cannot be reached")
+	}
+}
+
+// The configured refspec must never break the user's own git commands: a
+// bare `git fetch` / `git pull` against a remote that has no notes ref yet
+// (every repo before the first notes push) has to succeed. An exact refspec
+// makes git abort with "couldn't find remote ref"; the pattern form does not.
+func TestPlainFetchAndPullSucceedWhenRemoteHasNoNotes(t *testing.T) {
+	_, a, _ := setup(t)
+	if !EnsureRefspec(a, "origin") {
+		t.Fatal("expected the refspec to be added")
+	}
+	git(t, a, "fetch", "-q", "origin")
+	git(t, a, "pull", "-q", "origin")
+	if RefExists(a, TrackingRef) {
+		t.Fatal("nothing should have been fetched into the tracking ref")
 	}
 }
 
@@ -150,6 +174,7 @@ func TestEnsureRefspecAddsTrackingFetchAndRemovesLegacy(t *testing.T) {
 	_, a, _ := setup(t)
 	git(t, a, "config", "--add", "remote.origin.fetch", legacyRefspec)
 	git(t, a, "config", "--add", "remote.origin.push", legacyRefspec)
+	git(t, a, "config", "--add", "remote.origin.fetch", exactRefspec)
 
 	if !EnsureRefspec(a, "origin") {
 		t.Fatal("expected config to change on first run")
@@ -163,6 +188,9 @@ func TestEnsureRefspecAddsTrackingFetchAndRemovesLegacy(t *testing.T) {
 	}
 	if containsLine(fetch, legacyRefspec) {
 		t.Fatalf("legacy fetch refspec still present: %q", fetch)
+	}
+	if containsLine(fetch, exactRefspec) {
+		t.Fatalf("exact (non-pattern) fetch refspec still present: %q", fetch)
 	}
 	cmd := exec.Command("git", "config", "--get-all", "remote.origin.push")
 	cmd.Dir = a

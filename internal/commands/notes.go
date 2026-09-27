@@ -67,7 +67,11 @@ Set POSTHOOK_NOTES_SYNC=0 to turn automatic transport off entirely.`,
 				}
 				notes.EnsureRefspec(root, remote)
 				if err := notes.Fetch(root, remote); err != nil {
-					return fmt.Errorf("%s has no attribution notes yet (or is unreachable): %w", remote, err)
+					return fmt.Errorf("fetch attribution notes from %s: %w", remote, err)
+				}
+				if !notes.RefExists(root, notes.TrackingRef) {
+					logx.Infof("%s has no attribution notes yet — nothing to fetch", remote)
+					return nil
 				}
 				logx.Infof("fetched %s from %s", paths.NotesRef, remote)
 				return nil
