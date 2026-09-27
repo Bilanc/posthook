@@ -86,9 +86,15 @@ func awaitSpoolDrain() error {
 }
 
 func runSyncOnce() error {
-	if err := awaitSpoolDrain(); err != nil {
+	drainErr := awaitSpoolDrain()
+	if err := flushOnce(); err != nil {
 		return err
 	}
+	return drainErr
+}
+
+// flushOnce ships whatever is already in the store, independent of the spool.
+func flushOnce() error {
 	db, err := store.Open()
 	if err != nil {
 		return err
