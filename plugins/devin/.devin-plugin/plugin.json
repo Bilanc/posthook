@@ -1,0 +1,5 @@
+{
+  "name": "posthook",
+  "version": "1.0.0",
+  "description": "Records Devin's edits, prompts and commits with posthook for line-level AI attribution"
+}

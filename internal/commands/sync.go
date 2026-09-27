@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bilanc/posthook/internal/config"
+	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 	pksync "github.com/bilanc/posthook/internal/sync"
 
@@ -29,7 +30,7 @@ func newSyncCmd() *cobra.Command {
 		Short: "Flush local rows to the cloud ingest endpoint",
 		Long: `Replicates rows from the local SQLite store to the configured cloud endpoint.
 
-  posthook sync                 flush once and exit (default)
+  posthook sync                 drain the spool, flush once and exit (default)
   posthook sync --loop          flush every flush_interval_seconds until killed
   posthook sync --status        show last-flush metadata + pending counts
   posthook sync --set-endpoint URL --set-token TOK --set-enabled true
@@ -56,7 +57,49 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
+// spoolDrainWait bounds how long a one-shot sync waits for the worker to
+// drain events that hooks spooled moments earlier (e.g. a Stop hook running
+// `posthook ingest; posthook sync`). The worker normally catches up within
+// one poll interval; the bound only matters if it's wedged.
+const spoolDrainWait = 15 * time.Second
+
+// flushDeadline bounds the whole one-shot flush, across all batches.
+const flushDeadline = 60 * time.Second
+
+// awaitSpoolDrain makes sure a worker is running and waits until the spool is
+// empty, so a one-shot flush includes rows from events that were spooled just
+// before it ran. Returns an error if records are still queued when the bound
+// elapses, so a zero exit never implies they were flushed.
+func awaitSpoolDrain() error {
+	ensureWorker()
+	deadline := time.Now().Add(spoolDrainWait)
+	for {
+		p, err := spool.Pending()
+		if err != nil {
+			return fmt.Errorf("spool: %w", err)
+		}
+		if p == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("spool: %d event(s) still queued after %s; worker not draining (see %s)", p, spoolDrainWait, workerLogPath())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func runSyncOnce() error {
+	drainErr := awaitSpoolDrain()
+	if err := flushOnce(); err != nil {
+		return err
+	}
+	return drainErr
+}
+
+// flushOnce ships everything already in the store, independent of the spool.
+// Flush sends one batch per table per call, so it repeats until no table
+// returns a full batch; a one-shot sync that exits zero has nothing left.
+func flushOnce() error {
 	db, err := store.Open()
 	if err != nil {
 		return err
@@ -65,27 +108,48 @@ func runSyncOnce() error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), flushDeadline)
 	defer cancel()
-	res, err := pksync.Flush(ctx, db, cfg.Cloud)
-	if err != nil {
-		return err
-	}
-	if res.Skipped {
-		fmt.Printf("sync skipped: %s\n", res.Reason)
-		return nil
+	synced := map[string]int{}
+	var durationMS int64
+	for {
+		res, err := pksync.Flush(ctx, db, cfg.Cloud)
+		if err != nil {
+			return err
+		}
+		if res.Skipped {
+			fmt.Printf("sync skipped: %s\n", res.Reason)
+			return nil
+		}
+		for t, n := range res.Synced {
+			synced[t] += n
+		}
+		durationMS += res.DurationMS
+		if !res.More {
+			break
+		}
+		if ctx.Err() != nil {
+			left, err := pksync.Pending(db)
+			if err != nil {
+				return err
+			}
+			if left == 0 {
+				break
+			}
+			return fmt.Errorf("sync: %d row(s) still pending after %s", left, flushDeadline)
+		}
 	}
 	total := 0
-	for _, n := range res.Synced {
+	for _, n := range synced {
 		total += n
 	}
 	if total == 0 {
-		fmt.Printf("sync: nothing pending (%dms)\n", res.DurationMS)
+		fmt.Printf("sync: nothing pending (%dms)\n", durationMS)
 		return nil
 	}
-	fmt.Printf("sync: flushed %d row(s) in %dms\n", total, res.DurationMS)
+	fmt.Printf("sync: flushed %d row(s) in %dms\n", total, durationMS)
 	for _, t := range store.SyncableTables {
-		if n := res.Synced[t]; n > 0 {
+		if n := synced[t]; n > 0 {
 			fmt.Printf("  %-22s %d\n", t, n)
 		}
 	}

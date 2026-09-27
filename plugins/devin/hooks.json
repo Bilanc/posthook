@@ -1,0 +1,26 @@
+{
+  "PostToolUse": [
+    {
+      "matcher": "",
+      "hooks": [
+        { "type": "command", "command": "posthook ingest --agent devin", "timeout": 10 }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "matcher": "",
+      "hooks": [
+        { "type": "command", "command": "posthook ingest --agent devin", "timeout": 10 }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        { "type": "command", "command": "posthook ingest --agent devin; s=$?; posthook sync >/dev/null 2>&1 && exit $s", "timeout": 90 }
+      ]
+    }
+  ]
+}

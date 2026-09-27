@@ -61,6 +61,9 @@ type Result struct {
 	DurationMS int64          `json:"duration_ms"`
 	Skipped    bool           `json:"skipped,omitempty"`
 	Reason     string         `json:"reason,omitempty"`
+	// More is set when at least one table returned a full batch, so rows may
+	// still be pending and another Flush is needed to catch up.
+	More bool `json:"more,omitempty"`
 }
 
 type ingestPayload struct {
@@ -103,6 +106,9 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 		}
 		pending[table] = pendingRows{rows: rows, keys: keys}
 		payload.Tables[table] = rows
+		if len(rows) == defaultBatchSize {
+			res.More = true
+		}
 	}
 	if len(payload.Tables) == 0 {
 		res.DurationMS = time.Since(start).Milliseconds()
@@ -283,6 +289,21 @@ func recordError(db *store.DB, table string, err error) {
 			last_attempt_at = excluded.last_attempt_at,
 			last_error      = excluded.last_error`,
 		table, now, err.Error())
+}
+
+// Pending returns the number of rows across all syncable tables that have
+// not been marked synced.
+func Pending(db *store.DB) (int, error) {
+	total := 0
+	for _, table := range store.SyncableTables {
+		var n int
+		if err := db.QueryRow(fmt.Sprintf(
+			`SELECT COUNT(*) FROM %s WHERE synced_at IS NULL`, table)).Scan(&n); err != nil {
+			return 0, fmt.Errorf("count pending in %s: %w", table, err)
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // Status row from sync_state, surfaced by `posthook sync --status`.
