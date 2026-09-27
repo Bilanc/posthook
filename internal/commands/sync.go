@@ -129,7 +129,14 @@ func flushOnce() error {
 			break
 		}
 		if ctx.Err() != nil {
-			return fmt.Errorf("sync: rows still pending after %s", flushDeadline)
+			left, err := pksync.Pending(db)
+			if err != nil {
+				return err
+			}
+			if left == 0 {
+				break
+			}
+			return fmt.Errorf("sync: %d row(s) still pending after %s", left, flushDeadline)
 		}
 	}
 	total := 0

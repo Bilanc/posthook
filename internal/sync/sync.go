@@ -291,6 +291,21 @@ func recordError(db *store.DB, table string, err error) {
 		table, now, err.Error())
 }
 
+// Pending returns the number of rows across all syncable tables that have
+// not been marked synced.
+func Pending(db *store.DB) (int, error) {
+	total := 0
+	for _, table := range store.SyncableTables {
+		var n int
+		if err := db.QueryRow(fmt.Sprintf(
+			`SELECT COUNT(*) FROM %s WHERE synced_at IS NULL`, table)).Scan(&n); err != nil {
+			return 0, fmt.Errorf("count pending in %s: %w", table, err)
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // Status row from sync_state, surfaced by `posthook sync --status`.
 type StatusRow struct {
 	Table         string         `json:"table"`
