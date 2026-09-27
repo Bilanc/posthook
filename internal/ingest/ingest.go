@@ -37,6 +37,12 @@ var editTools = map[string]bool{
 	"Edit": true, "Write": true, "MultiEdit": true,
 }
 
+// Devin's tool names are lowercase but carry the same tool_input shape as
+// Claude Code's, so they map straight onto the canonical line-range tools.
+var devinEditTools = map[string]string{
+	"edit": "Edit", "write": "Write", "multiedit": "MultiEdit",
+}
+
 // SpoolAgentEvent is the synchronous hook path: capture the payload + cwd and
 // hand them to the spool, then return. It deliberately does no DB or git work
 // so the hook stays fast and can't pile up under tool-call bursts — the worker
@@ -243,10 +249,10 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		}
 	}
 
-	// Cursor's beforeSubmitPrompt hook carries the typed prompt directly —
-	// there is no readable transcript on Stop for Cursor, so this is the only
-	// moment the prompt is available.
-	if eventType == "beforeSubmitPrompt" && sessionID != "" {
+	// Cursor's beforeSubmitPrompt and Devin's UserPromptSubmit hooks carry the
+	// typed prompt directly — neither exposes a readable transcript on Stop, so
+	// this is the only moment the prompt is available.
+	if (eventType == "beforeSubmitPrompt" || eventType == "UserPromptSubmit") && sessionID != "" {
 		if promptText := pickString(payload, "prompt"); promptText != "" {
 			if err := db.AppendHookPrompt(sessionID, agentSlug, ts, promptText); err != nil {
 				logx.Warnf("prompt capture failed: %v", err)
@@ -871,6 +877,9 @@ func lineRangeToolForEvent(agentSlug, eventType string, payload map[string]any) 
 		}
 		if editTools[toolName] {
 			return toolName
+		}
+		if canonical, ok := devinEditTools[strings.ToLower(toolName)]; ok && agentSlug == "devin" {
+			return canonical
 		}
 		return ""
 	}
