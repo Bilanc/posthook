@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bilanc/posthook/internal/config"
+	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 	pksync "github.com/bilanc/posthook/internal/sync"
 
@@ -29,7 +30,7 @@ func newSyncCmd() *cobra.Command {
 		Short: "Flush local rows to the cloud ingest endpoint",
 		Long: `Replicates rows from the local SQLite store to the configured cloud endpoint.
 
-  posthook sync                 flush once and exit (default)
+  posthook sync                 drain the spool, flush once and exit (default)
   posthook sync --loop          flush every flush_interval_seconds until killed
   posthook sync --status        show last-flush metadata + pending counts
   posthook sync --set-endpoint URL --set-token TOK --set-enabled true
@@ -56,7 +57,29 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
+// spoolDrainWait bounds how long a one-shot sync waits for the worker to
+// drain events that hooks spooled moments earlier (e.g. a Stop hook running
+// `posthook ingest && posthook sync`). The worker normally catches up within
+// one poll interval; the bound only matters if it's wedged.
+const spoolDrainWait = 15 * time.Second
+
+// awaitSpoolDrain makes sure a worker is running and waits until the spool is
+// empty (or the bound elapses), so a one-shot flush includes rows from events
+// that were spooled just before it ran.
+func awaitSpoolDrain() {
+	ensureWorker()
+	deadline := time.Now().Add(spoolDrainWait)
+	for time.Now().Before(deadline) {
+		p, err := spool.Pending()
+		if err != nil || p == 0 {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func runSyncOnce() error {
+	awaitSpoolDrain()
 	db, err := store.Open()
 	if err != nil {
 		return err
