@@ -82,27 +82,101 @@ func EnsureRefspec(repoRoot, remote string) bool {
 	if gitx.Run(repoRoot, "config", "--get", "remote."+remote+".url") == "" {
 		return false
 	}
-	changed := false
+	changed := RepairRefspec(repoRoot, remote)
 	fetchKey := "remote." + remote + ".fetch"
-	pushKey := "remote." + remote + ".push"
-
-	if hasConfigValue(repoRoot, fetchKey, legacyRefspec) {
-		gitx.Run(repoRoot, "config", "--unset-all", fetchKey, "^"+regexpQuote(legacyRefspec)+"$")
-		changed = true
-	}
-	if hasConfigValue(repoRoot, pushKey, legacyRefspec) {
-		gitx.Run(repoRoot, "config", "--unset-all", pushKey, "^"+regexpQuote(legacyRefspec)+"$")
-		changed = true
-	}
-	if hasConfigValue(repoRoot, fetchKey, exactRefspec) {
-		gitx.Run(repoRoot, "config", "--unset-all", fetchKey, "^"+regexpQuote(exactRefspec)+"$")
-		changed = true
-	}
 	if !hasConfigValue(repoRoot, fetchKey, FetchRefspec) {
 		gitx.Run(repoRoot, "config", "--add", fetchKey, FetchRefspec)
 		changed = true
 	}
 	return changed
+}
+
+// RepairRefspec removes the refspecs earlier releases wrote that break the
+// user's own git commands: the exact and legacy fetch refspecs make a bare
+// `git fetch` / `git pull` abort with "couldn't find remote ref" while the
+// remote has no notes ref yet, and the legacy push refspec makes a bare
+// `git push` fail while the local notes ref does not exist. A remote whose
+// fetch refspec was broken gets FetchRefspec in its place, so transport
+// stays configured; a remote that never had one is left alone.
+//
+// remote == "" repairs every remote. Purely local and cheap — a single
+// `git config` read when there is nothing to fix — which is why the git
+// shadow can afford to run it before every push, fetch and pull. Returns
+// true iff git config was modified.
+func RepairRefspec(repoRoot, remote string) bool {
+	keyPattern := `^remote\..*\.(fetch|push)$`
+	if remote != "" {
+		keyPattern = "^" + regexpQuote("remote."+remote) + `\.(fetch|push)$`
+	}
+	type remoteConfig struct {
+		brokenFetch, brokenPush []string
+		hasCurrent              bool
+	}
+	byRemote := map[string]*remoteConfig{}
+	var order []string
+	for _, line := range strings.Split(gitx.Run(repoRoot, "config", "--get-regexp", keyPattern), "\n") {
+		key, value, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		name, kind := splitRemoteKey(key)
+		if name == "" {
+			continue
+		}
+		rc := byRemote[name]
+		if rc == nil {
+			rc = &remoteConfig{}
+			byRemote[name] = rc
+			order = append(order, name)
+		}
+		switch {
+		case kind == "fetch" && (value == exactRefspec || value == legacyRefspec):
+			rc.brokenFetch = appendUnique(rc.brokenFetch, value)
+		case kind == "fetch" && value == FetchRefspec:
+			rc.hasCurrent = true
+		case kind == "push" && value == legacyRefspec:
+			rc.brokenPush = appendUnique(rc.brokenPush, value)
+		}
+	}
+	changed := false
+	for _, name := range order {
+		rc := byRemote[name]
+		fetchKey := "remote." + name + ".fetch"
+		for _, v := range rc.brokenFetch {
+			gitx.Run(repoRoot, "config", "--unset-all", fetchKey, "^"+regexpQuote(v)+"$")
+			changed = true
+		}
+		if len(rc.brokenFetch) > 0 && !rc.hasCurrent {
+			gitx.Run(repoRoot, "config", "--add", fetchKey, FetchRefspec)
+		}
+		for _, v := range rc.brokenPush {
+			gitx.Run(repoRoot, "config", "--unset-all", "remote."+name+".push", "^"+regexpQuote(v)+"$")
+			changed = true
+		}
+	}
+	return changed
+}
+
+// splitRemoteKey turns "remote.<name>.fetch" into ("<name>", "fetch").
+func splitRemoteKey(key string) (name, kind string) {
+	rest, ok := strings.CutPrefix(key, "remote.")
+	if !ok {
+		return "", ""
+	}
+	i := strings.LastIndex(rest, ".")
+	if i <= 0 {
+		return "", ""
+	}
+	return rest[:i], rest[i+1:]
+}
+
+func appendUnique(list []string, v string) []string {
+	for _, have := range list {
+		if have == v {
+			return list
+		}
+	}
+	return append(list, v)
 }
 
 // Fetch pulls the remote's notes into the tracking ref and merges them into

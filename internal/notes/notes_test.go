@@ -232,3 +232,57 @@ func containsLine(lines []string, want string) bool {
 	}
 	return false
 }
+
+func TestRepairRefspecReplacesBrokenRefspecsAndLeavesOthersAlone(t *testing.T) {
+	remote, a, b := setup(t)
+	if RepairRefspec(a, "") {
+		t.Fatal("a fresh clone has nothing to repair")
+	}
+	git(t, a, "config", "--add", "remote.origin.fetch", exactRefspec)
+	git(t, a, "config", "--add", "remote.origin.fetch", legacyRefspec)
+	git(t, a, "config", "--add", "remote.origin.push", legacyRefspec)
+	git(t, a, "remote", "add", "upstream", remote)
+	git(t, a, "config", "--add", "remote.upstream.fetch", exactRefspec)
+
+	if !RepairRefspec(a, "origin") {
+		t.Fatal("expected origin to be repaired")
+	}
+	fetch := strings.Split(git(t, a, "config", "--get-all", "remote.origin.fetch"), "\n")
+	for _, bad := range []string{exactRefspec, legacyRefspec} {
+		if containsLine(fetch, bad) {
+			t.Fatalf("%q still present: %q", bad, fetch)
+		}
+	}
+	if n := strings.Count(strings.Join(fetch, "\n"), FetchRefspec); n != 1 {
+		t.Fatalf("expected exactly one %q in %q", FetchRefspec, fetch)
+	}
+	cmd := exec.Command("git", "config", "--get-all", "remote.origin.push")
+	cmd.Dir = a
+	if out, _ := cmd.Output(); strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("legacy push refspec still present: %q", out)
+	}
+	// Naming one remote leaves the others untouched; "" repairs them all.
+	if !containsLine(strings.Split(git(t, a, "config", "--get-all", "remote.upstream.fetch"), "\n"), exactRefspec) {
+		t.Fatal("repairing origin must not touch upstream")
+	}
+	if !RepairRefspec(a, "") {
+		t.Fatal("expected upstream to be repaired")
+	}
+	up := strings.Split(git(t, a, "config", "--get-all", "remote.upstream.fetch"), "\n")
+	if containsLine(up, exactRefspec) || !containsLine(up, FetchRefspec) {
+		t.Fatalf("upstream not repaired: %q", up)
+	}
+	// The user's own commands work again, and a second run is a no-op.
+	git(t, a, "fetch", "-q", "origin")
+	git(t, a, "pull", "-q", "origin")
+	if RepairRefspec(a, "") {
+		t.Fatal("second run must be a no-op")
+	}
+	// A repo that never had transport configured gains nothing.
+	if RepairRefspec(b, "") {
+		t.Fatal("nothing to repair in b")
+	}
+	if containsLine(strings.Split(git(t, b, "config", "--get-all", "remote.origin.fetch"), "\n"), FetchRefspec) {
+		t.Fatal("RepairRefspec must never add transport to a repo that had none")
+	}
+}

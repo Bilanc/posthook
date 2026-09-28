@@ -9,7 +9,9 @@
 //   - Exit with the child's exit code (or 128+N on signal termination) so
 //     scripts and IDE integrations see the same outcome as plain git.
 //   - Capture logic runs AFTER git succeeds, never before. Pre-hooks could
-//     block legitimate work on a bug.
+//     block legitimate work on a bug. The one exception is preflight, which
+//     only repairs git config an earlier posthook wrote that would otherwise
+//     make git itself fail; see its comment.
 //   - Any failure in capture MUST NOT affect the user-visible exit code.
 //   - POSTHOOK_BYPASS=1 disables capture entirely — set by our own internal
 //     git calls to prevent recursion.
@@ -44,6 +46,9 @@ func Run(args []string) {
 	subcommand, subcommandArgs := splitGitInvocation(args)
 	interceptable := !bypass && isInterceptable(subcommand)
 
+	if !bypass {
+		preflight(realGit, subcommand, subcommandArgs)
+	}
 	code := spawnPassthrough(realGit, args)
 
 	if interceptable && code == 0 {
@@ -69,6 +74,41 @@ func Run(args []string) {
 		}
 	}
 	os.Exit(code)
+}
+
+// preflight runs before the real git for push, fetch and pull. It is the
+// one deliberate exception to "capture runs after git succeeds": posthook
+// <= 0.3.0 wrote notes refspecs into the repo's own git config that make the
+// user's command fail ("fatal: couldn't find remote ref refs/notes/posthook"
+// on a bare fetch/pull against a remote with no notes yet), and a command
+// that fails never reaches a post-success handler, so nothing after the fact
+// could repair it. Preflight touches only that config, does no network I/O,
+// never adds transport to a repo that had none, runs even with
+// POSTHOOK_NOTES_SYNC=0 (the broken config breaks git either way), and cannot
+// change git's exit code: every failure inside it is swallowed.
+func preflight(realGit, subcommand string, args []string) {
+	flags := fetchFlagsWithValues
+	switch subcommand {
+	case "push":
+		flags = pushFlagsWithValues
+	case "fetch", "pull":
+	default:
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Warnf("proxy preflight panicked for %s: %v", subcommand, r)
+		}
+	}()
+	root := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
+	if root == "" {
+		return
+	}
+	// A bare invocation (or --all) may touch any remote, so with no remote
+	// named on the command line every remote is repaired.
+	if notes.RepairRefspec(gitx.Canonicalize(root), remoteFromArgs(args, flags)) {
+		logx.Debugf("proxy: repaired notes refspec before %s", subcommand)
+	}
 }
 
 func isInterceptable(subcommand string) bool {
