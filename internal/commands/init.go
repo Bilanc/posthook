@@ -5,8 +5,12 @@
 package commands
 
 import (
+	"os"
+	"path/filepath"
+
 	"github.com/bilanc/posthook/internal/installers"
 	"github.com/bilanc/posthook/internal/logx"
+	"github.com/bilanc/posthook/internal/notes"
 	"github.com/bilanc/posthook/internal/store"
 
 	"github.com/spf13/cobra"
@@ -87,6 +91,13 @@ func runInit(binFlag string) error {
 	}
 	logx.Info("")
 
+	// Existing repos: posthook <= 0.3.0 wrote a notes fetch refspec that
+	// makes a bare `git fetch` / `git pull` fail until the remote has notes.
+	// The git shadow repairs a repo the next time git runs there; the repos
+	// we already know about are fixed here so the hook-only fallback install
+	// (no shadow) is covered too. install.sh runs init on every upgrade.
+	repairKnownRepos()
+
 	// Bring the web dashboard up in the background (best-effort; never fails init).
 	logx.Info("Web dashboard:")
 	autostartDashboard()
@@ -95,4 +106,31 @@ func runInit(binFlag string) error {
 	logx.Info("Done. Track existing repos with: posthook track <path>")
 	logx.Info("Verify with:                     posthook status")
 	return nil
+}
+
+// repairKnownRepos runs notes.RepairRefspec over every repo in the store.
+// Best-effort and quiet: paths that no longer exist are skipped.
+func repairKnownRepos() {
+	db, err := store.Open()
+	if err != nil {
+		return
+	}
+	roots, err := db.RepositoryRoots()
+	if err != nil {
+		logx.Debugf("init: list repositories: %v", err)
+		return
+	}
+	repaired := 0
+	for _, root := range roots {
+		if _, err := os.Stat(filepath.Join(root, ".git")); err != nil {
+			continue
+		}
+		if notes.RepairRefspec(root, "") {
+			repaired++
+		}
+	}
+	if repaired > 0 {
+		logx.Infof("Notes transport: repaired the fetch refspec in %d existing repo(s)", repaired)
+		logx.Info("")
+	}
 }

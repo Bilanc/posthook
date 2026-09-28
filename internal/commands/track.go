@@ -4,8 +4,10 @@ import (
 	"errors"
 	"path/filepath"
 
+	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/installers"
 	"github.com/bilanc/posthook/internal/logx"
+	"github.com/bilanc/posthook/internal/store"
 
 	"github.com/spf13/cobra"
 )
@@ -31,6 +33,13 @@ func newTrackCmd() *cobra.Command {
 			res, err := installers.InstallRepoHook(abs, bin)
 			if err != nil {
 				return err
+			}
+			// Register the repo so upgrade-time sweeps (see repairKnownRepos)
+			// reach it even if it never produces an event. Best-effort.
+			if db, err := store.Open(); err == nil {
+				if _, err := db.EnsureRepository(gitx.Canonicalize(abs)); err != nil {
+					logx.Debugf("track: register %s: %v", abs, err)
+				}
 			}
 			logx.Info(res.Message)
 			return nil
