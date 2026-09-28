@@ -44,10 +44,11 @@ func Run(args []string) {
 
 	bypass := os.Getenv("POSTHOOK_BYPASS") == "1"
 	subcommand, subcommandArgs := splitGitInvocation(args)
+	globals := globalOptions(args, subcommandArgs)
 	interceptable := !bypass && isInterceptable(subcommand)
 
 	if !bypass {
-		preflight(realGit, subcommand, subcommandArgs)
+		preflight(realGit, globals, subcommand)
 	}
 	code := spawnPassthrough(realGit, args)
 
@@ -61,13 +62,13 @@ func Run(args []string) {
 		var err error
 		switch subcommand {
 		case "commit":
-			err = handleCommit(realGit)
+			err = handleCommit(realGit, globals)
 		case "clone":
 			err = handleClone(realGit, subcommandArgs)
 		case "push":
-			err = handlePush(realGit, subcommandArgs)
+			err = handlePush(realGit, globals, subcommandArgs)
 		case "fetch", "pull":
-			err = handleFetch(realGit, subcommandArgs)
+			err = handleFetch(realGit, globals, subcommandArgs)
 		}
 		if err != nil {
 			logx.Warnf("proxy capture failed for %s: %v", subcommand, err)
@@ -86,12 +87,13 @@ func Run(args []string) {
 // never adds transport to a repo that had none, runs even with
 // POSTHOOK_NOTES_SYNC=0 (the broken config breaks git either way), and cannot
 // change git's exit code: every failure inside it is swallowed.
-func preflight(realGit, subcommand string, args []string) {
-	flags := fetchFlagsWithValues
+//
+// globals are the options git received before the subcommand (`-C dir`,
+// `--git-dir`, `-c k=v`, ...) so the repo is resolved exactly as git itself
+// will resolve it.
+func preflight(realGit string, globals []string, subcommand string) {
 	switch subcommand {
-	case "push":
-		flags = pushFlagsWithValues
-	case "fetch", "pull":
+	case "push", "fetch", "pull":
 	default:
 		return
 	}
@@ -100,15 +102,36 @@ func preflight(realGit, subcommand string, args []string) {
 			logx.Warnf("proxy preflight panicked for %s: %v", subcommand, r)
 		}
 	}()
-	root := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
+	root := repoRoot(realGit, globals)
 	if root == "" {
 		return
 	}
-	// A bare invocation (or --all) may touch any remote, so with no remote
-	// named on the command line every remote is repaired.
-	if notes.RepairRefspec(gitx.Canonicalize(root), remoteFromArgs(args, flags)) {
+	// Every remote is repaired, not just the one named on the command line:
+	// `--all` and `--multiple` touch several, and the cost is the same single
+	// config read either way.
+	if notes.RepairRefspec(root, "") {
 		logx.Debugf("proxy: repaired notes refspec before %s", subcommand)
 	}
+}
+
+// globalOptions returns the arguments git received before its subcommand.
+func globalOptions(args, subcommandArgs []string) []string {
+	n := len(args) - len(subcommandArgs) - 1
+	if n < 0 {
+		return nil
+	}
+	return args[:n]
+}
+
+// repoRoot resolves the working tree git will operate on for an invocation
+// with the given global options. Empty outside a working tree (bare repo,
+// `--git-dir` without `--work-tree`, not a repo at all).
+func repoRoot(realGit string, globals []string) string {
+	root := runRealGit(realGit, "", append(append([]string{}, globals...), "rev-parse", "--show-toplevel")...)
+	if root == "" {
+		return ""
+	}
+	return gitx.Canonicalize(root)
 }
 
 func isInterceptable(subcommand string) bool {
@@ -200,18 +223,16 @@ func spawnPassthrough(realGit string, args []string) int {
 	return 127
 }
 
-func handleCommit(realGit string) error {
-	// After `git commit` succeeds, capture the new HEAD commit. We're
-	// already in the user's cwd, so rev-parse works without --cwd plumbing.
-	repoRoot := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
-	if repoRoot == "" {
+func handleCommit(realGit string, globals []string) error {
+	// After `git commit` succeeds, capture the new HEAD commit.
+	root := repoRoot(realGit, globals)
+	if root == "" {
 		return nil
 	}
-	sha := runRealGit(realGit, "", "rev-parse", "HEAD")
+	sha := runRealGit(realGit, root, "rev-parse", "HEAD")
 	if sha == "" {
 		return nil
 	}
-	root := gitx.Canonicalize(repoRoot)
 	if err := ingest.GitCommit(root, sha); err != nil {
 		return err
 	}
@@ -252,15 +273,14 @@ func handleClone(realGit string, args []string) error {
 // handlePush runs after a successful `git push`: it merges any notes the
 // remote already has into ours, then pushes refs/notes/posthook so
 // teammates can `posthook blame` the commits that just went up.
-func handlePush(realGit string, args []string) error {
+func handlePush(realGit string, globals, args []string) error {
 	if pushSkipsNotes(args) {
 		return nil
 	}
-	root := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
+	root := repoRoot(realGit, globals)
 	if root == "" {
 		return nil
 	}
-	root = gitx.Canonicalize(root)
 	remote := remoteFromArgs(args, pushFlagsWithValues)
 	if remote == "" {
 		remote = defaultPushRemote(realGit, root)
@@ -284,15 +304,14 @@ func handlePush(realGit string, args []string) error {
 // left. With an explicit refspec (`git pull origin main`) git ignores the
 // configured ones, so the notes are fetched explicitly — one extra
 // single-ref round trip.
-func handleFetch(realGit string, args []string) error {
+func handleFetch(realGit string, globals, args []string) error {
 	if hasFlag(args, "--dry-run") {
 		return nil
 	}
-	root := runRealGit(realGit, "", "rev-parse", "--show-toplevel")
+	root := repoRoot(realGit, globals)
 	if root == "" {
 		return nil
 	}
-	root = gitx.Canonicalize(root)
 	remote := remoteFromArgs(args, fetchFlagsWithValues)
 	if remote == "" {
 		remote = "origin"

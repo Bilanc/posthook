@@ -19,3 +19,10 @@ func (db *DB) RepositoryRoots() ([]string, error) {
 	}
 	return roots, rows.Err()
 }
+
+// EnsureRepository records root as a known repository (no-op when it is
+// already there) and returns its id. `posthook track` calls this so repos
+// that never produce an event are still visible to upgrade-time sweeps.
+func (db *DB) EnsureRepository(root string) (string, error) {
+	return db.lookupOrCreateRepoByRoot(root)
+}
