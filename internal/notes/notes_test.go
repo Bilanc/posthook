@@ -286,3 +286,23 @@ func TestRepairRefspecReplacesBrokenRefspecsAndLeavesOthersAlone(t *testing.T) {
 		t.Fatal("RepairRefspec must never add transport to a repo that had none")
 	}
 }
+
+// RepairRefspec only ever wrote local config, so it only reads local config:
+// a broken refspec inherited from the global scope must neither be reported
+// as repaired nor cause anything to be written.
+func TestRepairRefspecIgnoresRefspecsFromOtherConfigScopes(t *testing.T) {
+	_, a, _ := setup(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	git(t, a, "config", "--global", "--add", "remote.origin.fetch", exactRefspec)
+	if !containsLine(strings.Split(git(t, a, "config", "--get-all", "remote.origin.fetch"), "\n"), exactRefspec) {
+		t.Fatal("test setup: global refspec should be visible in effective config")
+	}
+	if RepairRefspec(a, "") {
+		t.Fatal("a refspec that lives outside local config must not be reported as repaired")
+	}
+	if containsLine(strings.Split(git(t, a, "config", "--local", "--get-all", "remote.origin.fetch"), "\n"), FetchRefspec) {
+		t.Fatal("nothing should have been written to local config")
+	}
+}

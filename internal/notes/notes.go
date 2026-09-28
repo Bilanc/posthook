@@ -99,10 +99,13 @@ func EnsureRefspec(repoRoot, remote string) bool {
 // fetch refspec was broken gets FetchRefspec in its place, so transport
 // stays configured; a remote that never had one is left alone.
 //
-// remote == "" repairs every remote. Purely local and cheap — a single
-// `git config` read when there is nothing to fix — which is why the git
-// shadow can afford to run it before every push, fetch and pull. Returns
-// true iff git config was modified.
+// remote == "" repairs every remote. Only the repository's local config is
+// read and written: that is the only scope posthook ever wrote to, and
+// reading the effective (system + global + local) config would report a
+// repair for a refspec inherited from a scope this never edits. Cheap — a
+// single `git config` read when there is nothing to fix — which is why the
+// git shadow can afford to run it before every push, fetch and pull.
+// Returns true iff git config was modified.
 func RepairRefspec(repoRoot, remote string) bool {
 	keyPattern := `^remote\..*\.(fetch|push)$`
 	if remote != "" {
@@ -114,7 +117,7 @@ func RepairRefspec(repoRoot, remote string) bool {
 	}
 	byRemote := map[string]*remoteConfig{}
 	var order []string
-	for _, line := range strings.Split(gitx.Run(repoRoot, "config", "--get-regexp", keyPattern), "\n") {
+	for _, line := range strings.Split(gitx.Run(repoRoot, "config", "--local", "--get-regexp", keyPattern), "\n") {
 		key, value, ok := strings.Cut(line, " ")
 		if !ok {
 			continue
@@ -143,14 +146,14 @@ func RepairRefspec(repoRoot, remote string) bool {
 		rc := byRemote[name]
 		fetchKey := "remote." + name + ".fetch"
 		for _, v := range rc.brokenFetch {
-			gitx.Run(repoRoot, "config", "--unset-all", fetchKey, "^"+regexpQuote(v)+"$")
+			gitx.Run(repoRoot, "config", "--local", "--unset-all", fetchKey, "^"+regexpQuote(v)+"$")
 			changed = true
 		}
 		if len(rc.brokenFetch) > 0 && !rc.hasCurrent {
-			gitx.Run(repoRoot, "config", "--add", fetchKey, FetchRefspec)
+			gitx.Run(repoRoot, "config", "--local", "--add", fetchKey, FetchRefspec)
 		}
 		for _, v := range rc.brokenPush {
-			gitx.Run(repoRoot, "config", "--unset-all", "remote."+name+".push", "^"+regexpQuote(v)+"$")
+			gitx.Run(repoRoot, "config", "--local", "--unset-all", "remote."+name+".push", "^"+regexpQuote(v)+"$")
 			changed = true
 		}
 	}
