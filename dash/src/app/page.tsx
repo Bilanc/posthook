@@ -3,9 +3,18 @@ import { FilterBar } from "@/components/filter-bar";
 import { SankeyFunnel } from "@/components/sankey-funnel";
 import { BreakdownBar } from "@/components/breakdown-bar";
 import { DailyUsageChart } from "@/components/daily-usage-chart";
+import { TokenUsagePanel } from "@/components/token-usage-panel";
 import { parseFilters, resolveFilters, type SearchParams } from "@/lib/filters";
 import { overviewSummary } from "@/lib/queries/overview";
 import { dailyUsage } from "@/lib/queries/daily";
+import {
+  dailyTokens,
+  tokenSummary,
+  tokensByAgent,
+  tokensByEngineer,
+  tokensByModel,
+  tokensByRepo,
+} from "@/lib/queries/tokens";
 import {
   breakdownByAgent,
   breakdownByModel,
@@ -52,6 +61,14 @@ export default async function OverviewPage({
   const byModel = breakdownByModel(filters);
   const byRepo = breakdownByRepo(filters);
   const byEngineer = breakdownByEngineer(filters);
+  const tokens = tokenSummary(filters);
+  const tokensDaily = dailyTokens(filters);
+  const tokenBreakdowns = {
+    agent: tokensByAgent(filters),
+    model: tokensByModel(filters),
+    repo: tokensByRepo(filters),
+    engineer: tokensByEngineer(filters),
+  };
 
   return (
     <div>
@@ -110,7 +127,15 @@ export default async function OverviewPage({
       </section>
 
       <section className="mb-8">
-        <DailyUsageChart from={filters.from} to={filters.to} data={daily} />
+        <DailyUsageChart from={filters.from} to={filters.to} data={daily} tokens={tokensDaily} />
+      </section>
+
+      <section className="mb-8">
+        <TokenUsagePanel
+          summary={tokens}
+          linesGenerated={summary.lines_generated}
+          breakdowns={tokenBreakdowns}
+        />
       </section>
 
       <section className="mb-8">

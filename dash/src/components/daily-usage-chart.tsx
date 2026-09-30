@@ -14,8 +14,10 @@ import {
   YAxis,
 } from "recharts";
 import type { DailyKeyRow, DailyUsage } from "@/lib/queries/daily";
+import type { DailyTokenRow } from "@/lib/queries/tokens";
+import { TOKEN_BUCKETS } from "./token-usage-panel";
 
-type Mode = "overall" | "agent" | "model" | "repo" | "engineer";
+type Mode = "overall" | "agent" | "model" | "repo" | "engineer" | "tokens";
 
 const MODES: Array<{ key: Mode; label: string }> = [
   { key: "overall", label: "Generated vs committed" },
@@ -23,7 +25,13 @@ const MODES: Array<{ key: Mode; label: string }> = [
   { key: "model", label: "Model" },
   { key: "repo", label: "Repo" },
   { key: "engineer", label: "Engineer" },
+  { key: "tokens", label: "Tokens" },
 ];
+
+const compact = new Intl.NumberFormat("en-US", {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
 
 // Stacked series beyond this collapse into "Other" so the legend stays legible.
 const MAX_KEYS = 8;
@@ -46,6 +54,7 @@ interface Props {
   from: string | null;
   to: string | null;
   data: DailyUsage;
+  tokens: DailyTokenRow[];
 }
 
 function dayRange(from: string | null, to: string | null, fallbackDays: string[]): string[] {
@@ -90,12 +99,13 @@ function fmtDay(day: string): string {
   return format(parseISO(day), "MMM d");
 }
 
-export function DailyUsageChart({ from, to, data }: Props) {
+export function DailyUsageChart({ from, to, data, tokens }: Props) {
   const [mode, setMode] = useState<Mode>("overall");
 
   const allDays = [
     ...data.overall.map((r) => r.day),
     ...data.byAgent.map((r) => r.day),
+    ...tokens.map((r) => r.day),
   ];
   const days = dayRange(from, to, allDays);
 
@@ -113,6 +123,15 @@ export function DailyUsageChart({ from, to, data }: Props) {
       { key: "Lines generated", color: GENERATED_COLOR, type: "bar" },
       { key: "Lines committed", color: COMMITTED_COLOR, type: "line" },
     ];
+  } else if (mode === "tokens") {
+    const byDay = new Map(tokens.map((r) => [r.day, r]));
+    chartData = days.map((d) => {
+      const row: Record<string, number | string> = { day: d };
+      const t = byDay.get(d);
+      for (const b of TOKEN_BUCKETS) row[b.label] = t?.[b.key] ?? 0;
+      return row;
+    });
+    series = TOKEN_BUCKETS.map((b) => ({ key: b.label, color: b.color, type: "bar" as const }));
   } else {
     const rows = {
       agent: data.byAgent,
@@ -137,7 +156,9 @@ export function DailyUsageChart({ from, to, data }: Props) {
     <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-5">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
         <div className="text-xs uppercase tracking-wider text-[var(--color-fg-muted)]">
-          Daily usage — AI lines per day
+          {mode === "tokens"
+            ? "Daily usage — tokens per day (by session start)"
+            : "Daily usage — AI lines per day"}
         </div>
         <div className="flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-0.5">
           {MODES.map((m) => (
@@ -167,7 +188,12 @@ export function DailyUsageChart({ from, to, data }: Props) {
               tickFormatter={fmtDay}
               minTickGap={24}
             />
-            <YAxis stroke="#8e8e93" fontSize={11} width={56} />
+            <YAxis
+              stroke="#8e8e93"
+              fontSize={11}
+              width={56}
+              tickFormatter={mode === "tokens" ? (v: number) => compact.format(v) : undefined}
+            />
             <Tooltip
               cursor={{ fill: "#1f1f23", opacity: 0.4 }}
               contentStyle={{

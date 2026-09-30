@@ -7,6 +7,7 @@ import {
   getSessionDetail,
   storedPromptsForSession,
   transcriptPathForSession,
+  type SessionDetail,
 } from "@/lib/queries/sessions";
 import { commitsForSession } from "@/lib/queries/commits";
 import { readPrompts } from "@/lib/transcript";
@@ -96,6 +97,10 @@ export default async function SessionDetailPage({
         <Kpi label="Repo" value={session.repo_name ?? "—"} />
         <Kpi label="Lines generated" value={fmtNum(session.lines_generated)} />
         <Kpi
+          label="Duration"
+          value={fmtDuration(session.started_at, session.ended_at)}
+        />
+        <Kpi
           label="Tokens in / out"
           value={
             session.input_tokens == null && session.output_tokens == null
@@ -103,11 +108,9 @@ export default async function SessionDetailPage({
               : `${compact.format(session.input_tokens ?? 0)} / ${compact.format(session.output_tokens ?? 0)}`
           }
         />
-        <Kpi
-          label="Duration"
-          value={fmtDuration(session.started_at, session.ended_at)}
-        />
       </section>
+
+      {session.input_tokens != null ? <TokenBreakdown session={session} /> : null}
 
       <section className="mb-8 text-sm text-[var(--color-fg-muted)] grid grid-cols-1 md:grid-cols-2 gap-2">
         <div>
@@ -205,6 +208,69 @@ export default async function SessionDetailPage({
         </Panel>
       </section>
     </div>
+  );
+}
+
+function TokenBreakdown({
+  session,
+}: {
+  session: Pick<
+    SessionDetail,
+    "input_tokens" | "output_tokens" | "cache_read_tokens" | "cache_creation_tokens" | "lines_generated"
+  >;
+}) {
+  const input = session.input_tokens ?? 0;
+  const output = session.output_tokens ?? 0;
+  const cacheRead = session.cache_read_tokens ?? 0;
+  const cacheWrite = session.cache_creation_tokens ?? 0;
+  const total = input + output + cacheRead + cacheWrite;
+  const prompt = input + cacheRead + cacheWrite;
+  const hitRate = prompt > 0 ? (cacheRead / prompt) * 100 : null;
+  const outPerLine = session.lines_generated > 0 ? output / session.lines_generated : null;
+  const buckets = [
+    { label: "Input", value: input, color: "#6366f1" },
+    { label: "Output", value: output, color: "#14b8a6" },
+    { label: "Cache read", value: cacheRead, color: "#0ea5e9" },
+    { label: "Cache write", value: cacheWrite, color: "#f59e0b" },
+  ];
+  return (
+    <section className="mb-8 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-5">
+      <div className="flex flex-wrap items-baseline justify-between gap-3 mb-3">
+        <div className="text-xs uppercase tracking-wider text-[var(--color-fg-muted)]">
+          Token usage
+        </div>
+        <div className="text-xs text-[var(--color-fg-muted)] tabular-nums">
+          {fmtNum(total)} total · cache hit{" "}
+          {hitRate == null ? "—" : `${hitRate.toFixed(1)}%`} ·{" "}
+          {outPerLine == null ? "—" : outPerLine.toFixed(0)} output tokens / AI line
+        </div>
+      </div>
+      <div className="flex h-3 w-full overflow-hidden rounded bg-[var(--color-bg)] mb-3">
+        {buckets.map((b) =>
+          b.value > 0 && total > 0 ? (
+            <div
+              key={b.label}
+              style={{ width: `${(b.value / total) * 100}%`, background: b.color }}
+              title={`${b.label}: ${fmtNum(b.value)}`}
+            />
+          ) : null,
+        )}
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        {buckets.map((b) => (
+          <div key={b.label} className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] p-3">
+            <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-[var(--color-fg-muted)]">
+              <span className="inline-block h-2 w-2 rounded-sm" style={{ background: b.color }} />
+              {b.label}
+            </div>
+            <div className="mt-1 text-sm font-medium tabular-nums">{fmtNum(b.value)}</div>
+            <div className="text-[11px] text-[var(--color-fg-muted)] tabular-nums">
+              {total > 0 ? `${((b.value / total) * 100).toFixed(1)}% of total` : "—"}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
