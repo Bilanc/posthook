@@ -262,6 +262,6 @@ Issues and pull requests are welcome. The CLI has no runtime dependencies beyond
 
 Things to avoid while developing:
 
-- **Don't run a dev build of `posthook init`, `install-shadow` or the git shadow against your real setup.** They rewrite `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/config.toml`, `~/.gitconfig` and `~/.posthook/posthook.db`. Everything resolves under `$HOME`, so point them at a scratch home instead: `HOME=$(mktemp -d) ./posthook init`. Set `POSTHOOK_BIN` if you do want hooks to call a dev binary.
+- **Don't run a dev build of `posthook init`, `install-shadow` or the git shadow against your real setup.** They rewrite `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/config.toml`, `~/.gitconfig` and `~/.posthook/posthook.db`. Everything resolves under `$HOME`, and `install-shadow` drops its `git` symlink next to the posthook binary, so build into a scratch home and run from there: `export HOME=$(mktemp -d) && go build -o $HOME/bin/posthook ./cmd/posthook && $HOME/bin/posthook init`. Set `POSTHOOK_BIN` if you do want hooks to call a dev binary.
 - **Don't push `refs/notes/posthook` from a test repo to a shared remote.** Use `POSTHOOK_NOTES_SYNC=0` or a throwaway remote when exercising the shadow's push/fetch path.
 - **Don't change `internal/store/schema.go` without a migration** in `internal/store/migrations.go` and a matching update to `dash/src/types/posthook.ts`, which mirrors the schema by hand.
