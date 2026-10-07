@@ -1,4 +1,4 @@
-// Row shapes mirror posthook's SQLite schema (posthook/src/store.ts).
+// Row shapes mirror posthook's SQLite schema (internal/store/schema.go).
 // Keep nullability matching the schema — every column documented here.
 
 export interface SessionRow {

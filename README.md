@@ -259,3 +259,9 @@ cd dash && npm ci && npm run build
 ## Contributing
 
 Issues and pull requests are welcome. The CLI has no runtime dependencies beyond a Go toolchain, so `go build ./...` and `go test ./...` are all you need to get going. Each `internal/` package is small and single-purpose — the line-range extractor, installers, and transcript parser are all pure and unit-tested, which is the easiest place to start.
+
+Things to avoid while developing:
+
+- **Don't run a dev build of `posthook init`, `install-shadow` or the git shadow against your real setup.** They rewrite `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/config.toml`, `~/.gitconfig` and `~/.posthook/posthook.db`. Everything resolves under `$HOME`, so point them at a scratch home instead: `HOME=$(mktemp -d) ./posthook init`. Set `POSTHOOK_BIN` if you do want hooks to call a dev binary.
+- **Don't push `refs/notes/posthook` from a test repo to a shared remote.** Use `POSTHOOK_NOTES_SYNC=0` or a throwaway remote when exercising the shadow's push/fetch path.
+- **Don't change `internal/store/schema.go` without a migration** in `internal/store/migrations.go` and a matching update to `dash/src/types/posthook.ts`, which mirrors the schema by hand.
