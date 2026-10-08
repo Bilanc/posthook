@@ -63,7 +63,7 @@ npm run build    # produces .next/standalone, which bin/posthook-dash.mjs runs
 
 - Next.js 15 App Router + React 19 + TypeScript strict.
 - Tailwind v4 for styling.
-- `better-sqlite3` for SQLite access; server components query it directly.
+- `node:sqlite` (`DatabaseSync`, Node >=24) for SQLite access via `src/lib/db.ts`; server components query it directly.
 - Recharts for KPI bars and breakdowns; ECharts (Sankey only) for the funnel.
 - No API routes, no client-side data fetching.
 
