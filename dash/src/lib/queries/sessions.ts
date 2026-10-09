@@ -19,6 +19,7 @@ export interface SessionListRow {
   commits_attributed: number;
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_read_tokens: number | null;
 }
 
 const NL = (col: string) => `(length(${col}) - length(replace(${col}, char(10), '')))`;
@@ -121,6 +122,7 @@ export function listSessions(
       (julianday(COALESCE(s.ended_at, s.started_at)) - julianday(s.started_at)) * 24 AS duration_hours,
       s.input_tokens,
       s.output_tokens,
+      s.cache_read_tokens,
       COALESCE(pse.lines_generated, 0) AS lines_generated,
       COALESCE(pse.edits, 0) AS edits,
       COALESCE(pse.files_touched, 0) AS files_touched,
