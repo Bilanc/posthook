@@ -52,6 +52,7 @@ func runInit(binFlag string) error {
 		{"Claude Code", installers.DetectClaudeCode, func() (installers.Result, error) { return installers.InstallClaudeCodeHooks(binaryPath) }},
 		{"Cursor", installers.DetectCursor, func() (installers.Result, error) { return installers.InstallCursorHooks(binaryPath) }},
 		{"Codex CLI", installers.DetectCodex, func() (installers.Result, error) { return installers.InstallCodexHooks(binaryPath) }},
+		{"GitHub Copilot", installers.DetectCopilot, func() (installers.Result, error) { return installers.InstallCopilotHooks(binaryPath) }},
 	}
 
 	logx.Info("AI agent hooks:")

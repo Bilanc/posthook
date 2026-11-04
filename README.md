@@ -10,7 +10,7 @@ Posthook tells you which lines of your codebase were written by an AI agent, by 
 
 ---
 
-Posthook installs hooks into the AI coding tools you already use (Claude Code, Cursor, Codex CLI) and a lightweight `git` shadow that sits in front of every git command on your machine. It captures both sides — what the AI did, and what you committed — into a single SQLite file you can query, browse in a web dashboard, or attribute line-by-line with `posthook blame`.
+Posthook installs hooks into the AI coding tools you already use (Claude Code, Cursor, Codex CLI, GitHub Copilot) and a lightweight `git` shadow that sits in front of every git command on your machine. It captures both sides — what the AI did, and what you committed — into a single SQLite file you can query, browse in a web dashboard, or attribute line-by-line with `posthook blame`.
 
 Everything runs on your laptop by default. No account, no network calls, no telemetry. The data is yours, in a file you can open with any SQLite client.
 
@@ -49,7 +49,7 @@ export PATH="$HOME/.local/bin:$PATH"
 # 3. Install hooks + the git shadow (idempotent; safe to re-run):
 posthook init
 
-# 4. After using Claude Code / Cursor / Codex for a while:
+# 4. After using Claude Code / Cursor / Codex / Copilot for a while:
 posthook status                 # is everything wired up and capturing?
 posthook metrics                # AI vs. human, by agent/model/repo
 posthook blame path/to/file.ts  # per-line attribution
@@ -73,13 +73,14 @@ posthook dash                   # open the web dashboard (needs Node >=24)
 | **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call, full payload, session end, model. `Bash` heredoc writes are line-attributed too. |
 | **Cursor** | hooks in `~/.cursor/hooks.json` (`postToolUse`, `beforeSubmitPrompt`, `afterFileEdit`) | every tool call + prompt submission |
 | **Codex CLI** | inline hooks in `~/.codex/config.toml` (`PostToolUse`, `Stop`) + `features.hooks = true` | every tool call + session end |
+| **GitHub Copilot** (CLI + VS Code Copilot sessions) | own file `~/.copilot/hooks/posthook.json` (`PostToolUse`, `Stop`) | every tool call + end of every turn; model, tokens and prompts from the CLI's session transcript |
 | **Devin** (cloud agent) | Devin hooks (`PostToolUse`, `UserPromptSubmit`, `Stop`) calling `posthook ingest --agent devin`, installed via the [`plugins/devin`](plugins/devin) Devin plugin or `.devin/hooks.v1.json`; binary installed by the Devin blueprint. See the [docs](https://docs.bilanc.co/posthook/cloud-agents). | every tool call + prompt submission, with line ranges for `edit`/`write` |
 | **Git (shadow)** | `~/.local/bin/git` symlink → posthook binary, intercepts every git command on every repo | every successful `git commit` and `git clone`. After a successful `git push` it also pushes `refs/notes/posthook`; after `fetch`/`pull`/`clone` it merges teammates' notes in. All other git commands pass through with zero overhead. |
 | **Git (fallback)** | per-repo `post-commit` hook (auto-installed in new repos via `init.templateDir`, manual `posthook track` for existing repos) | commit capture as the shadow, plus the notes fetch refspec so plain `git fetch` still brings notes down. Pushing notes is manual here (`posthook notes push`). Coexists safely — commit ingest is idempotent via `UNIQUE(repo_id, sha)`. |
 
 Agent hooks fire on the critical path of every tool call, so they do the bare minimum: each `posthook ingest` captures the payload to an append-only spool (`~/.posthook/spool/`) and returns in milliseconds. A single background worker (`posthook worker`, auto-started by the hooks and self-terminating when idle) drains the spool into SQLite — so the heavy work (DB writes, git lookups, transcript parsing) happens once, off the hot path, and bursts of tool calls can never pile up. Check the queue with `posthook status`.
 
-For Claude Code, the `Stop` hook parses the session transcript at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` to backfill the model name and session timespan. For all three agents, when a `PostToolUse` event arrives for an `Edit`/`Write`/`MultiEdit`, posthook reads the post-edit file and records the exact line range the AI wrote.
+For Claude Code, the `Stop` hook parses the session transcript at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` to backfill the model name and session timespan. For GitHub Copilot it reads the Copilot CLI session stream at `~/.copilot/session-state/<session-id>/events.jsonl` (model as resolved by Auto mode, per-call token usage, typed prompts) or, for a VS Code Copilot session, the transcript under VS Code's `workspaceStorage/<hash>/GitHub.copilot-chat/transcripts/` (span and prompts only: VS Code records neither model nor usage). For every agent, when a `PostToolUse` event arrives for an `Edit`/`Write`/`MultiEdit` (or Copilot's and Codex's `apply_patch`), posthook reads the post-edit file and records the exact line range the AI wrote.
 
 ### How attribution works
 
@@ -115,7 +116,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 - `posthook service install|uninstall|status` — manage a background daemon (launchd on macOS, systemd `--user` on Linux) that runs `posthook sync --loop` so a connected machine keeps flushing across reboots. The team installer sets this up automatically.
 - `posthook update` — update posthook to the latest release by re-running the official installer (the same as installing from curl again): downloads the latest binary for your OS/arch (sha256 verified), refreshes the dashboard bundle, and re-runs `posthook init`. Your local database and cloud-sync config are left untouched. `--version X.Y.Z` pins a specific release.
 - `posthook track <repo-path>` — install the fallback per-repo `post-commit` hook for an existing repo.
-- `posthook uninstall` — remove posthook from this machine completely, so a later install starts from scratch: stops the sync daemon, dashboard and worker; strips posthook's entries from the Claude Code / Cursor / Codex configs (your own hooks stay); drains queued events and, if cloud sync is on, flushes once more; cleans every repo it knows about (post-commit hook, notes refspec, the local `refs/notes/posthook` and `refs/notes/posthook-remote` refs — notes already on the remote are never touched); removes the git shadow and `init.templateDir`; deletes `~/.posthook` and the binary. If that final flush fails, the database, `config.json` and queued events are kept and the binary stays so you can retry; `--keep-data` finishes regardless. `--dry-run` lists what it would remove without touching anything, `--keep-data` keeps the database and `config.json`, `--yes` skips the prompt.
+- `posthook uninstall` — remove posthook from this machine completely, so a later install starts from scratch: stops the sync daemon, dashboard and worker; strips posthook's entries from the Claude Code / Cursor / Codex / Copilot configs (your own hooks stay); drains queued events and, if cloud sync is on, flushes once more; cleans every repo it knows about (post-commit hook, notes refspec, the local `refs/notes/posthook` and `refs/notes/posthook-remote` refs — notes already on the remote are never touched); removes the git shadow and `init.templateDir`; deletes `~/.posthook` and the binary. If that final flush fails, the database, `config.json` and queued events are kept and the binary stays so you can retry; `--keep-data` finishes regardless. `--dry-run` lists what it would remove without touching anything, `--keep-data` keeps the database and `config.json`, `--yes` skips the prompt.
 - `posthook install-shadow` / `posthook uninstall-shadow` — manage the `git` symlink directly.
 - `posthook ingest …` — read an agent or git payload from stdin. Called by the hooks; you won't run it by hand. Agent events are spooled and drained asynchronously; git commits are recorded synchronously.
 - `posthook worker` — background daemon that drains the agent-event spool into the store. Auto-started by the hooks (singleton; idle-exits). You won't normally run it by hand.
@@ -140,6 +141,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 | `~/.local/bin/git` | The shadow symlink → `~/.local/bin/posthook`. |
 | `~/.posthook/git-template/hooks/post-commit` | Fallback hook copied into every new repo by `git init`. |
 | `~/.claude/settings.json` · `~/.cursor/hooks.json` · `~/.codex/config.toml` | Agent hook entries — **merged alongside your existing hooks**, never clobbered. |
+| `~/.copilot/hooks/posthook.json` | Posthook's own Copilot hook file (Copilot loads every `*.json` in that directory, so nothing of yours is edited). |
 | `~/.gitconfig` (`init.templateDir`) | Points git at the template dir above. |
 | Each tracked repo's `refs/notes/posthook` | Line-attribution metadata (no prompt text). Pushed after every `git push` and merged in after every `fetch`/`pull`/`clone`, so blame works after a clone. Remote notes land in `refs/notes/posthook-remote` first and are merged from there. |
 
@@ -199,7 +201,7 @@ Access is invite-based — **[talk to the team](https://bilanc.co)** to get set 
 - **SQLite via `modernc.org/sqlite`** — a pure-Go driver, no CGO, cross-compiles to every platform. The schema mirrors the eventual server-side shape, so the cloud migration path stays simple.
 - **Per-agent installer modules** (`internal/installers/`) all follow the same idempotent merge-and-deduplicate pattern: read the existing config, surgically add or update only posthook's entry, write atomically.
 - **Line-range extractor** (`internal/lineranges/`) — a pure function from post-edit file content + tool input to the line range(s) the AI wrote. Testable in isolation.
-- **Transcript parser** (`internal/transcript/`) reads Claude Code JSONL for model + session-span backfill and prompt lookup during `posthook blame`.
+- **Transcript parser** (`internal/transcript/`) reads Claude Code JSONL, Codex rollouts and Copilot event streams for model + session-span + token backfill and prompt lookup during `posthook blame`.
 - **Cloud sync** (`internal/sync/`, `internal/config/`) — a per-row `synced_at` cursor and a single batched POST per flush. Append-only and at-least-once; safe to retry.
 - **Schema migrations** run automatically on `store.Open()` via `ALTER TABLE` guards, backfill passes for repo IDs and session models, and `datetime()`-wrapped time comparisons for timezone-correct windowing.
 
@@ -214,7 +216,7 @@ internal/
   atomicfs/                      Atomic file write (temp + rename)
   gitx/                          findRepoRoot, relPathInRepo, Canonicalize, BypassEnv
   lineranges/                    Pure line-range extractor for Edit/Write/MultiEdit/apply_patch
-  transcript/                    Claude Code JSONL parser + prompt extraction
+  transcript/                    Claude Code / Codex / Copilot transcript parser + prompt extraction
   store/                         SQLite schema, migrations, backfill passes, attribution
   sync/                          Cloud flush: per-row synced_at cursor, batched POST, sync_state
   service/                       launchd / systemd unit manager for the background sync daemon
@@ -226,6 +228,7 @@ internal/
     claudecode.go                ~/.claude/settings.json
     cursor.go                    ~/.cursor/hooks.json
     codex.go                     ~/.codex/config.toml
+    copilot.go                   ~/.copilot/hooks/posthook.json
     githook.go                   per-repo post-commit hook + global template
   ingest/                        Event + commit capture core
   commands/                      Cobra command implementations
@@ -265,6 +268,6 @@ Issues and pull requests are welcome. The CLI has no runtime dependencies beyond
 
 Things to avoid while developing:
 
-- **Don't run a dev build of `posthook init`, `install-shadow` or the git shadow against your real setup.** They rewrite `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/config.toml`, `~/.gitconfig` and `~/.posthook/posthook.db`. Everything resolves under `$HOME`, and `install-shadow` drops its `git` symlink next to the posthook binary, so build into a scratch home and run from there: `export HOME=$(mktemp -d) && go build -o $HOME/bin/posthook ./cmd/posthook && $HOME/bin/posthook init`. Set `POSTHOOK_BIN` if you do want hooks to call a dev binary.
+- **Don't run a dev build of `posthook init`, `install-shadow` or the git shadow against your real setup.** They rewrite `~/.claude/settings.json`, `~/.cursor/hooks.json`, `~/.codex/config.toml`, `~/.copilot/hooks/posthook.json`, `~/.gitconfig` and `~/.posthook/posthook.db`. Everything resolves under `$HOME`, and `install-shadow` drops its `git` symlink next to the posthook binary, so build into a scratch home and run from there: `export HOME=$(mktemp -d) && go build -o $HOME/bin/posthook ./cmd/posthook && $HOME/bin/posthook init`. Set `POSTHOOK_BIN` if you do want hooks to call a dev binary.
 - **Don't push `refs/notes/posthook` from a test repo to a shared remote.** Use `POSTHOOK_NOTES_SYNC=0` or a throwaway remote when exercising the shadow's push/fetch path.
 - **Don't change `internal/store/schema.go` without a migration** in `internal/store/migrations.go` and a matching update to `dash/src/types/posthook.ts`, which mirrors the schema by hand.
