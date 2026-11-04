@@ -21,9 +21,11 @@ func newSyncCmd() *cobra.Command {
 	var (
 		loop        bool
 		status      bool
+		preview     bool
 		setEndpoint string
 		setToken    string
 		setEnabled  string // "true" / "false" / "" (unset = no change)
+		setSyncMode string // "full" / "metadata_only" / "" (unset = no change)
 	)
 	cmd := &cobra.Command{
 		Use:   "sync",
@@ -33,15 +35,24 @@ func newSyncCmd() *cobra.Command {
   posthook sync                 drain the spool, flush once and exit (default)
   posthook sync --loop          flush every flush_interval_seconds until killed
   posthook sync --status        show last-flush metadata + pending counts
+  posthook sync --preview       print the exact JSON the next flush would send
+                                (nothing is sent or marked synced; pipe to jq)
   posthook sync --set-endpoint URL --set-token TOK --set-enabled true
                                 write ~/.posthook/config.json
+  posthook sync --set-sync-mode metadata_only
+                                keep prompts, code and tool output on this
+                                machine; sync sessions, tokens, turns, paths
+                                and line counts only (default: full)
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if setEndpoint != "" || setToken != "" || setEnabled != "" {
-				return runSyncConfigure(setEndpoint, setToken, setEnabled)
+			if setEndpoint != "" || setToken != "" || setEnabled != "" || setSyncMode != "" {
+				return runSyncConfigure(setEndpoint, setToken, setEnabled, setSyncMode)
 			}
 			if status {
 				return runSyncStatus()
+			}
+			if preview {
+				return runSyncPreview()
 			}
 			if loop {
 				return runSyncLoop()
@@ -54,6 +65,8 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().StringVar(&setEndpoint, "set-endpoint", "", "Write cloud endpoint URL to ~/.posthook/config.json")
 	cmd.Flags().StringVar(&setToken, "set-token", "", "Write cloud install token to ~/.posthook/config.json")
 	cmd.Flags().StringVar(&setEnabled, "set-enabled", "", "Set cloud.enabled to true or false")
+	cmd.Flags().BoolVar(&preview, "preview", false, "Print the next flush's JSON body without sending it")
+	cmd.Flags().StringVar(&setSyncMode, "set-sync-mode", "", "Set cloud.sync_mode: full or metadata_only")
 	return cmd
 }
 
@@ -258,6 +271,7 @@ func runSyncStatus() error {
 	fmt.Printf("  endpoint:       %s\n", orDash(cfg.Cloud.Endpoint))
 	fmt.Printf("  token:          %s\n", maskToken(cfg.Cloud.Token))
 	fmt.Printf("  flush interval: %ds\n", cfg.Cloud.FlushIntervalSecs)
+	fmt.Printf("  sync mode:      %s\n", describeSyncMode(cfg.Cloud))
 	fmt.Println()
 
 	rows, err := pksync.ReadStatus(db)
@@ -277,10 +291,58 @@ func runSyncStatus() error {
 	return nil
 }
 
-func runSyncConfigure(endpoint, token, enabled string) error {
+// runSyncPreview prints the batch the next flush would send. The banner goes
+// to stderr so stdout is pure JSON and `posthook sync --preview | jq` works.
+// Config errors (e.g. an unknown sync_mode) surface here the same way they
+// would stop a real flush.
+func runSyncPreview() error {
+	db, err := store.Open()
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	payload, err := pksync.Preview(db, cfg.Cloud)
+	if err != nil {
+		return err
+	}
+	rows := 0
+	for _, r := range payload.Tables {
+		rows += len(r)
+	}
+	fmt.Fprintf(os.Stderr, "posthook sync --preview: %d pending row(s) across %d table(s); sync mode: %s\n",
+		rows, len(payload.Tables), describeSyncMode(cfg.Cloud))
+	fmt.Fprintf(os.Stderr, "This is the exact body the next flush would POST to %s. Nothing was sent or marked synced.\n",
+		orDash(cfg.Cloud.Endpoint))
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
+}
+
+// describeSyncMode renders the mode with the one-line meaning a reader of
+// `posthook status` needs, so nobody has to look the constant up.
+func describeSyncMode(c config.CloudConfig) string {
+	if c.MetadataOnly() {
+		return config.SyncModeMetadataOnly + " (prompts, code and tool output stay on this machine)"
+	}
+	return config.SyncModeFull + " (prompts and verbatim tool-call payloads are sent)"
+}
+
+func runSyncConfigure(endpoint, token, enabled, syncMode string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	// Validate before touching the file: a privacy setting must never be
+	// half-applied or silently coerced.
+	if syncMode != "" {
+		mode, err := config.NormalizeSyncMode(syncMode)
+		if err != nil {
+			return err
+		}
+		syncMode = mode
 	}
 	// Load() applies env overrides; strip them before save so we persist only
 	// what the user explicitly set on this command line plus any prior file
@@ -298,6 +360,9 @@ func runSyncConfigure(endpoint, token, enabled string) error {
 	case "false", "0":
 		disk.Cloud.Enabled = false
 	}
+	if syncMode != "" {
+		disk.Cloud.SyncMode = syncMode
+	}
 	if disk.Cloud.FlushIntervalSecs <= 0 {
 		disk.Cloud.FlushIntervalSecs = cfg.Cloud.FlushIntervalSecs
 	}
@@ -305,9 +370,10 @@ func runSyncConfigure(endpoint, token, enabled string) error {
 		return err
 	}
 	fmt.Printf("wrote %s\n", config.Path())
-	fmt.Printf("  enabled:  %v\n", disk.Cloud.Enabled)
-	fmt.Printf("  endpoint: %s\n", orDash(disk.Cloud.Endpoint))
-	fmt.Printf("  token:    %s\n", maskToken(disk.Cloud.Token))
+	fmt.Printf("  enabled:   %v\n", disk.Cloud.Enabled)
+	fmt.Printf("  endpoint:  %s\n", orDash(disk.Cloud.Endpoint))
+	fmt.Printf("  token:     %s\n", maskToken(disk.Cloud.Token))
+	fmt.Printf("  sync mode: %s\n", describeSyncMode(effectiveMode(disk.Cloud)))
 	return nil
 }
 
@@ -348,4 +414,13 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
+}
+
+// effectiveMode resolves an on-disk CloudConfig's raw sync_mode ("" means
+// full) so describeSyncMode can print what the next flush will actually do.
+func effectiveMode(c config.CloudConfig) config.CloudConfig {
+	if mode, err := config.NormalizeSyncMode(c.SyncMode); err == nil {
+		c.SyncMode = mode
+	}
+	return c
 }

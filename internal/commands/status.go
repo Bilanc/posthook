@@ -48,6 +48,7 @@ func runStatus() error {
 	fmt.Printf("  commits:      %d\n", totals.commits)
 	fmt.Printf("  repositories: %d\n", totals.repos)
 	printIdentityLine()
+	printCloudSyncLine()
 	fmt.Println()
 
 	printIngestQueue()
@@ -193,6 +194,22 @@ func printIdentityLine() {
 		fmt.Println("  ⚠ Cloud sync is on but no engineer identity is set — sessions may sync")
 		fmt.Println("    unattributed. Fix: posthook identity --setup")
 	}
+}
+
+// printCloudSyncLine says whether anything leaves this machine and, if so,
+// whether prompts and tool-call content go with it. This is the line an
+// engineer (or their security team) reads to check the privacy posture.
+func printCloudSyncLine() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Printf("  cloud sync:   ⚠ config error: %v\n", err)
+		return
+	}
+	if !cfg.Cloud.Enabled {
+		fmt.Printf("  cloud sync:   off (nothing leaves this machine)\n")
+		return
+	}
+	fmt.Printf("  cloud sync:   on → %s, %s\n", orDash(cfg.Cloud.Endpoint), describeSyncMode(cfg.Cloud))
 }
 
 // printIngestQueue surfaces the async ingest path: agent hooks drop events in

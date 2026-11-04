@@ -27,6 +27,9 @@
 # Env overrides:
 #   POSTHOOK_API_KEY        team ingest key — enables cloud sync + daemon
 #   POSTHOOK_CLOUD_ENDPOINT ingest base URL (default https://api.bilanc.co)
+#   POSTHOOK_CLOUD_SYNC_MODE  full (default) or metadata_only. The team link
+#                           bakes in the org's setting; metadata_only keeps
+#                           prompts, code and tool output on this machine.
 #   POSTHOOK_ENGINEER_EMAIL work email to attribute sessions to (skips the prompt)
 #   POSTHOOK_ENGINEER_NAME  display name to go with the email
 #   POSTHOOK_VERSION        pin a release, e.g. 0.1.0 (default: latest)
@@ -137,9 +140,22 @@ fi
 # ---------------------------------------------------------------------------
 if [ -n "${POSTHOOK_API_KEY:-}" ]; then
   endpoint="${POSTHOOK_CLOUD_ENDPOINT:-$DEFAULT_ENDPOINT}"
+  sync_mode="${POSTHOOK_CLOUD_SYNC_MODE:-}"
   info ""
-  info "Configuring cloud sync -> $endpoint"
-  "$BIN" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true
+  if [ -n "$sync_mode" ]; then
+    info "Configuring cloud sync -> $endpoint (sync mode: $sync_mode)"
+    # Deliberately fatal: if this binary predates --set-sync-mode we must not
+    # fall through to a full-content install on a machine whose org asked for
+    # metadata only. Pin POSTHOOK_VERSION to a release that has it.
+    "$BIN" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true --set-sync-mode "$sync_mode" || {
+      warn "This posthook release does not support --set-sync-mode $sync_mode. Cloud sync was NOT enabled."
+      warn "Install a newer release (unset POSTHOOK_VERSION) or ask your admin."
+      exit 1
+    }
+  else
+    info "Configuring cloud sync -> $endpoint"
+    "$BIN" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true
+  fi
 fi
 
 # ---------------------------------------------------------------------------
