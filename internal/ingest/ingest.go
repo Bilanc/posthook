@@ -101,6 +101,24 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		logx.Debugf("ingest --agent %s: dropping cursor-compat duplicate event", agentSlug)
 		return nil
 	}
+	// Same story for GitHub Copilot, which runs Claude-format hooks from a
+	// repository's .claude/settings.json: keep only the delivery from our own
+	// ~/.copilot/hooks/posthook.json registration.
+	if agentSlug != copilotAgentSlug && isCopilotPayload(payload) {
+		logx.Debugf("ingest --agent %s: dropping copilot-compat duplicate event", agentSlug)
+		return nil
+	}
+	// Copilot's payload is stored in its normalized form: metrics, the
+	// dashboard and the backfills read tool_name / tool_input straight from
+	// events.payload and only know the canonical shapes (Edit/Write/MultiEdit
+	// with new_string/content, apply_patch with lines_added). The original
+	// tool name is kept under copilot_tool_name.
+	if agentSlug == copilotAgentSlug {
+		payload = normalizeCopilotPayload(payload)
+		if normalized, err := json.Marshal(payload); err == nil {
+			raw = normalized
+		}
+	}
 
 	id := uuid.NewString()
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
@@ -266,12 +284,16 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		}
 	}
 
-	// Stop event: parse the transcript (Claude JSONL or Codex rollout — both
-	// hooks pass transcript_path) to backfill model + span + token totals.
+	// Stop event: parse the transcript (Claude JSONL, Codex rollout or Copilot
+	// event stream — the hooks pass transcript_path, and Copilot's is found by
+	// session id when they don't) to backfill model + span + token totals.
 	// Token totals are whole-transcript sums, so plain overwrite is idempotent
 	// across repeated Stops in one session.
 	if eventType == "Stop" && sessionID != "" {
 		transcriptPath := pickString(payload, "transcript_path", "transcriptPath")
+		if agentSlug == copilotAgentSlug {
+			transcriptPath = copilotTranscriptPath(transcriptPath, rawSessionID)
+		}
 		if transcriptPath != "" {
 			if summary := transcript.ParseFile(transcriptPath); summary != nil {
 				tokens := tokenArgs(summary.Tokens)
@@ -297,8 +319,8 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 						sessionID, summary.Model, summary.AssistantMessageCount)
 				}
 			}
-			// The transcript is also the only place Claude Code / Codex expose
-			// the engineer's typed prompts. Extraction is idempotent per
+			// The transcript is also the only place Claude Code / Codex /
+			// Copilot expose the engineer's typed prompts. Extraction is idempotent per
 			// (session, seq), so each Stop just appends the new tail.
 			if prompts := transcript.ExtractUserPrompts(transcriptPath); len(prompts) > 0 {
 				if n, err := db.UpsertSessionPrompts(sessionID, agentSlug, "transcript", prompts); err != nil {
@@ -998,12 +1020,25 @@ func pickString(payload map[string]any, keys ...string) string {
 	return ""
 }
 
+// normalizeEventType folds the camelCase event names Cursor and GitHub
+// Copilot use onto the PascalCase ones Claude Code (and Copilot's
+// Claude-compatible aliases) deliver, so the rest of ingest keys on one
+// spelling. Cursor-only events (afterFileEdit, beforeSubmitPrompt) pass
+// through unchanged.
 func normalizeEventType(et string) string {
 	switch et {
 	case "preToolUse":
 		return "PreToolUse"
 	case "postToolUse":
 		return "PostToolUse"
+	case "userPromptSubmitted", "userPromptSubmit":
+		return "UserPromptSubmit"
+	case "agentStop":
+		return "Stop"
+	case "sessionEnd":
+		return "SessionEnd"
+	case "sessionStart":
+		return "SessionStart"
 	}
 	return et
 }

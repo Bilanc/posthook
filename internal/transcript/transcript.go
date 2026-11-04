@@ -12,6 +12,20 @@
 //
 //	{type: "event_msg", payload: {type: "token_count", info: {total_token_usage}}, timestamp}
 //
+// GitHub Copilot event streams — Copilot CLI's
+// ~/.copilot/session-state/<id>/events.jsonl and VS Code's
+// workspaceStorage/<hash>/GitHub.copilot-chat/transcripts/<id>.jsonl share
+// one producer ("copilot-agent"):
+//
+//	{type: "user.message",              data: {content}, timestamp}
+//	{type: "assistant.message",         data: {content, modelId?}, timestamp}
+//	{type: "session.auto_mode_resolved", data: {chosenModel}, timestamp}
+//	{type: "session.model_change",      data: {newModel}, timestamp}
+//	{type: "session.usage_record",      data: {usage: {model, inputTokens, …}}, timestamp}
+//
+// Only the CLI writes the model and usage events; VS Code's stream carries
+// neither, so those sessions keep a NULL model and NULL tokens.
+//
 // Tokens are nullable by design: Cursor exposes no usage anywhere, so a
 // session without a Tokens summary means "agent doesn't report usage", not
 // zero. (Session token columns were dropped in schema v3 because cross-agent
@@ -37,11 +51,11 @@ type TokenUsage struct {
 }
 
 type Summary struct {
-	Model                  string
-	AssistantMessageCount  int
-	FirstTS                string
-	LastTS                 string
-	Tokens                 *TokenUsage // nil when the transcript carries no usage data
+	Model                 string
+	AssistantMessageCount int
+	FirstTS               string
+	LastTS                string
+	Tokens                *TokenUsage // nil when the transcript carries no usage data
 }
 
 type record struct {
@@ -49,6 +63,7 @@ type record struct {
 	Timestamp   string           `json:"timestamp"`
 	Message     *messageEnvelope `json:"message"`
 	Payload     *codexPayload    `json:"payload"`
+	Data        json.RawMessage  `json:"data"` // Copilot event streams
 	IsMeta      bool             `json:"isMeta"`
 	IsSidechain bool             `json:"isSidechain"`
 }
@@ -84,8 +99,125 @@ type codexUsage struct {
 	OutputTokens      int64 `json:"output_tokens"`
 }
 
-// ParseFile reads a Claude transcript JSONL and returns model + timestamp
-// summary. Returns nil on missing file / read failure.
+// copilotData is the union of the Copilot event fields we read; every event
+// type carries a different subset.
+type copilotData struct {
+	Content     json.RawMessage `json:"content"`     // user.message (string, or blocks)
+	ModelID     string          `json:"modelId"`     // assistant.message (VS Code never sets it)
+	Model       string          `json:"model"`       // tool.execution_start
+	ChosenModel string          `json:"chosenModel"` // session.auto_mode_resolved
+	NewModel    string          `json:"newModel"`    // session.model_change ("auto" until resolved)
+	Usage       *copilotUsage   `json:"usage"`       // session.usage_record, one per model call
+}
+
+type copilotUsage struct {
+	Model            string `json:"model"`
+	InputTokens      int64  `json:"inputTokens"`
+	OutputTokens     int64  `json:"outputTokens"`
+	CacheReadTokens  int64  `json:"cacheReadTokens"`
+	CacheWriteTokens int64  `json:"cacheWriteTokens"`
+}
+
+// isCopilotEvent recognises the dotted event types of a Copilot stream
+// (Claude's are bare "assistant"/"user", Codex's "event_msg"/"response_item").
+func isCopilotEvent(t string) bool {
+	for _, prefix := range []string{"session.", "user.", "assistant.", "tool.", "model.", "system."} {
+		if strings.HasPrefix(t, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// copilotState accumulates model and usage across one Copilot stream.
+type copilotState struct {
+	seen              bool
+	assistantMessages int
+	lastModel         string         // most recent explicit resolution (auto-mode pick or user switch)
+	modelCounts       map[string]int // models stamped on usage records / tool calls, as a fallback
+	usage             *TokenUsage
+}
+
+func (c *copilotState) observe(rec record) {
+	c.seen = true
+	var d copilotData
+	if len(rec.Data) > 0 {
+		_ = json.Unmarshal(rec.Data, &d)
+	}
+	switch rec.Type {
+	case "assistant.message":
+		c.assistantMessages++
+		if d.ModelID != "" {
+			c.count(d.ModelID)
+		}
+	case "session.auto_mode_resolved":
+		if d.ChosenModel != "" {
+			c.lastModel = d.ChosenModel
+		}
+	case "session.model_change":
+		if d.NewModel != "" && d.NewModel != "auto" {
+			c.lastModel = d.NewModel
+		}
+	case "tool.execution_start":
+		if d.Model != "" {
+			c.count(d.Model)
+		}
+	case "session.usage_record":
+		u := d.Usage
+		if u == nil {
+			return
+		}
+		if c.usage == nil {
+			c.usage = &TokenUsage{}
+		}
+		// inputTokens is the full prompt including cached tokens; subtract the
+		// cache traffic so Input means uncached input, as for the other agents.
+		uncached := u.InputTokens - u.CacheReadTokens - u.CacheWriteTokens
+		if uncached < 0 {
+			uncached = 0
+		}
+		c.usage.Input += uncached
+		c.usage.Output += u.OutputTokens
+		c.usage.CacheRead += u.CacheReadTokens
+		c.usage.CacheCreation += u.CacheWriteTokens
+		if u.Model != "" {
+			c.count(u.Model)
+		}
+	}
+}
+
+func (c *copilotState) count(model string) {
+	if c.modelCounts == nil {
+		c.modelCounts = map[string]int{}
+	}
+	c.modelCounts[model]++
+}
+
+func (c *copilotState) model() string {
+	if c.lastModel != "" {
+		return c.lastModel
+	}
+	top, topN := "", 0
+	for m, n := range c.modelCounts {
+		if n > topN {
+			top, topN = m, n
+		}
+	}
+	return top
+}
+
+// copilotPromptText returns the typed prompt from a user.message event.
+func copilotPromptText(rec record) string {
+	var d copilotData
+	if len(rec.Data) == 0 || json.Unmarshal(rec.Data, &d) != nil {
+		return ""
+	}
+	return cleanPromptText(stringifyContent(d.Content))
+}
+
+// ParseFile reads a session transcript (Claude JSONL, Codex rollout or Copilot
+// event stream) and returns model + timestamp summary. Returns nil on missing
+// file / read failure.
 func ParseFile(path string) *Summary {
 	if _, err := os.Stat(path); err != nil {
 		return nil
@@ -108,6 +240,7 @@ func parseString(raw string) *Summary {
 	claudeByMsgID := map[string]claudeUsage{}
 	var claudeNoID []claudeUsage
 	var codexTotal *codexUsage
+	var copilot copilotState
 
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -129,6 +262,10 @@ func parseString(raw string) *Summary {
 			rec.Payload.Type == "token_count" &&
 			rec.Payload.Info != nil && rec.Payload.Info.TotalTokenUsage != nil {
 			codexTotal = rec.Payload.Info.TotalTokenUsage
+			continue
+		}
+		if isCopilotEvent(rec.Type) {
+			copilot.observe(rec)
 			continue
 		}
 		if rec.Type != "assistant" || rec.Message == nil {
@@ -157,6 +294,15 @@ func parseString(raw string) *Summary {
 	}
 	out.Model = top
 	out.Tokens = sumTokens(claudeByMsgID, claudeNoID, codexTotal)
+	if copilot.seen {
+		out.AssistantMessageCount += copilot.assistantMessages
+		if out.Model == "" {
+			out.Model = copilot.model()
+		}
+		if out.Tokens == nil {
+			out.Tokens = copilot.usage
+		}
+	}
 	return out
 }
 
@@ -199,7 +345,9 @@ type UserPrompt struct {
 // lines and slash-command noise. Codex rollouts: event_msg/user_message lines,
 // which hold the typed prompt verbatim (the response_item user messages also
 // present in rollouts duplicate these plus environment-context noise, so they
-// are ignored). Returns nil on missing/unreadable file.
+// are ignored). Copilot streams: user.message events, whose content is the
+// prompt as typed (transformedContent, which adds a datetime header, is
+// ignored). Returns nil on missing/unreadable file.
 func ExtractUserPrompts(path string) []UserPrompt {
 	if _, err := os.Stat(path); err != nil {
 		return nil
@@ -222,6 +370,14 @@ func ExtractUserPrompts(path string) []UserPrompt {
 		// Codex rollout shape.
 		if rec.Type == "event_msg" && rec.Payload != nil && rec.Payload.Type == "user_message" {
 			if text := cleanPromptText(rec.Payload.Message); text != "" {
+				out = append(out, UserPrompt{TS: rec.Timestamp, Text: text})
+			}
+			continue
+		}
+
+		// Copilot event-stream shape.
+		if rec.Type == "user.message" {
+			if text := copilotPromptText(rec); text != "" {
 				out = append(out, UserPrompt{TS: rec.Timestamp, Text: text})
 			}
 			continue
@@ -289,13 +445,18 @@ func FindPromptBefore(transcriptPath, beforeTS string) string {
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			continue
 		}
-		if rec.Type != "user" || rec.Message == nil || rec.Message.Role != "user" {
+		var text string
+		switch {
+		case rec.Type == "user.message": // Copilot
+			text = copilotPromptText(rec)
+		case rec.Type == "user" && rec.Message != nil && rec.Message.Role == "user": // Claude Code
+			text = stringifyContent(rec.Message.Content)
+		default:
 			continue
 		}
 		if rec.Timestamp == "" || rec.Timestamp >= beforeTS {
 			continue
 		}
-		text := stringifyContent(rec.Message.Content)
 		if text == "" {
 			continue
 		}

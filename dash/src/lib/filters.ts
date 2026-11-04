@@ -1,4 +1,10 @@
-import { subMonths, formatISO, parseISO, startOfDay, endOfDay } from "date-fns";
+import { subMonths, subDays, differenceInCalendarDays, formatISO, parseISO, startOfDay, endOfDay } from "date-fns";
+
+// Session outcome, derived from what the session left behind: a commit with
+// attributed AI lines (shipped), an AI edit with nothing committed yet
+// (edited), or no edit at all (explored).
+export type Outcome = "shipped" | "edited" | "explored";
+export const OUTCOMES: Outcome[] = ["shipped", "edited", "explored"];
 
 export interface Filters {
   from: string | null;   // YYYY-MM-DD interpreted as the local start of day, or null
@@ -7,7 +13,8 @@ export interface Filters {
   models: string[];
   repos: string[];
   engineers: string[];
-  q: string | null;      // free-text search over session id / branch / engineer / repo
+  q: string | null;      // free-text search over session id / branch / engineer / repo / prompts
+  outcome: Outcome | null;
 }
 
 export type SearchParams = Record<string, string | string[] | undefined>;
@@ -33,7 +40,13 @@ export function parseFilters(searchParams: SearchParams): Filters {
     repos: pickMulti(searchParams.repos),
     engineers: pickMulti(searchParams.engineers),
     q: pickOne(searchParams.q),
+    outcome: pickOutcome(searchParams.outcome),
   };
+}
+
+function pickOutcome(v: string | string[] | undefined): Outcome | null {
+  const one = pickOne(v);
+  return one && (OUTCOMES as string[]).includes(one) ? (one as Outcome) : null;
 }
 
 export function defaultFilters(): Filters {
@@ -42,7 +55,7 @@ export function defaultFilters(): Filters {
   const now = new Date();
   const to = formatISO(now, { representation: "date" });
   const from = formatISO(subMonths(now, 1), { representation: "date" });
-  return { from, to, agents: [], models: [], repos: [], engineers: [], q: null };
+  return { from, to, agents: [], models: [], repos: [], engineers: [], q: null, outcome: null };
 }
 
 // Resolve user-set filters against defaults: only "from"/"to" gain a default,
@@ -57,7 +70,30 @@ export function resolveFilters(parsed: Filters): Filters {
     repos: parsed.repos,
     engineers: parsed.engineers,
     q: parsed.q,
+    outcome: parsed.outcome,
   };
+}
+
+// The window of the same length immediately before this one, for deltas.
+// Null when the filters carry no complete date range.
+export function priorWindow(f: Filters): Filters | null {
+  if (!f.from || !f.to) return null;
+  const from = parseISO(f.from);
+  const to = parseISO(f.to);
+  const days = differenceInCalendarDays(to, from) + 1;
+  if (days <= 0) return null;
+  return {
+    ...f,
+    from: formatISO(subDays(from, days), { representation: "date" }),
+    to: formatISO(subDays(to, days), { representation: "date" }),
+  };
+}
+
+// Number of calendar days the window covers (inclusive), or null.
+export function windowDays(f: Filters): number | null {
+  if (!f.from || !f.to) return null;
+  const d = differenceInCalendarDays(parseISO(f.to), parseISO(f.from)) + 1;
+  return d > 0 ? d : null;
 }
 
 // Build the SQL WHERE fragment + params for an `events e` / `sessions s` join.
@@ -103,6 +139,32 @@ export function filterSql(f: Filters): SqlChunk {
   return { sql, params };
 }
 
+// Session-level scope: the agent / model / repo / engineer filters applied to a
+// sessions table alias, plus the date range applied to `dateCol` when given.
+// Carries no free-text search and no outcome; callers add those. Used by every
+// query that aggregates sessions rather than edit events.
+export function sessionScopeSql(
+  f: Filters,
+  alias = "s",
+  dateCol: string | null = `${alias}.started_at`,
+): SqlChunk {
+  const params: unknown[] = [];
+  let sql = "";
+  if (dateCol && f.from) {
+    sql += ` AND datetime(${dateCol}) >= datetime(?)`;
+    params.push(localDayStartIso(f.from));
+  }
+  if (dateCol && f.to) {
+    sql += ` AND datetime(${dateCol}) <= datetime(?)`;
+    params.push(localDayEndIso(f.to));
+  }
+  sql += inClause(`${alias}.agent_slug`, f.agents, params);
+  sql += inClause(`COALESCE(${alias}.model_slug, 'unknown')`, f.models, params);
+  sql += inClause(`${alias}.repo_id`, f.repos, params);
+  sql += inClause(`${alias}.engineer_email`, f.engineers, params);
+  return { sql, params };
+}
+
 // Variant for queries that have `sessions s` but no events alias yet — used for the
 // sessions list page where date/agent/etc filter the sessions table directly.
 export function filterSqlForSessions(f: Filters): SqlChunk {
@@ -131,8 +193,13 @@ export function filterSqlForSessions(f: Filters): SqlChunk {
       "s.model_slug",
       "(SELECT r.name FROM repositories r WHERE r.id = s.repo_id)",
     ];
-    sql += ` AND (${cols.map((c) => `${c} LIKE ? ESCAPE '\\'`).join(" OR ")})`;
-    params.push(...cols.map(() => like));
+    const clauses = [
+      ...cols.map((c) => `${c} LIKE ? ESCAPE '\\'`),
+      // Prompt text: any prompt in the session, same escaped pattern.
+      `EXISTS (SELECT 1 FROM session_prompts p WHERE p.session_id = s.id AND p.prompt_text LIKE ? ESCAPE '\\')`,
+    ];
+    sql += ` AND (${clauses.join(" OR ")})`;
+    params.push(...clauses.map(() => like));
   }
   return { sql, params };
 }
@@ -151,5 +218,6 @@ export function filtersToQueryString(f: Partial<Filters>): string {
     if (values && values.length > 0) parts.push(`${key}=${encodeURIComponent(values.join(","))}`);
   }
   if (f.q) parts.push(`q=${encodeURIComponent(f.q)}`);
+  if (f.outcome) parts.push(`outcome=${f.outcome}`);
   return parts.length ? `?${parts.join("&")}` : "";
 }

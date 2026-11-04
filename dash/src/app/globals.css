@@ -3,12 +3,22 @@
 @theme {
   --color-bg: #0a0a0b;
   --color-bg-elevated: #121214;
+  --color-bg-2: #19191c;
   --color-border: #1f1f23;
+  --color-border-2: #2c2c33;
   --color-fg: #e8e8ea;
+  --color-fg-2: #b4b4ba;
   --color-fg-muted: #8e8e93;
+  --color-fg-faint: #5f5f66;
   --color-accent: #6366f1;
+  --color-accent-soft: rgba(99, 102, 241, 0.16);
   --color-ai: #6366f1;
   --color-human: #14b8a6;
+  --color-good: #7fd37f;
+  --color-bad: #f08c8c;
+  --color-warn: #f0a07e;
+  --color-grid: #1c1c21;
+  --color-axis: #2c2c33;
   --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
 }
@@ -34,4 +44,42 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   width: 100%;
   height: 100%;
   cursor: pointer;
+}
+
+/* Native disclosure used for folded tool groups on the session page. */
+details.tools > summary {
+  list-style: none;
+  cursor: pointer;
+}
+details.tools > summary::-webkit-details-marker {
+  display: none;
+}
+details.tools > summary .caret {
+  display: inline-block;
+  transition: transform 0.12s;
+}
+details.tools[open] > summary .caret {
+  transform: rotate(90deg);
+}
+
+/* Chart marks that carry a hover tooltip (see components/ui/chart-tooltip). */
+[data-tip] {
+  cursor: default;
+}
+svg [data-tip]:hover,
+.segbar [data-tip]:hover {
+  filter: brightness(1.3);
+}
+/* A per-day hit group in a column chart lights its band on hover. */
+svg g.hit > .band {
+  opacity: 0;
+}
+svg g.hit:hover > .band {
+  opacity: 0.08;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
 }

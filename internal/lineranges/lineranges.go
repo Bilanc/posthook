@@ -125,7 +125,56 @@ func rangeForMatch(postContent string, matchIndex int, newString string) LineRan
 }
 
 // Extract returns the line ranges that the named tool wrote into postContent.
+//
+// Matching is byte-exact first: that is what every edit to a consistently
+// LF file needs, and in a file with mixed line endings it is the only thing
+// that tells otherwise identical occurrences apart. Only when something is
+// left unlocated is the search retried with CRLF folded to LF on both sides,
+// because agents hand us LF text (hook payloads, apply_patch blocks, shell
+// heredocs) even when the file on disk uses CRLF, and the odd payload carries
+// CRLF into an LF file. Dropping the CR bytes leaves every '\n' in place, so
+// line numbers computed on the folded content are the file's real line
+// numbers and the new-text line counts are unchanged; the retry is kept only
+// if it locates more edits than the exact pass.
 func Extract(toolName string, in ToolInput, postContent string) Extracted {
+	out := extract(toolName, in, postContent)
+	if out.Unlocated == 0 || !mentionsCRLF(in, postContent) {
+		return out
+	}
+	retry := extract(toolName, normalizeInput(in), normalizeNewlines(postContent))
+	if retry.Unlocated < out.Unlocated {
+		return retry
+	}
+	return out
+}
+
+func mentionsCRLF(in ToolInput, postContent string) bool {
+	if strings.Contains(postContent, "\r\n") || strings.Contains(in.NewString, "\r\n") || strings.Contains(in.Content, "\r\n") {
+		return true
+	}
+	for _, e := range in.Edits {
+		if strings.Contains(e.NewString, "\r\n") {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeInput(in ToolInput) ToolInput {
+	out := in
+	out.NewString = normalizeNewlines(in.NewString)
+	out.Content = normalizeNewlines(in.Content)
+	if len(in.Edits) > 0 {
+		out.Edits = make([]Edit, len(in.Edits))
+		for i, e := range in.Edits {
+			out.Edits[i] = Edit{OldString: e.OldString, NewString: normalizeNewlines(e.NewString)}
+		}
+	}
+	return out
+}
+
+// extract is one byte-exact pass over postContent.
+func extract(toolName string, in ToolInput, postContent string) Extracted {
 	switch toolName {
 	case "Write":
 		content := in.Content
@@ -180,6 +229,15 @@ func Extract(toolName string, in ToolInput, postContent string) Extracted {
 		return Extracted{Ranges: ranges, Unlocated: unlocated}
 	}
 	return Extracted{}
+}
+
+// normalizeNewlines folds CRLF to LF for the fallback pass. Lone CRs are
+// left alone: they are not line endings in any format we see.
+func normalizeNewlines(s string) string {
+	if !strings.Contains(s, "\r\n") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\r\n", "\n")
 }
 
 // ParseApplyPatch parses Codex CLI's apply_patch command text into a slice of

@@ -1,6 +1,6 @@
-import { db } from "../db";
-import { filterSql, type Filters } from "../filters";
-import { aiEditsCte } from "./overview";
+import { db } from "../db.ts";
+import { filterSql, type Filters } from "../filters.ts";
+import { aiEditsCte } from "./overview.ts";
 import type { BreakdownRow } from "@/types/posthook";
 
 function runBreakdown(
