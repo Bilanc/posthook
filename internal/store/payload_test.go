@@ -65,6 +65,19 @@ func TestTrimPayloadEditResponseKeepsOnlyFlags(t *testing.T) {
 	}
 }
 
+func TestTrimPayloadCopilotResultKeepsResultType(t *testing.T) {
+	raw := []byte(`{"hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"a.go"},` +
+		`"tool_result":{"result_type":"success","text_result_for_llm":` + mustJSON(strings.Repeat("package main\n", 3000)) + `}}`)
+	out, dropped := TrimPayload(raw)
+	if dropped == 0 {
+		t.Fatal("expected text_result_for_llm to be dropped")
+	}
+	res := decode(t, out)["tool_result"].(map[string]any)
+	if len(res) != 1 || res["result_type"] != "success" {
+		t.Errorf("want only result_type kept, got %v", res)
+	}
+}
+
 func TestTrimPayloadNonObjectToolOutputBecomesNull(t *testing.T) {
 	cases := map[string]string{
 		"codex string":    `"` + strings.Repeat("o", 100) + `"`,

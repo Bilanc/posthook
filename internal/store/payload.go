@@ -22,8 +22,9 @@ const (
 	// MaxStoredStringBytes caps any single string kept in a stored payload:
 	// a Write's content, a prompt, the text of a non-JSON payload.
 	MaxStoredStringBytes = 256 * 1024
-	// MaxStoredStderrBytes caps the stderr excerpt kept from a tool response
-	// so the dashboard can still flag a tool call that failed.
+	// MaxStoredStderrBytes caps each status string kept from a tool response
+	// (stderr, Copilot's result_type) so the dashboard can still flag a tool
+	// call that failed.
 	MaxStoredStderrBytes = 2 * 1024
 	// TrimMarkerKey is set at the top level of every payload TrimPayload
 	// changed, holding {"dropped_bytes": N} (cumulative across re-runs).
@@ -31,15 +32,21 @@ const (
 )
 
 // toolOutputKeys name what a tool returned: tool_response for Claude Code,
-// Codex and Devin; tool_output for Cursor.
-var toolOutputKeys = []string{"tool_response", "tool_output"}
+// Codex and Devin; tool_output for Cursor; tool_result for GitHub Copilot.
+var toolOutputKeys = []string{"tool_response", "tool_output", "tool_result"}
+
+// keptOutputStrings are the string members of a tool output worth keeping,
+// capped at MaxStoredStderrBytes: they say whether the call failed, not what
+// it returned.
+var keptOutputStrings = map[string]bool{"stderr": true, "result_type": true}
 
 // TrimPayload returns the form of a hook payload posthook stores and how many
 // bytes this call dropped. Rules:
 //
-//   - tool_response / tool_output: an object keeps only its boolean, number
-//     and null members plus the first MaxStoredStderrBytes of a string
-//     "stderr"; a string, array or anything else becomes null.
+//   - tool_response / tool_output / tool_result: an object keeps only its
+//     boolean, number and null members plus the first MaxStoredStderrBytes of
+//     the strings "stderr" and "result_type"; a string, array or anything
+//     else becomes null.
 //   - every other value: strings longer than MaxStoredStringBytes are cut and
 //     suffixed with "[...posthook truncated N bytes]", wherever they nest.
 //   - non-object payloads are cut to MaxStoredStringBytes.
@@ -97,9 +104,9 @@ func TrimPayload(raw []byte) ([]byte, int) {
 	return out, dropped
 }
 
-// trimToolOutput reduces one tool_response/tool_output value. Objects keep
-// their scalar flags (interrupted, userModified, replaceAll, exit codes…) and
-// a bounded stderr; anything else is replaced by null.
+// trimToolOutput reduces one tool_response/tool_output/tool_result value.
+// Objects keep their scalar flags (interrupted, userModified, replaceAll, exit
+// codes…) and a bounded stderr / result_type; anything else is replaced by null.
 func trimToolOutput(v json.RawMessage) (json.RawMessage, int) {
 	body := bytes.TrimSpace(v)
 	if len(body) == 0 || bytes.Equal(body, []byte("null")) {
@@ -121,7 +128,7 @@ func trimToolOutput(v json.RawMessage) (json.RawMessage, int) {
 			changed = true
 		case isScalarFlag(t):
 			kept[k] = val
-		case k == "stderr" && t[0] == '"':
+		case keptOutputStrings[k] && t[0] == '"':
 			var s string
 			if json.Unmarshal(t, &s) != nil {
 				changed = true
