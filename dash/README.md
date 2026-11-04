@@ -24,17 +24,46 @@ two ship together. Until then run `posthook-dash` directly.
 
 ## What you get
 
-- **Overview (`/`)** — 6 KPI cards (AI code %, AI lines generated, AI lines
-  committed, top model, working hours, max parallel agents), a Sankey funnel
-  from AI-generated → committed, and breakdown bars by agent / model / repo / engineer.
-- **Sessions list (`/sessions`)** — every AI session with duration, lines
-  generated, edits, files touched, and commits in window. Filterable and paginated.
-- **Session detail (`/sessions/<id>`)** — header KPIs, the user prompts pulled
-  from the Claude transcript JSONL, commits that fell in the session's window,
-  and the files that were touched.
+- **Overview (`/`)** — what your agents shipped this period and how the work
+  was spread out: AI lines committed (hero), five KPI tiles with deltas against
+  the previous window and sparklines, active time per day by agent, a
+  weekday × hour rhythm heatmap, an outcome funnel (sessions started → edited →
+  shipped; lines generated → committed) and where agent time goes (model vs
+  shell vs MCP vs subagents, plus the slowest calls).
+- **Agents (`/agents`)** — one table per agent + model with the efficiency
+  ratios side by side (keep rate, lines per 1K output tokens, tool calls per
+  edit, re-edit rate, shipped sessions) next to the counts they come from, a
+  generated → committed dumbbell and the tool mix per agent.
+- **Sessions (`/sessions`)** — every session with a title (its first
+  prompt), an activity strip, an outcome chip (Shipped / Edited / Explored),
+  prompts, active time and lines generated → committed. Grouped by day;
+  search covers prompt text, branch and repo; filterable by outcome.
+- **Session (`/sessions/<id>`)** — the session as it happened: a timeline
+  with idle gaps compressed, a numbered turn rail, the conversation with tool
+  calls folded under each prompt, commits inline where they happened, a files
+  panel (generated vs committed per file) and output tokens per turn.
 
-Filters (date range, agent, model, repo, engineer) live in URL search params and
-work consistently across pages.
+Filters (date range, agent, model, repo, outcome) live in URL search params and
+apply to every chart on a page.
+
+### How the numbers are defined
+
+- **Active time** is the sum of gaps between consecutive events in a session,
+  each gap capped at `POSTHOOK_DASH_IDLE_MINUTES` (default 5). Wall-clock
+  session span counts idle hours and double-counts parallel sessions, so it is
+  shown only on the session page, next to active time.
+- **A turn** is everything between two Stop events: the prompt, the tool calls
+  it caused, the edits, the agent's closing message. Prompts are bucketed into
+  turns by timestamp.
+- **Outcome**: *Shipped* = at least one commit has AI lines attributed to the
+  session; *Edited* = the session edited a file but nothing is committed yet;
+  *Explored* = no file edits.
+- **Keep rate** = AI lines committed ÷ AI lines generated. Lines written through
+  shell commands (heredocs) are counted from the line ranges posthook located
+  in the file, so a file can show more committed than generated lines.
+- Tool durations come from Claude Code (`duration_ms`) and Cursor; Codex
+  reports none, so its time in tools is shown as unknown rather than zero.
+  Token usage comes from Claude Code and Codex transcripts; Cursor reports none.
 
 ## Environment
 
@@ -43,6 +72,7 @@ work consistently across pages.
 | `POSTHOOK_DB`             | `~/.posthook/posthook.db`     | Path to the SQLite file posthook writes. |
 | `POSTHOOK_DASH_PORT`      | `3847`                        | Port to bind on.                         |
 | `POSTHOOK_DASH_HOSTNAME`  | `127.0.0.1`                   | Hostname to bind on.                     |
+| `POSTHOOK_DASH_IDLE_MINUTES` | `5`                        | Gap cap for active time (see above).     |
 
 ## Develop
 
@@ -64,13 +94,14 @@ npm run build    # produces .next/standalone, which bin/posthook-dash.mjs runs
 - Next.js 15 App Router + React 19 + TypeScript strict.
 - Tailwind v4 for styling.
 - `node:sqlite` (`DatabaseSync`, Node >=24) for SQLite access via `src/lib/db.ts`; server components query it directly.
-- Recharts for KPI bars and breakdowns; ECharts (Sankey only) for the funnel.
+- Charts are inline SVG rendered on the server; no charting library.
 - No API routes, no client-side data fetching.
 
 ## Roadmap
 
-- `/commits/<sha>` page with diff + AI line highlights (uses `event_line_ranges`
-  from posthook's schema).
-- Cloud Postgres adapter for SaaS deployment — same UI, swappable data layer.
-- Time-series chart of AI activity over the filtered window.
-- Drill-down from commit → session → prompt → exact lines.
+- `/commits/<sha>` page with the diff and AI lines highlighted (uses
+  `event_line_ranges`), linked from the session page's commit cards and files
+  panel.
+- Link resumed sessions to their parent once the SessionStart hook reports
+  `source = resume`.
+- Approximate Codex tool durations from PreToolUse → PostToolUse pairs.
