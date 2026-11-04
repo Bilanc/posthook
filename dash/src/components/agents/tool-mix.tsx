@@ -41,7 +41,7 @@ export function ToolMix({ mix }: Props) {
             <span className="text-[11px] text-[var(--color-fg-muted)]">{fmtNum(a.total)} calls</span>
           </div>
           <div
-            className="flex h-[22px] gap-[2px] overflow-hidden rounded"
+            className="segbar flex h-[22px] gap-[2px] overflow-hidden rounded"
             role="img"
             aria-label={`${a.agent}: ${present
               .filter((f) => (a.byFamily[f] ?? 0) > 0)
@@ -55,7 +55,7 @@ export function ToolMix({ mix }: Props) {
               return (
                 <div
                   key={f}
-                  title={`${a.agent} · ${FAMILY_LABEL[f]}: ${fmtNum(calls)} calls (${fmtPct(share)})`}
+                  data-tip={`${a.agent} · ${FAMILY_LABEL[f]}\n${fmtNum(calls)} calls · ${fmtPct(share)}`}
                   className="flex min-w-0 items-center overflow-hidden whitespace-nowrap rounded px-2 text-[11px] font-medium text-white"
                   style={{ flex: `${calls} 0 0`, background: FAMILY_COLOR[f] }}
                 >

@@ -7,7 +7,8 @@ import { layoutTimeline, ms } from "./model";
 
 // One SVG: prompts, tool calls, Stops and commits on a shared x axis where any
 // idle stretch over GAP_MS collapses to a fixed break. Turn bands link to the
-// conversation below. Hover values are <title> elements, so no client JS.
+// conversation below. Hover values are data-tip attributes read by the shared
+// hover layer (ui/chart-tooltip); the markup stays server-rendered.
 
 const GAP_MS = 8 * 60_000;
 const GAP_W = 34;
@@ -18,6 +19,10 @@ const BAND_H = 26;
 const AXIS_Y = BAND_Y + BAND_H + 12;
 const COMPACTION = "#c98500";
 const PROMPT_MARK = "var(--color-fg-2)";
+// Ticks are 2 units wide; an invisible rect this wide around each one makes
+// them hoverable. Where ticks crowd closer than this, the later one wins the
+// overlap and each keeps its own spacing, no worse than the bare tick.
+const HIT_W = 6;
 
 export function SessionTimeline({
   startedAt,
@@ -77,10 +82,8 @@ export function SessionTimeline({
             const ly = AXIS_Y + 18 + (i % 2) * 13;
             const label = fmtMinutes(g.ms / 60_000);
             return (
-              <g key={`gap-${i}`}>
-                <rect x={g.x} y={BAND_Y} width={g.w} height={BAND_H} fill="var(--color-bg-2)">
-                  <title>{`idle ${label}`}</title>
-                </rect>
+              <g key={`gap-${i}`} data-tip={`idle ${label}`}>
+                <rect x={g.x} y={BAND_Y} width={g.w} height={BAND_H} fill="var(--color-bg-2)" />
                 <text x={cx} y={BAND_Y + BAND_H / 2 + 4} textAnchor="middle" fontSize={11} fill="var(--color-fg-faint)">
                   ⋯
                 </text>
@@ -97,11 +100,11 @@ export function SessionTimeline({
             const x1 = Math.max(X(t.end), x0 + 4);
             const end = t.open && running ? "…" : fmtTime(t.end);
             const tokens = t.output_tokens == null ? "" : ` · ${fmtCompact(t.output_tokens)} output tokens`;
+            const tip = `Turn ${t.n} · ${fmtTime(t.start)}–${end}\n${plural(t.tools.length, "tool call")} · ${plural(t.edits.length, "edit")}${tokens}`;
             return (
-              <a key={`turn-${t.n}`} href={`#turn-${t.n}`}>
-                <rect x={x0} y={BAND_Y} width={x1 - x0} height={BAND_H} rx={3} fill={ACCENT} opacity={0.16}>
-                  <title>{`Turn ${t.n} · ${fmtTime(t.start)}–${end}\n${t.tools.length} tool calls · ${t.edits.length} edits${tokens}`}</title>
-                </rect>
+              // The link keeps its pointer cursor; [data-tip] resets it to the arrow.
+              <a key={`turn-${t.n}`} href={`#turn-${t.n}`} data-tip={tip} style={{ cursor: "pointer" }}>
+                <rect x={x0} y={BAND_Y} width={x1 - x0} height={BAND_H} rx={3} fill={ACCENT} opacity={0.16} />
                 <text x={x0 + 3} y={12} fontSize={11} fill="var(--color-fg-2)">
                   {t.n}
                 </text>
@@ -113,23 +116,19 @@ export function SessionTimeline({
             const px = X(x.ts);
             const dur = x.duration_ms != null ? ` · ${fmtMs(x.duration_ms)}` : "";
             const detail = oneLine(x.file ?? x.summary ?? "", 80);
+            const tip = `${fmtTime(x.ts)} ${x.tool_name ?? "tool"}${dur}${detail ? `\n${detail}` : ""}`;
             return (
-              <rect
-                key={x.id}
-                x={px - 1}
-                y={BAND_Y + 3}
-                width={2}
-                height={BAND_H - 6}
-                fill={FAMILY_COLOR[x.family]}
-              >
-                <title>{`${fmtTime(x.ts)} ${x.tool_name ?? "tool"}${dur}${detail ? `\n${detail}` : ""}`}</title>
-              </rect>
+              <g key={x.id} data-tip={tip}>
+                <rect x={px - HIT_W / 2} y={BAND_Y + 3} width={HIT_W} height={BAND_H - 6} fill="transparent" />
+                <rect x={px - 1} y={BAND_Y + 3} width={2} height={BAND_H - 6} fill={FAMILY_COLOR[x.family]} />
+              </g>
             );
           })}
 
           {commits.map((c) => {
             const px = X(c.committed_at);
             const msg = oneLine((c.message ?? "").split("\n")[0] ?? "", 80);
+            const tip = `commit ${c.sha.slice(0, 7)} · ${fmtTime(c.committed_at)}${msg ? `\n${msg}` : ""}\n${fmtNum(c.lines_attributed)} lines from this session`;
             return (
               <rect
                 key={c.id}
@@ -139,9 +138,8 @@ export function SessionTimeline({
                 height={10}
                 fill={COMMIT_MARK}
                 transform={`rotate(45 ${px} ${AXIS_Y})`}
-              >
-                <title>{`commit ${c.sha.slice(0, 7)} · ${fmtTime(c.committed_at)}${msg ? `\n${msg}` : ""}\n${fmtNum(c.lines_attributed)} lines from this session`}</title>
-              </rect>
+                data-tip={tip}
+              />
             );
           })}
 
@@ -149,10 +147,8 @@ export function SessionTimeline({
             const px = X(p.ts as string);
             if (p.kind === "compaction") {
               return (
-                <g key={`p-${p.seq}`}>
-                  <circle cx={px} cy={BAND_Y - 11} r={4} fill="var(--color-bg-elevated)" stroke={COMPACTION} strokeWidth={1.5}>
-                    <title>{`context compacted · ${fmtTime(p.ts)}`}</title>
-                  </circle>
+                <g key={`p-${p.seq}`} data-tip={`context compacted · ${fmtTime(p.ts)}`}>
+                  <circle cx={px} cy={BAND_Y - 11} r={4} fill="var(--color-bg-elevated)" stroke={COMPACTION} strokeWidth={1.5} />
                   <text x={px + 8} y={BAND_Y - 7} fontSize={11} fill="var(--color-fg-muted)">
                     compacted
                   </text>
@@ -161,15 +157,21 @@ export function SessionTimeline({
             }
             if (p.kind === "resend") {
               return (
-                <circle key={`p-${p.seq}`} cx={px} cy={BAND_Y - 11} r={3} fill={MUTED_MARK}>
-                  <title>{`prompt re-sent · ${fmtTime(p.ts)}`}</title>
-                </circle>
+                <circle
+                  key={`p-${p.seq}`}
+                  cx={px}
+                  cy={BAND_Y - 11}
+                  r={3}
+                  fill={MUTED_MARK}
+                  data-tip={`prompt re-sent · ${fmtTime(p.ts)}`}
+                />
               );
             }
             return (
-              <rect key={`p-${p.seq}`} x={px - 1} y={BAND_Y - 6} width={2} height={6} fill={PROMPT_MARK}>
-                <title>{`prompt · ${fmtTime(p.ts)}\n${oneLine(p.text, 90)}`}</title>
-              </rect>
+              <g key={`p-${p.seq}`} data-tip={`prompt · ${fmtTime(p.ts)}\n${oneLine(p.text, 90)}`}>
+                <rect x={px - HIT_W / 2} y={BAND_Y - 8} width={HIT_W} height={8} fill="transparent" />
+                <rect x={px - 1} y={BAND_Y - 6} width={2} height={6} fill={PROMPT_MARK} />
+              </g>
             );
           })}
 
@@ -214,6 +216,10 @@ export function SessionTimeline({
       </div>
     </div>
   );
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
 function LegendItem({ label, children }: { label: string; children: React.ReactNode }) {

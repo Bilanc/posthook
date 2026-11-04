@@ -14,7 +14,8 @@ const TOP = 8;
 
 // Column per turn: output tokens, with the thinking share drawn as the lower
 // segment. When usage is unknown (Cursor, missing transcript) the caller
-// passes the sentence to show instead.
+// passes the sentence to show instead. Each slot is a g.hit group: the whole
+// column area is hoverable, lights its band and tips the turn's numbers.
 export function TurnTokens({ turns, noUsage }: { turns: Turn[]; noUsage: string | null }) {
   if (noUsage) return <Empty>{noUsage}</Empty>;
   const n = Math.max(1, turns.length);
@@ -43,14 +44,15 @@ export function TurnTokens({ turns, noUsage }: { turns: Turn[]; noUsage: string 
         {turns.map((t, i) => {
           const out = t.output_tokens ?? 0;
           const think = Math.min(out, t.thinking_tokens ?? 0);
-          const x = ML + i * slot + (slot - bw) / 2;
+          const sx = ML + i * slot;
+          const x = sx + (slot - bw) / 2;
           const h = px(out);
           const th = px(think);
           const split = th >= 3 && h - th - 2 > 0;
-          const tip = `Turn ${t.n}: ${fmtCompact(out)} output tokens${think ? `, ${fmtCompact(think)} thinking` : ""}\n${t.edits.length} edits`;
+          const tip = `Turn ${t.n}\n${fmtCompact(out)} output tokens${think ? ` · ${fmtCompact(think)} thinking` : ""}\n${t.edits.length} ${t.edits.length === 1 ? "edit" : "edits"}`;
           return (
-            <g key={t.n}>
-              <title>{tip}</title>
+            <g key={t.n} className="hit" data-tip={tip}>
+              <rect className="band" x={sx} y={TOP} width={slot} height={plotH} fill="var(--color-fg)" />
               {h > 0 ? (
                 split ? (
                   <>
@@ -66,6 +68,7 @@ export function TurnTokens({ turns, noUsage }: { turns: Turn[]; noUsage: string 
                   {t.n}
                 </text>
               ) : null}
+              <rect x={sx} y={0} width={slot} height={H} fill="transparent" />
             </g>
           );
         })}

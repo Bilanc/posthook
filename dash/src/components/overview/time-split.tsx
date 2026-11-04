@@ -35,7 +35,7 @@ export function TimeSplitPanel({ ts }: { ts: TimeSplit }) {
         <Empty>No active time in this range.</Empty>
       ) : (
         <>
-          <div className="flex gap-0.5 h-7" role="img" aria-label="Active time by what the agent was doing">
+          <div className="segbar flex gap-0.5 h-7" role="img" aria-label="Active time by what the agent was doing">
             {parts.map((p) => {
               const share = ratio(p.minutes, total);
               if (share == null || p.minutes <= 0) return null;
@@ -47,7 +47,7 @@ export function TimeSplitPanel({ ts }: { ts: TimeSplit }) {
                     labelled ? "px-2" : ""
                   }`}
                   style={{ flex: `${p.minutes} 0 0`, background: p.color }}
-                  title={`${p.label}: ${fmtMinutes(p.minutes)} (${share < 0.005 ? "<1%" : fmtPct(share)})`}
+                  data-tip={`${p.label}\n${fmtMinutes(p.minutes)} · ${share < 0.005 ? "<1%" : fmtPct(share)}`}
                 >
                   {labelled ? fmtPct(share) : ""}
                 </div>

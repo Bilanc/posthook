@@ -24,7 +24,7 @@ export interface ConversationProps {
 export function Conversation(props: ConversationProps) {
   const committed = new Set(props.committedFiles);
   return (
-    <div className="grid min-w-0 gap-5">
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5">
       {props.turns.map((t) => (
         <TurnArticle key={t.n} turn={t} committed={committed} {...props} />
       ))}
@@ -51,7 +51,7 @@ function TurnArticle({
 }: ConversationProps & { turn: Turn; committed: Set<string> }) {
   const inProgress = t.open && running;
   return (
-    <article id={`turn-${t.n}`} className="grid min-w-0 scroll-mt-4 gap-2">
+    <article id={`turn-${t.n}`} className="grid min-w-0 grid-cols-[minmax(0,1fr)] scroll-mt-4 gap-2">
       <header className="flex flex-wrap items-baseline gap-x-3.5 gap-y-1 text-xs text-[var(--color-fg-muted)] tabular-nums">
         <b className="font-mono text-[11px] font-semibold text-[var(--color-fg)]">TURN {t.n}</b>
         <span>
@@ -111,7 +111,7 @@ function Who({ children }: { children: ReactNode }) {
 
 function UserBubble({ prompt }: { prompt: TurnPrompt }) {
   return (
-    <div className="min-w-0 rounded-lg border border-[rgba(99,102,241,0.25)] bg-[var(--color-accent-soft)] px-3 py-2.5 text-[13px] leading-relaxed break-words">
+    <div className="min-w-0 rounded-lg border border-[rgba(99,102,241,0.25)] bg-[var(--color-accent-soft)] px-3 py-2.5 text-[13px] leading-relaxed break-words [overflow-wrap:anywhere]">
       <Who>you · {fmtTime(prompt.ts)}</Who>
       <ClampedText text={prompt.text} maxChars={400} maxLines={6} />
     </div>
@@ -124,7 +124,7 @@ function ReplyBubble({ turn: t, agent }: { turn: Turn; agent: string }) {
       ? ` · ${fmtCompact(t.output_tokens)} out${t.thinking_tokens ? ` · ${fmtCompact(t.thinking_tokens)} thinking` : ""}`
       : "";
   return (
-    <div className="min-w-0 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-2)] px-3 py-2.5 text-[13px] leading-relaxed text-[var(--color-fg-2)] break-words">
+    <div className="min-w-0 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-2)] px-3 py-2.5 text-[13px] leading-relaxed text-[var(--color-fg-2)] break-words [overflow-wrap:anywhere]">
       <Who>
         {agent} · {fmtTime(t.end)}
         {tokens}

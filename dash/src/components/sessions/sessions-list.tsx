@@ -78,7 +78,9 @@ function Row({ r }: { r: SessionListRow }) {
           tokens={[r.agent_slug, r.model_slug ?? "—", r.repo_name ?? "no repo", r.branch]}
         />
       </div>
-      {/* Raised above the stretched link so the strip's <title> still shows on hover. */}
+      {/* The strip and the chip sit above the stretched link so their data-tip
+          marks receive the pointer (the link's pseudo-element would otherwise
+          swallow it). */}
       <span className={`${WIDE} relative z-10 leading-none`}>
         <ActivityStrip
           startedAt={r.started_at}
@@ -88,7 +90,7 @@ function Row({ r }: { r: SessionListRow }) {
           commitTs={r.commit_ts}
         />
       </span>
-      <span>
+      <span className="relative z-10 w-fit">
         <OutcomeChip outcome={r.outcome} commits={r.commits_attributed} />
       </span>
       <span className={NUM}>

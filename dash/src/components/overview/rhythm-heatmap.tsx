@@ -60,9 +60,8 @@ export function RhythmHeatmap({ cells }: { cells: HeatCell[] }) {
                       height={CH}
                       rx={2}
                       fill={step < 0 ? "var(--color-bg-2)" : RAMP[step]}
-                    >
-                      <title>{`${NAMES[ri]} ${hh(h)}:00–${hh(h + 1)}:00 · ${fmtNum(v)} AI ${plural(v, "edit")}`}</title>
-                    </rect>
+                      data-tip={`${NAMES[ri]} ${hh(h)}:00–${hh(h + 1)}:00\n${fmtNum(v)} AI ${plural(v, "edit")}`}
+                    />
                   );
                 })}
               </g>

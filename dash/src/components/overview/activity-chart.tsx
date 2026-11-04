@@ -176,11 +176,13 @@ function ActiveColumns({ rows, days }: { rows: DailyActivityRow[]; days: string[
           const segs = agents
             .map((a) => ({ a, v: perDay[i].get(a) ?? 0 }))
             .filter((s) => s.v > 0);
-          const title =
+          const lines =
             `${fmtDay(d)}\n` +
             (segs.length ? segs.map((s) => `${s.a}: ${fmtMinutes(s.v)}`).join("\n") : "no activity");
+          const tip = tot > 0 ? `${lines}\ntotal: ${fmtMinutes(tot)}` : lines;
           return (
-            <g key={d}>
+            <g key={d} className="hit">
+              <rect className="band" x={(ML + i * slot).toFixed(1)} y={MT} width={slot.toFixed(1)} height={PH} fill="var(--color-fg)" />
               {segs.map((s, si) => {
                 const isTop = si === segs.length - 1;
                 const top = y(acc + s.v);
@@ -193,9 +195,7 @@ function ActiveColumns({ rows, days }: { rows: DailyActivityRow[]; days: string[
                   <rect key={s.a} x={x.toFixed(1)} y={top.toFixed(1)} width={bw.toFixed(1)} height={hgt.toFixed(1)} fill={agentColor(s.a)} />
                 );
               })}
-              <rect x={(ML + i * slot).toFixed(1)} y={MT} width={slot.toFixed(1)} height={PH} fill="transparent">
-                <title>{tot > 0 ? `${title}\ntotal: ${fmtMinutes(tot)}` : title}</title>
-              </rect>
+              <rect x={(ML + i * slot).toFixed(1)} y={MT} width={slot.toFixed(1)} height={PH} fill="transparent" data-tip={tip} />
             </g>
           );
         })}
@@ -235,8 +235,10 @@ function LineColumns({ rows, days }: { rows: DailyActivityRow[]; days: string[] 
         <Axes y={y} ticks={[0, max / 2, max]} fmt={fmtCompact} />
         {days.map((d, i) => {
           const x0 = ML + i * slot + (slot - inner) / 2;
+          const tip = `${fmtDay(d)}\ngenerated: ${fmtNum(gen[i])} lines\ncommitted: ${fmtNum(com[i])} lines`;
           return (
-            <g key={d}>
+            <g key={d} className="hit">
+              <rect className="band" x={(ML + i * slot).toFixed(1)} y={MT} width={slot.toFixed(1)} height={PH} fill="var(--color-fg)" />
               {series.map((s, si) => {
                 const v = s.vals[i];
                 if (v <= 0) return null;
@@ -244,9 +246,7 @@ function LineColumns({ rows, days }: { rows: DailyActivityRow[]; days: string[] 
                 const top = y(v);
                 return <path key={s.key} d={roundedEndRect(x, top, bw, y(0) - top, 4, "top")} fill={s.color} />;
               })}
-              <rect x={(ML + i * slot).toFixed(1)} y={MT} width={slot.toFixed(1)} height={PH} fill="transparent">
-                <title>{`${fmtDay(d)}\ngenerated: ${fmtNum(gen[i])} lines\ncommitted: ${fmtNum(com[i])} lines`}</title>
-              </rect>
+              <rect x={(ML + i * slot).toFixed(1)} y={MT} width={slot.toFixed(1)} height={PH} fill="transparent" data-tip={tip} />
             </g>
           );
         })}

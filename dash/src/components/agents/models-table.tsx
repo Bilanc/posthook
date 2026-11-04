@@ -4,18 +4,20 @@ import { agentColor, ORDINAL } from "@/lib/palette";
 import { fmtCompact, fmtMinutes, fmtNum, fmtPct } from "@/lib/format";
 import { defaultDir, type ModelMetrics, type SortDir, type SortKey } from "./model-metrics";
 
-const COLUMNS: Array<{ key: SortKey; label: string }> = [
+// `tip` is the one-line definition a ratio column shows on hover, so the
+// footnote is reachable from the header too.
+const COLUMNS: Array<{ key: SortKey; label: string; tip?: string }> = [
   { key: "model", label: "Model" },
   { key: "sessions", label: "Sessions" },
   { key: "active", label: "Active" },
   { key: "prompts", label: "Prompts" },
   { key: "generated", label: "Generated" },
   { key: "committed", label: "Committed" },
-  { key: "keep", label: "Keep rate" },
-  { key: "lpk", label: "Lines / 1K tok" },
-  { key: "tpe", label: "Tools / edit" },
-  { key: "reedit", label: "Re-edit" },
-  { key: "shipped", label: "Shipped" },
+  { key: "keep", label: "Keep rate", tip: "Keep rate: share of generated lines that reached a commit" },
+  { key: "lpk", label: "Lines / 1K tok", tip: "Lines / 1K tok: lines generated per thousand output tokens" },
+  { key: "tpe", label: "Tools / edit", tip: "Tools / edit: tool calls per edit event" },
+  { key: "reedit", label: "Re-edit", tip: "Re-edit: share of files edited more than once in a session" },
+  { key: "shipped", label: "Shipped", tip: "Shipped: sessions that reached a commit, and their share of sessions" },
 ];
 
 interface Props {
@@ -37,10 +39,10 @@ function one(n: number | null): string {
   return n == null || !Number.isFinite(n) ? "—" : n.toFixed(1);
 }
 
-function Meter({ ratio }: { ratio: number | null }) {
+function Meter({ ratio, tip }: { ratio: number | null; tip: string }) {
   if (ratio == null) return <>—</>;
   return (
-    <span className="inline-flex items-center gap-2">
+    <span className="inline-flex items-center gap-2" data-tip={tip}>
       <span className="inline-block h-1.5 w-[70px] overflow-hidden rounded-full bg-[#1e2a4a]">
         <span
           className="block h-full rounded-full"
@@ -69,6 +71,7 @@ export function ModelsTable({ rows, sort, dir, preserved }: Props) {
                     className={`whitespace-nowrap border-b border-[var(--color-border-2)] px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wider ${
                       c.key === "model" ? "text-left" : "text-right"
                     } ${active ? "text-[var(--color-fg-2)]" : "text-[var(--color-fg-muted)]"}`}
+                    data-tip={c.tip}
                   >
                     <Link
                       href={sortHref(preserved, c.key, sort, dir)}
@@ -96,13 +99,16 @@ export function ModelsTable({ rows, sort, dir, preserved }: Props) {
                   </td>
                   <Num>{fmtNum(r.sessions)}</Num>
                   <Num>{fmtMinutes(r.active_minutes)}</Num>
-                  <Num title={noPrompts ? "This agent captured no prompts" : undefined}>
+                  <Num tip={noPrompts ? "This agent captured no prompts" : undefined}>
                     {noPrompts ? "—" : fmtNum(r.prompts)}
                   </Num>
                   <Num>{fmtCompact(r.lines_generated)}</Num>
                   <Num>{fmtCompact(r.lines_committed)}</Num>
                   <Num>
-                    <Meter ratio={m.keep} />
+                    <Meter
+                      ratio={m.keep}
+                      tip={`${fmtCompact(r.lines_committed)} of ${fmtCompact(r.lines_generated)} lines committed`}
+                    />
                   </Num>
                   <Num>{one(m.linesPerKTok)}</Num>
                   <Num>{one(m.toolsPerEdit)}</Num>
@@ -126,9 +132,9 @@ export function ModelsTable({ rows, sort, dir, preserved }: Props) {
   );
 }
 
-function Num({ children, title }: { children: React.ReactNode; title?: string }) {
+function Num({ children, tip }: { children: React.ReactNode; tip?: string }) {
   return (
-    <td title={title} className="whitespace-nowrap px-2 py-[7px] text-right">
+    <td data-tip={tip} className="whitespace-nowrap px-2 py-[7px] text-right">
       {children}
     </td>
   );

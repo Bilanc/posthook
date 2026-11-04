@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
+import { ChartTooltip } from "@/components/ui/chart-tooltip";
 
 export const metadata: Metadata = {
   title: "posthook-dash",
@@ -35,6 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           </div>
         </header>
         <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>
+        <ChartTooltip />
       </body>
     </html>
   );

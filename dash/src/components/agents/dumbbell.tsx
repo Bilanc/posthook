@@ -71,6 +71,9 @@ export function Dumbbell({ rows }: Props) {
           const xg = x(gen);
           const xc = x(com);
           const name = label(m);
+          const genTip = `${name}\ngenerated ${fmtNum(gen)} lines`;
+          const comTip = `${name}\ncommitted ${fmtNum(com)} lines${m.keep == null ? "" : ` · ${fmtPct(m.keep)} kept`}`;
+          const bothTip = `${name}\ngenerated ${fmtNum(gen)} lines\ncommitted ${fmtNum(com)} lines${m.keep == null ? "" : ` · ${fmtPct(m.keep)} kept`}`;
           return (
             <g key={`${m.row.agent}/${m.row.model}`}>
               <text x={0} y={y + 4} fill="var(--color-fg-2)" className="font-mono">
@@ -83,13 +86,20 @@ export function Dumbbell({ rows }: Props) {
                 y2={y}
                 stroke="var(--color-axis)"
                 strokeWidth={2}
+                data-tip={bothTip}
               />
-              <circle cx={xg.toFixed(1)} cy={y} r={5} fill={MUTED_MARK} stroke={SURFACE} strokeWidth={2}>
-                <title>{`${name}\ngenerated ${fmtNum(gen)} lines`}</title>
-              </circle>
-              <circle cx={xc.toFixed(1)} cy={y} r={5} fill={ACCENT} stroke={SURFACE} strokeWidth={2}>
-                <title>{`${name}\ncommitted ${fmtNum(com)} lines${m.keep == null ? "" : ` (${fmtPct(m.keep)})`}`}</title>
-              </circle>
+              {/* Invisible wide stroke so the connector is hoverable along its length. */}
+              <line
+                x1={Math.min(xg, xc).toFixed(1)}
+                x2={Math.max(xg, xc).toFixed(1)}
+                y1={y}
+                y2={y}
+                stroke="transparent"
+                strokeWidth={12}
+                data-tip={bothTip}
+              />
+              <circle cx={xg.toFixed(1)} cy={y} r={5} fill={MUTED_MARK} stroke={SURFACE} strokeWidth={2} data-tip={genTip} />
+              <circle cx={xc.toFixed(1)} cy={y} r={5} fill={ACCENT} stroke={SURFACE} strokeWidth={2} data-tip={comTip} />
               <text x={(Math.max(xg, xc) + 10).toFixed(1)} y={y + 4} fill={MUTED}>
                 {fmtCompact(gen)}
               </text>

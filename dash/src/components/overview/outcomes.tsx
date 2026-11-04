@@ -58,17 +58,18 @@ function Bars({ stages, unit }: { stages: Stage[]; unit: string }) {
         const w = share == null ? 0 : Math.max(s.value > 0 ? 4 : 0, Math.min(span, share * span));
         const y = i * (BH + GAP);
         const tip = share == null ? fmtCompact(s.value) : `${fmtCompact(s.value)}${i ? ` · ${fmtPct(share)}` : ""}`;
+        const hover =
+          `${s.label}\n${fmtNum(s.value)} ${unit}` +
+          (i && share != null ? ` · ${fmtPct(share)} of ${stages[0].label.toLowerCase()}` : "");
         return (
           <g key={s.label}>
             <text x={0} y={y + 14} className="text-[12px] fill-[var(--color-fg-2)]">
               {s.label}
             </text>
             {w > 0 ? (
-              <path d={roundedEndRect(LAB, y, w, BH, 4, "right")} fill={s.color}>
-                <title>{`${s.label}: ${fmtNum(s.value)} ${unit}`}</title>
-              </path>
+              <path d={roundedEndRect(LAB, y, w, BH, 4, "right")} fill={s.color} data-tip={hover} />
             ) : (
-              <line x1={LAB} x2={LAB} y1={y} y2={y + BH} stroke="var(--color-axis)" strokeWidth={1} />
+              <line x1={LAB} x2={LAB} y1={y} y2={y + BH} stroke="var(--color-axis)" strokeWidth={1} data-tip={hover} />
             )}
             <text x={(LAB + w + 8).toFixed(1)} y={y + 14} className="text-[12px] tabular-nums fill-[var(--color-fg-2)]">
               {tip}

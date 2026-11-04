@@ -1,9 +1,11 @@
+import { format } from "date-fns";
 import { ACCENT, COMMIT_MARK } from "@/lib/palette";
 
 // The session's shape on a linear time axis: one block per turn (previous
 // Stop → this Stop), filled when the turn edited a file and hollow when it only
 // read or ran commands; a diamond per attributed commit. Server-rendered SVG;
-// the <title> is the hover text.
+// every mark carries a data-tip for the shared hover layer (ui/chart-tooltip)
+// and the track itself tips the session summary.
 const W = 180;
 const H = 16;
 const MIN_BLOCK = 3;
@@ -30,6 +32,10 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? "" : "s"}`;
 }
 
+function hhmm(t: number): string {
+  return format(t, "HH:mm");
+}
+
 export function ActivityStrip({ startedAt, endedAt, stopTs, editTs, commitTs }: Props) {
   const stops = toMs(stopTs);
   const edits = toMs(editTs);
@@ -37,11 +43,12 @@ export function ActivityStrip({ startedAt, endedAt, stopTs, editTs, commitTs }: 
   const label = `${plural(stops.length, "turn")} · ${plural(edits.length, "edit")} · ${plural(commits.length, "commit")}`;
 
   const t0 = ms(startedAt);
-  const track = <rect x={0} y={6} width={W} height={4} rx={2} fill="var(--color-bg-2)" />;
+  const track = (
+    <rect x={0} y={6} width={W} height={4} rx={2} fill="var(--color-bg-2)" data-tip={label} />
+  );
   if (t0 == null) {
     return (
-      <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} role="img" aria-label={label}>
-        <title>{label}</title>
+      <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} role="img" aria-label={label} data-tip={label}>
         {track}
       </svg>
     );
@@ -52,20 +59,22 @@ export function ActivityStrip({ startedAt, endedAt, stopTs, editTs, commitTs }: 
   const t1 = Math.max(ms(endedAt) ?? 0, t0 + 60_000, stops[stops.length - 1] ?? 0);
   const x = (t: number) => Math.min(W, Math.max(0, ((t - t0) / (t1 - t0)) * W));
 
-  const blocks: Array<{ left: number; width: number; edited: boolean }> = [];
+  // Per block: the edit events that fall in its window. Tool counts are not on
+  // the list row, so the tip says what the fill says — edited or not.
+  const blocks: Array<{ left: number; width: number; edits: number; tip: string }> = [];
   let prev = t0;
-  for (const st of stops) {
+  stops.forEach((st, i) => {
     const x0 = x(prev);
     const width = Math.max(MIN_BLOCK, x(st) - x0);
     const left = Math.min(x0, W - width);
-    const edited = edits.some((e) => e > prev && e <= st);
-    blocks.push({ left, width, edited });
+    const n = edits.filter((e) => e > prev && e <= st).length;
+    const tip = `Turn ${i + 1} · ${hhmm(prev)}–${hhmm(st)}\n${n ? plural(n, "file edit") : "no edits"}`;
+    blocks.push({ left, width, edits: n, tip });
     prev = st;
-  }
+  });
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} role="img" aria-label={label}>
-      <title>{label}</title>
+    <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} role="img" aria-label={label} data-tip={label}>
       {track}
       {blocks.map((b, i) => (
         <rect
@@ -75,9 +84,10 @@ export function ActivityStrip({ startedAt, endedAt, stopTs, editTs, commitTs }: 
           width={b.width.toFixed(1)}
           height={10}
           rx={2}
-          fill={b.edited ? ACCENT : "transparent"}
-          stroke={b.edited ? "none" : "var(--color-fg-muted)"}
+          fill={b.edits ? ACCENT : "transparent"}
+          stroke={b.edits ? "none" : "var(--color-fg-muted)"}
           strokeWidth={1}
+          data-tip={b.tip}
         />
       ))}
       {commits.map((c, i) => {
@@ -91,6 +101,7 @@ export function ActivityStrip({ startedAt, endedAt, stopTs, editTs, commitTs }: 
             height={8}
             fill={COMMIT_MARK}
             transform={`rotate(45 ${cx.toFixed(1)} 8)`}
+            data-tip={`Commit · ${hhmm(c)}`}
           />
         );
       })}

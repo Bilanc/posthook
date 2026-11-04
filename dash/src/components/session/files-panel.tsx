@@ -4,7 +4,9 @@ import { ACCENT, MUTED_MARK } from "@/lib/palette";
 import type { FileSummary } from "./model";
 
 // Per file: how much of what the agent wrote reached a commit. Bars share one
-// scale (the largest file) so widths compare across rows.
+// scale (the largest file) so widths compare across rows. Each segment carries
+// a data-tip for the shared hover layer; the path keeps a native title since
+// that is overflow text, not a chart value.
 export function FilesPanel({ files }: { files: FileSummary }) {
   if (files.rows.length === 0) return <Empty>No file edits captured.</Empty>;
   const fmax = Math.max(1, ...files.rows.map((r) => Math.max(r.generated, r.committed)));
@@ -13,20 +15,25 @@ export function FilesPanel({ files }: { files: FileSummary }) {
     <div className="grid content-start gap-2.5">
       {files.rows.map((r) => {
         const lost = Math.max(0, r.generated - r.committed);
-        const tip = r.committed
-          ? `${fmtNum(r.committed)} lines committed · ${fmtNum(lost)} not committed`
-          : `${fmtNum(r.generated)} lines generated, none committed`;
         return (
           <div key={r.path} className="grid gap-1 text-xs">
             <div className="truncate font-mono text-[11px] text-[var(--color-fg)]" title={r.path}>
               {r.path}
             </div>
-            <div className="flex h-1.5 w-full gap-[2px] overflow-hidden" title={tip}>
+            <div className="segbar flex h-1.5 w-full gap-[2px] overflow-hidden">
               {r.committed > 0 ? (
-                <div className="rounded-sm shrink-0" style={{ width: pct(r.committed), background: ACCENT }} />
+                <div
+                  className="rounded-sm shrink-0"
+                  style={{ width: pct(r.committed), background: ACCENT }}
+                  data-tip={`${r.path}\n${fmtNum(r.committed)} lines committed`}
+                />
               ) : null}
               {lost > 0 ? (
-                <div className="rounded-sm shrink-0" style={{ width: pct(lost), background: MUTED_MARK }} />
+                <div
+                  className="rounded-sm shrink-0"
+                  style={{ width: pct(lost), background: MUTED_MARK }}
+                  data-tip={`${r.path}\n${fmtNum(lost)} lines not committed`}
+                />
               ) : null}
             </div>
             <div className="flex justify-between gap-2 text-[var(--color-fg-muted)] tabular-nums">

@@ -3,7 +3,7 @@ import { fmtMinutes, fmtNum, fmtPct } from "@/lib/format";
 import { ACCENT } from "@/lib/palette";
 import type { ActivityTotals, DailyActivityRow } from "@/lib/queries/activity";
 import type { Funnel } from "@/lib/queries/outcomes";
-import { ratio, sumByDay } from "./series";
+import { fmtDayShort, plural, ratio, sumByDay } from "./series";
 
 // Five stat tiles: value, change against the prior window, and a one-point-
 // per-day sparkline. Shipped sessions has no prior comparison; it carries the
@@ -38,6 +38,8 @@ export function KpiTiles({
         value={fmtNum(totals.sessions)}
         foot={<Delta cur={totals.sessions} prev={prior?.sessions ?? null} fmt={fmtNum} />}
         series={sumByDay(rows, days, (r) => r.sessions)}
+        days={days}
+        fmt={(v) => `${fmtNum(v)} ${plural(v, "session")}`}
       />
       <Tile
         label="Active time"
@@ -46,12 +48,16 @@ export function KpiTiles({
           <Delta cur={totals.active_minutes} prev={prior?.active_minutes ?? null} fmt={fmtMinutes} />
         }
         series={sumByDay(rows, days, (r) => r.active_minutes)}
+        days={days}
+        fmt={fmtMinutes}
       />
       <Tile
         label="Prompts"
         value={fmtNum(totals.prompts)}
         foot={<Delta cur={totals.prompts} prev={prior?.prompts ?? null} fmt={fmtNum} />}
         series={sumByDay(rows, days, (r) => r.prompts)}
+        days={days}
+        fmt={(v) => `${fmtNum(v)} ${plural(v, "prompt")}`}
       />
       <Tile
         label="Shipped sessions"
@@ -69,12 +75,16 @@ export function KpiTiles({
           </span>
         }
         series={sumByDay(rows, days, (r) => r.commits)}
+        days={days}
+        fmt={(v) => `${fmtNum(v)} ${plural(v, "commit")}`}
       />
       <Tile
         label="Keep rate"
         value={fmtPct(keep)}
         foot={<Delta cur={keep} prev={priorKeep} fmt={(v) => fmtPct(v)} pts />}
         series={keepSeries}
+        days={days}
+        fmt={(v) => fmtPct(v)}
       />
     </div>
   );
@@ -85,11 +95,15 @@ function Tile({
   value,
   foot,
   series,
+  days,
+  fmt,
 }: {
   label: string;
   value: ReactNode;
   foot: ReactNode;
   series: number[];
+  days: string[];
+  fmt: (v: number) => string;
 }) {
   return (
     <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-4 min-w-0">
@@ -98,7 +112,7 @@ function Tile({
       </div>
       <div className="mt-1 text-2xl font-semibold leading-tight">{value}</div>
       <div className="mt-1 text-xs flex items-center gap-1.5 min-h-4">{foot}</div>
-      <Sparkline values={series} />
+      <Sparkline values={series} days={days} fmt={fmt} />
     </div>
   );
 }
@@ -140,12 +154,18 @@ function Delta({
 }
 
 // One point per day; the area wash and end dot mark the current period.
-// Scales uniformly with the tile width so the dot stays round.
-function Sparkline({ values }: { values: number[] }) {
+// Scales uniformly with the tile width so the dot stays round. Hovering the
+// whole sparkline names the window and its peak day.
+function Sparkline({ values, days, fmt }: { values: number[]; days: string[]; fmt: (v: number) => string }) {
   const w = 160;
   const h = 32;
   const n = values.length;
   if (n === 0) return <div className="mt-2 h-8" aria-hidden="true" />;
+  const peak = Math.max(...values);
+  const peakAt = values.indexOf(peak);
+  const tip =
+    `last ${n} ${plural(n, "day")}` +
+    (peak > 0 && days[peakAt] ? ` · peak ${fmt(peak)} on ${fmtDayShort(days[peakAt])}` : " · no activity");
   const mx = Math.max(...values, 1);
   const pts = values.map((v, i) => {
     const x = n === 1 ? w / 2 : 2 + (i / (n - 1)) * (w - 4);
@@ -162,6 +182,7 @@ function Sparkline({ values }: { values: number[] }) {
       className="mt-2 block w-full h-auto"
       aria-hidden="true"
       focusable="false"
+      data-tip={tip}
     >
       {n > 1 ? (
         <>
