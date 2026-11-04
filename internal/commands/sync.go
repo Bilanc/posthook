@@ -43,6 +43,10 @@ func newSyncCmd() *cobra.Command {
                                 keep prompts, code and tool output on this
                                 machine; sync sessions, tokens, turns, paths
                                 and line counts only (default: full)
+
+If the team server reports that the org's policy is metadata-only, the next
+flush switches this machine to metadata_only by itself. The server can only
+ever tighten a machine, never widen it.
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if setEndpoint != "" || setToken != "" || setEnabled != "" || setSyncMode != "" {
@@ -130,6 +134,7 @@ func flushOnce() error {
 		if err != nil {
 			return err
 		}
+		adoptServerPolicy(&cfg.Cloud, res)
 		if res.Skipped {
 			fmt.Printf("sync skipped: %s\n", res.Reason)
 			return nil
@@ -209,6 +214,7 @@ func runSyncLoop() error {
 			fmt.Fprintf(os.Stderr, "sync: %v\n", err)
 			return
 		}
+		adoptServerPolicy(&cfg.Cloud, res)
 		if res.Skipped {
 			return
 		}
@@ -322,12 +328,38 @@ func runSyncPreview() error {
 }
 
 // describeSyncMode renders the mode with the one-line meaning a reader of
-// `posthook status` needs, so nobody has to look the constant up.
+// `posthook status` needs, so nobody has to look the constant up. An
+// unrecognised value is called out as such: sync is paused on it.
 func describeSyncMode(c config.CloudConfig) string {
-	if c.MetadataOnly() {
+	mode, err := c.ResolveSyncMode()
+	if err != nil {
+		return fmt.Sprintf("⚠ %v — sync is paused until this is fixed (posthook sync --set-sync-mode %s|%s)",
+			err, config.SyncModeFull, config.SyncModeMetadataOnly)
+	}
+	if mode == config.SyncModeMetadataOnly {
 		return config.SyncModeMetadataOnly + " (prompts, code and tool output stay on this machine)"
 	}
 	return config.SyncModeFull + " (prompts and verbatim tool-call payloads are sent)"
+}
+
+// adoptServerPolicy tightens this machine when the server's reply says the
+// org is metadata-only and the batch just sent went out in full mode: the
+// in-memory config flips so the rest of this run is redacted, and the mode is
+// persisted so the daemon's next tick starts there. A reply can only ever
+// tighten a client — "full" never widens a machine set to metadata_only — so
+// a misconfigured or compromised server cannot pull content off a laptop.
+func adoptServerPolicy(c *config.CloudConfig, res pksync.Result) {
+	if res.ServerSyncMode != config.SyncModeMetadataOnly || c.MetadataOnly() {
+		return
+	}
+	c.SyncMode = config.SyncModeMetadataOnly
+	changed, err := config.SetSyncMode(config.SyncModeMetadataOnly)
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "sync: org policy is metadata_only; switched this run but could not update %s: %v\n", config.Path(), err)
+	case changed:
+		fmt.Printf("sync: org policy is metadata_only — this machine now syncs metadata only (%s)\n", config.Path())
+	}
 }
 
 func runSyncConfigure(endpoint, token, enabled, syncMode string) error {
@@ -347,7 +379,10 @@ func runSyncConfigure(endpoint, token, enabled, syncMode string) error {
 	// Load() applies env overrides; strip them before save so we persist only
 	// what the user explicitly set on this command line plus any prior file
 	// contents.
-	disk, _ := readDiskConfig()
+	disk, err := config.ReadDisk()
+	if err != nil {
+		return err
+	}
 	if endpoint != "" {
 		disk.Cloud.Endpoint = endpoint
 	}
@@ -373,23 +408,8 @@ func runSyncConfigure(endpoint, token, enabled, syncMode string) error {
 	fmt.Printf("  enabled:   %v\n", disk.Cloud.Enabled)
 	fmt.Printf("  endpoint:  %s\n", orDash(disk.Cloud.Endpoint))
 	fmt.Printf("  token:     %s\n", maskToken(disk.Cloud.Token))
-	fmt.Printf("  sync mode: %s\n", describeSyncMode(effectiveMode(disk.Cloud)))
+	fmt.Printf("  sync mode: %s\n", describeSyncMode(disk.Cloud))
 	return nil
-}
-
-// readDiskConfig reads ~/.posthook/config.json without applying env overrides,
-// so `posthook sync --set-*` writes only the on-disk delta and leaves env-only
-// settings out of the file.
-func readDiskConfig() (config.Config, error) {
-	var c config.Config
-	b, err := os.ReadFile(config.Path())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return c, nil
-		}
-		return c, err
-	}
-	return c, json.Unmarshal(b, &c)
 }
 
 func orDash(s string) string {
@@ -414,13 +434,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n-1] + "…"
-}
-
-// effectiveMode resolves an on-disk CloudConfig's raw sync_mode ("" means
-// full) so describeSyncMode can print what the next flush will actually do.
-func effectiveMode(c config.CloudConfig) config.CloudConfig {
-	if mode, err := config.NormalizeSyncMode(c.SyncMode); err == nil {
-		c.SyncMode = mode
-	}
-	return c
 }

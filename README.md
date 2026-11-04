@@ -158,7 +158,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 - `POSTHOOK_DB` — override the SQLite path the dashboard reads (default `~/.posthook/posthook.db`).
 - `POSTHOOK_DASH_PORT` / `POSTHOOK_DASH_HOSTNAME` — override where `posthook dash` binds (default `127.0.0.1:3847`). Read by both the Go command and the dashboard server so they always agree.
 - `POSTHOOK_DASH_AUTOSTART=0` — skip the automatic dashboard start at the end of `posthook init`.
-- `POSTHOOK_CLOUD_ENDPOINT` / `POSTHOOK_CLOUD_TOKEN` / `POSTHOOK_CLOUD_ENABLED` / `POSTHOOK_CLOUD_FLUSH_SECS` / `POSTHOOK_CLOUD_SYNC_MODE` — override cloud-sync settings without editing `config.json` (handy for pointing one binary at a staging endpoint). `POSTHOOK_CLOUD_SYNC_MODE` is `full` or `metadata_only`; anything else is a config error that stops the flush rather than widening it.
+- `POSTHOOK_CLOUD_ENDPOINT` / `POSTHOOK_CLOUD_TOKEN` / `POSTHOOK_CLOUD_ENABLED` / `POSTHOOK_CLOUD_FLUSH_SECS` / `POSTHOOK_CLOUD_SYNC_MODE` — override cloud-sync settings without editing `config.json` (handy for pointing one binary at a staging endpoint). `POSTHOOK_CLOUD_SYNC_MODE` is `full` or `metadata_only`; anything else pauses sync (nothing is sent) until it is fixed with `posthook sync --set-sync-mode`, rather than widening it.
 - `POSTHOOK_ENGINEER_EMAIL` / `POSTHOOK_ENGINEER_NAME` — override the engineer identity; `posthook identity --setup` persists them without prompting (handy for MDM or dotfiles installs).
 - `POSTHOOK_API_KEY` / `POSTHOOK_VERSION` / `POSTHOOK_INSTALL_DIR` — read by `install.sh`: a team install key enables cloud sync + the background daemon, `POSTHOOK_VERSION` pins a release (default: latest), and `POSTHOOK_INSTALL_DIR` chooses the install directory (default `~/.local/bin`). The team install link also exports `POSTHOOK_CLOUD_SYNC_MODE` when the org has chosen metadata-only sync, and the installer refuses to enable sync at all if the binary cannot honour it.
 
@@ -185,7 +185,7 @@ Posthook has a hosted team version (by Bilanc) that rolls the same local data up
 
 ### What team sync sends
 
-Solo mode sends nothing. With a team key, what leaves the machine depends on `cloud.sync_mode` in `~/.posthook/config.json` (`posthook sync --set-sync-mode …`, or `POSTHOOK_CLOUD_SYNC_MODE`). Your org picks the mode in the Bilanc admin and the install link bakes it in; `posthook status` shows which one is active.
+Solo mode sends nothing. With a team key, what leaves the machine depends on `cloud.sync_mode` in `~/.posthook/config.json` (`posthook sync --set-sync-mode …`, or `POSTHOOK_CLOUD_SYNC_MODE`). Your org picks the mode in the Bilanc admin and the install link bakes it in; `posthook status` shows which one is active. If the org's policy is metadata-only, the server says so in its reply to every flush and a machine still on `full` switches itself over on that reply. The server can only ever tighten a machine, never widen it, so moving an org back to `full` means running `posthook sync --set-sync-mode full` on each machine.
 
 | | `full` (default) | `metadata_only` |
 |---|---|---|

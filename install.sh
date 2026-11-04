@@ -117,6 +117,23 @@ verify_sha256 "$tmp/$asset" "$tmp/checksums.txt"
 tar -xzf "$tmp/$asset" -C "$tmp"
 [ -f "$tmp/posthook" ] || die "release archive did not contain a posthook binary"
 
+# A team policy of metadata-only is written BEFORE the binary swap, using the
+# freshly downloaded binary. The sync daemon from an earlier install watches
+# the binary on disk and relaunches on the new one the instant it lands,
+# reading config.json as it is at that moment — if the mode were written
+# afterwards, that first relaunch could flush a batch in full mode. Doing it
+# here also means a release that predates --set-sync-mode fails before
+# anything on the machine has changed.
+if [ -n "${POSTHOOK_API_KEY:-}" ] && [ -n "${POSTHOOK_CLOUD_SYNC_MODE:-}" ]; then
+  endpoint="${POSTHOOK_CLOUD_ENDPOINT:-$DEFAULT_ENDPOINT}"
+  info "Configuring cloud sync -> $endpoint (sync mode: $POSTHOOK_CLOUD_SYNC_MODE)"
+  "$tmp/posthook" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true --set-sync-mode "$POSTHOOK_CLOUD_SYNC_MODE" || {
+    warn "posthook $ver does not support --set-sync-mode $POSTHOOK_CLOUD_SYNC_MODE. Nothing was installed or changed."
+    warn "Install a newer release (unset POSTHOOK_VERSION) or ask your admin."
+    exit 1
+  }
+fi
+
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp/posthook" "$INSTALL_DIR/posthook"
 BIN="$INSTALL_DIR/posthook"
@@ -138,24 +155,13 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Configure cloud sync (only with a team key)
 # ---------------------------------------------------------------------------
-if [ -n "${POSTHOOK_API_KEY:-}" ]; then
+# (With POSTHOOK_CLOUD_SYNC_MODE set this already happened in step 1, before
+# the binary swap — see the note there.)
+if [ -n "${POSTHOOK_API_KEY:-}" ] && [ -z "${POSTHOOK_CLOUD_SYNC_MODE:-}" ]; then
   endpoint="${POSTHOOK_CLOUD_ENDPOINT:-$DEFAULT_ENDPOINT}"
-  sync_mode="${POSTHOOK_CLOUD_SYNC_MODE:-}"
   info ""
-  if [ -n "$sync_mode" ]; then
-    info "Configuring cloud sync -> $endpoint (sync mode: $sync_mode)"
-    # Deliberately fatal: if this binary predates --set-sync-mode we must not
-    # fall through to a full-content install on a machine whose org asked for
-    # metadata only. Pin POSTHOOK_VERSION to a release that has it.
-    "$BIN" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true --set-sync-mode "$sync_mode" || {
-      warn "This posthook release does not support --set-sync-mode $sync_mode. Cloud sync was NOT enabled."
-      warn "Install a newer release (unset POSTHOOK_VERSION) or ask your admin."
-      exit 1
-    }
-  else
-    info "Configuring cloud sync -> $endpoint"
-    "$BIN" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true
-  fi
+  info "Configuring cloud sync -> $endpoint"
+  "$BIN" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true
 fi
 
 # ---------------------------------------------------------------------------

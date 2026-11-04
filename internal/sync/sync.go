@@ -61,10 +61,15 @@ var tablePrimaryKeys = map[string][]string{
 
 // Result is the per-flush summary surfaced by `posthook sync --once`.
 type Result struct {
-	Synced     map[string]int `json:"synced"`
-	DurationMS int64          `json:"duration_ms"`
-	Skipped    bool           `json:"skipped,omitempty"`
-	Reason     string         `json:"reason,omitempty"`
+	// ServerSyncMode is the org policy the server reported in its response
+	// ("" when it said nothing). The commands layer tightens this machine to
+	// metadata_only when the server says so and the batch went out in full;
+	// a server can only ever tighten a client, never widen it.
+	ServerSyncMode string         `json:"server_sync_mode,omitempty"`
+	Synced         map[string]int `json:"synced"`
+	DurationMS     int64          `json:"duration_ms"`
+	Skipped        bool           `json:"skipped,omitempty"`
+	Reason         string         `json:"reason,omitempty"`
 	// More is set when at least one table returned a full batch, so rows may
 	// still be pending and another Flush is needed to catch up.
 	More bool `json:"more,omitempty"`
@@ -94,6 +99,7 @@ type batch struct {
 	payload ingestPayload
 	pending map[string]pendingRows
 	more    bool
+	mode    string // resolved sync mode the batch was built for
 }
 
 // collectPending reads up to batchSize pending rows per table and, in
@@ -104,6 +110,15 @@ func collectPending(db *store.DB, cfg config.CloudConfig, batchSize int) (batch,
 		payload: ingestPayload{SchemaVersion: schemaVersion, Tables: map[string][]map[string]any{}},
 		pending: map[string]pendingRows{},
 	}
+	// Fail closed before touching a row: an unrecognised sync_mode (a typo in
+	// config.json or the env) must pause sync entirely, never fall through to
+	// the wider mode.
+	mode, err := cfg.ResolveSyncMode()
+	if err != nil {
+		return b, fmt.Errorf("cloud.sync_mode: %w — sync is paused; fix it with: posthook sync --set-sync-mode %s|%s",
+			err, config.SyncModeFull, config.SyncModeMetadataOnly)
+	}
+	b.mode = mode
 	for _, table := range store.SyncableTables {
 		rows, keys, err := selectPending(db, table, batchSize)
 		if err != nil {
@@ -119,7 +134,7 @@ func collectPending(db *store.DB, cfg config.CloudConfig, batchSize int) (batch,
 			b.more = true
 		}
 	}
-	if cfg.MetadataOnly() {
+	if mode == config.SyncModeMetadataOnly {
 		RedactTables(b.payload.Tables)
 	}
 	return b, nil
@@ -174,7 +189,7 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	req.Header.Set("User-Agent", "posthook-sync/1")
-	req.Header.Set("X-Posthook-Sync-Mode", cfg.SyncMode)
+	req.Header.Set("X-Posthook-Sync-Mode", b.mode)
 
 	client := &http.Client{Timeout: httpTimeout}
 	resp, err := client.Do(req)
@@ -194,7 +209,9 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 		}
 		return res, ingestErr
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// The server answers with the org's policy; surface it so the caller can
+	// tighten this machine when the org is metadata-only (see Result).
+	res.ServerSyncMode = readServerSyncMode(resp.Body)
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, table := range store.SyncableTables {
@@ -210,6 +227,23 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 	}
 	res.DurationMS = time.Since(start).Milliseconds()
 	return res, nil
+}
+
+// readServerSyncMode pulls sync_mode out of a 2xx ingest response. Anything
+// unexpected — no body, not JSON, unknown value — reads as "" (no policy
+// reported); a malformed response must never change a client's behaviour.
+func readServerSyncMode(body io.Reader) string {
+	var reply struct {
+		SyncMode string `json:"sync_mode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(body, 64<<10)).Decode(&reply); err != nil {
+		return ""
+	}
+	mode, err := config.NormalizeSyncMode(reply.SyncMode)
+	if err != nil || reply.SyncMode == "" {
+		return ""
+	}
+	return mode
 }
 
 // selectPending streams up to limit unsync'd rows from table as

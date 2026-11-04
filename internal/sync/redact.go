@@ -34,6 +34,11 @@ import (
 // Everything else (ids, timestamps, enums, counts, emails, repo/file paths)
 // passes through unchanged. Paths are metadata but do reveal directory names
 // and the machine username; the README says so.
+//
+// The allowlist is on keys AND value shapes: an allowlisted key only survives
+// with a scalar value (string, number, bool, null), or a list of strings for
+// the two list-shaped keys. An agent that nests an object under a kept key —
+// {"model": {"prompt": …}} — gets that value dropped, not forwarded.
 
 // payloadKeys are the top-level hook-payload keys that survive. Identifiers,
 // enums, numbers and paths only — nothing an engineer or an agent typed.
@@ -59,6 +64,10 @@ var payloadKeys = []string{
 var toolInputKeys = []string{
 	"file_path", "file_paths", "notebook_path", "cwd", "timeout", "replace_all",
 }
+
+// listKeys are the allowlisted keys whose value is a list of strings rather
+// than a scalar (Cursor's workspace roots, multi-file tool calls).
+var listKeys = map[string]bool{"file_paths": true, "workspace_roots": true}
 
 // redactedMarker is stamped on every rewritten payload so a reader of the
 // landed data can tell "captured but withheld" from "agent sent nothing".
@@ -110,7 +119,7 @@ func redactEventPayload(row map[string]any) {
 
 	out := make(map[string]any, len(payloadKeys)+2)
 	for k, v := range payload {
-		if payloadKeySet[k] {
+		if payloadKeySet[k] && allowedValue(k, v) {
 			out[k] = v
 		}
 	}
@@ -118,15 +127,17 @@ func redactEventPayload(row map[string]any) {
 	if ti, ok := payload["tool_input"].(map[string]any); ok {
 		kept := map[string]any{}
 		for k, v := range ti {
-			if toolInputKeySet[k] {
+			if toolInputKeySet[k] && allowedValue(k, v) {
 				kept[k] = v
 			}
 		}
 		out["tool_input"] = kept
 		newLines += newlineCount(ti["new_string"]) + newlineCount(ti["content"]) + editsNewlines(ti["edits"])
 	}
-	// Cursor afterFileEdit carries its edits at the top level.
-	newLines += editsNewlines(payload["edits"])
+	// Cursor afterFileEdit carries the edit at the top level: edits[] for a
+	// multi-edit, new_string for a single edit, content for a whole-file
+	// write (the same three shapes ingest's lineRangeToolForEvent recognises).
+	newLines += editsNewlines(payload["edits"]) + newlineCount(payload["new_string"]) + newlineCount(payload["content"])
 	out[redactedMarker] = true
 
 	if newLines > 0 && isNull(row["lines_added"]) {
@@ -176,6 +187,28 @@ func editsNewlines(v any) int {
 
 func isNull(v any) bool {
 	return v == nil
+}
+
+// allowedValue reports whether v is a shape an allowlisted key may carry out
+// of the machine: a JSON scalar, or — for listKeys only — a list of strings.
+// Objects and any other list are dropped even under an allowlisted key, so
+// the allowlist cannot be tunnelled through.
+func allowedValue(key string, v any) bool {
+	switch x := v.(type) {
+	case nil, string, float64, bool:
+		return true
+	case []any:
+		if !listKeys[key] {
+			return false
+		}
+		for _, e := range x {
+			if _, ok := e.(string); !ok {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // RedactTables applies the allowlist to a whole batch, table by table. Used

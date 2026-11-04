@@ -31,6 +31,12 @@ var contentStrings = []string{
 	"SECRET_UNKNOWN_TOP_LEVEL_KEY",
 	"SECRET_RAW_NON_JSON",
 	"SECRET_COMMIT_MESSAGE",
+	"SECRET_CURSOR_FLAT_NEW",
+	"SECRET_CURSOR_FLAT_CONTENT",
+	"SECRET_NESTED_UNDER_MODEL",
+	"SECRET_NESTED_IN_LIST",
+	"SECRET_NESTED_IN_NUMBER_KEY",
+	"SECRET_NESTED_TOOL_INPUT",
 }
 
 func mustJSON(t *testing.T, v any) string {
@@ -98,6 +104,26 @@ func fixtureTables(t *testing.T) map[string][]map[string]any {
 		"file_path": "/ws/e.ts",
 		"edits":     []any{map[string]any{"old_string": "a", "new_string": "SECRET_CURSOR_EDIT_NEW\nmore"}},
 	}
+	// Cursor's single-edit and whole-file-write shapes put the text at the top
+	// level rather than under edits[] (ingest's lineRangeToolForEvent).
+	cursorFlatEdit := map[string]any{
+		"hook_event_name": "afterFileEdit", "conversation_id": "c1", "generation_id": "g1", "cursor_version": "1.7.0",
+		"file_path": "/ws/f.ts", "old_string": "a", "new_string": "SECRET_CURSOR_FLAT_NEW\nline2\nline3",
+	}
+	cursorFlatWrite := map[string]any{
+		"hook_event_name": "afterFileEdit", "conversation_id": "c1", "generation_id": "g1", "cursor_version": "1.7.0",
+		"file_path": "/ws/g.ts", "content": "SECRET_CURSOR_FLAT_CONTENT\n",
+	}
+	// Content smuggled under allowlisted keys: objects and non-string lists
+	// must be dropped even though the key itself is kept.
+	nestedUnderAllowed := map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Read",
+		"model":           map[string]any{"prompt": "SECRET_NESTED_UNDER_MODEL"},
+		"file_paths":      []any{"/repo/ok.go", map[string]any{"text": "SECRET_NESTED_IN_LIST"}},
+		"workspace_roots": []any{"/ws"},
+		"duration_ms":     []any{"SECRET_NESTED_IN_NUMBER_KEY"},
+		"tool_input":      map[string]any{"file_path": map[string]any{"text": "SECRET_NESTED_TOOL_INPUT"}, "timeout": 5},
+	}
 	cursorPostToolUse := map[string]any{
 		"hook_event_name": "PostToolUse", "session_id": "c1", "cursor_version": "1.7.0", "generation_id": "g1",
 		"tool_name": "Shell", "tool_input": map[string]any{"command": "SECRET_BASH_COMMAND", "cwd": "/ws"},
@@ -135,6 +161,9 @@ func fixtureTables(t *testing.T) map[string][]map[string]any {
 			ev("e-prompt", userPrompt, nil),
 			ev("e-cursor-afe", cursorAfterFileEdit, nil),
 			ev("e-cursor-ptu", cursorPostToolUse, nil),
+			ev("e-cursor-edit", cursorFlatEdit, nil),
+			ev("e-cursor-write", cursorFlatWrite, nil),
+			ev("e-nested", nestedUnderAllowed, nil),
 			ev("e-raw", "SECRET_RAW_NON_JSON", nil),
 			ev("e-null", nil, nil),
 			ev("e-patch", map[string]any{"hook_event_name": "PostToolUse", "tool_name": "apply_patch", "tool_input": map[string]any{"content": "SECRET_PATCH_HUNK\n\n\n"}}, int64(7)),
@@ -213,7 +242,7 @@ func TestRedactTables_MetadataSurvives(t *testing.T) {
 
 	// Newline counts of the dropped text land on lines_added, mirroring the
 	// server's fallback score, but never overwrite a value already there.
-	cases := map[string]int64{"e-edit": 2, "e-write": 2, "e-multi": 3, "e-cursor-afe": 1, "e-patch": 7}
+	cases := map[string]int64{"e-edit": 2, "e-write": 2, "e-multi": 3, "e-cursor-afe": 1, "e-cursor-edit": 2, "e-cursor-write": 1, "e-patch": 7}
 	for id, want := range cases {
 		if got := rowOf(id)["lines_added"]; got != want {
 			t.Errorf("%s lines_added = %v, want %d", id, got, want)
@@ -232,6 +261,22 @@ func TestRedactTables_MetadataSurvives(t *testing.T) {
 	}
 	if _, ok := afe["edits"]; ok {
 		t.Errorf("top-level edits survived")
+	}
+
+	// Allowlisted keys only carry scalars (or string lists for the two list
+	// keys); anything else under them is dropped, not forwarded.
+	nested := payloadOf("e-nested")
+	for _, k := range []string{"model", "file_paths", "duration_ms"} {
+		if v, ok := nested[k]; ok {
+			t.Errorf("non-scalar value survived under allowlisted key %s: %v", k, v)
+		}
+	}
+	if roots, ok := nested["workspace_roots"].([]any); !ok || len(roots) != 1 || roots[0] != "/ws" {
+		t.Errorf("string list dropped from workspace_roots: %v", nested["workspace_roots"])
+	}
+	nti := nested["tool_input"].(map[string]any)
+	if _, ok := nti["file_path"]; ok || nti["timeout"] != float64(5) {
+		t.Errorf("tool_input value shapes not enforced: %v", nti)
 	}
 
 	raw := payloadOf("e-raw")

@@ -87,8 +87,54 @@ type CloudConfig struct {
 }
 
 // MetadataOnly reports whether flushes must strip prompt text and tool-call
-// content before leaving the machine.
-func (c CloudConfig) MetadataOnly() bool { return c.SyncMode == SyncModeMetadataOnly }
+// content before leaving the machine. An unrecognised sync_mode reads as
+// metadata-only too — never as the wider mode — and the flush path refuses
+// to run on it at all (ResolveSyncMode).
+func (c CloudConfig) MetadataOnly() bool {
+	mode, err := NormalizeSyncMode(c.SyncMode)
+	return err != nil || mode == SyncModeMetadataOnly
+}
+
+// ResolveSyncMode returns the canonical sync mode, or an error naming the
+// unrecognised value so the caller can fail closed and say how to fix it.
+func (c CloudConfig) ResolveSyncMode() (string, error) { return NormalizeSyncMode(c.SyncMode) }
+
+// ReadDisk reads ~/.posthook/config.json exactly as written — no env
+// overrides, no normalisation — so a caller can change one field and save it
+// back without baking an env-only setting into the file. A missing file is
+// an empty Config.
+func ReadDisk() (Config, error) {
+	var c Config
+	b, err := os.ReadFile(Path())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return c, nil
+		}
+		return c, err
+	}
+	return c, json.Unmarshal(b, &c)
+}
+
+// SetSyncMode writes cloud.sync_mode to disk and leaves every other setting
+// as it is. Returns false when the file already held that mode. The sync
+// command calls it when the team server reports a metadata-only org policy,
+// so an already-installed machine tightens itself on its next flush instead
+// of waiting for someone to re-run the installer.
+func SetSyncMode(mode string) (changed bool, err error) {
+	mode, err = NormalizeSyncMode(mode)
+	if err != nil {
+		return false, err
+	}
+	disk, err := ReadDisk()
+	if err != nil {
+		return false, err
+	}
+	if current, cerr := NormalizeSyncMode(disk.Cloud.SyncMode); cerr == nil && current == mode {
+		return false, nil
+	}
+	disk.Cloud.SyncMode = mode
+	return true, Save(disk)
+}
 
 // Path returns the absolute path to the on-disk config file.
 func Path() string { return filepath.Join(paths.PosthookDir(), "config.json") }
@@ -123,11 +169,14 @@ func Load() (Config, error) {
 	if v := os.Getenv("POSTHOOK_CLOUD_SYNC_MODE"); v != "" {
 		c.Cloud.SyncMode = v
 	}
-	mode, err := NormalizeSyncMode(c.Cloud.SyncMode)
-	if err != nil {
-		return c, fmt.Errorf("cloud.sync_mode: %w", err)
+	// An unknown sync_mode is kept verbatim rather than failing the load: the
+	// flush path refuses to run on it (fail closed, see ResolveSyncMode) while
+	// `posthook sync --set-sync-mode` can still repair the typo and `posthook
+	// uninstall` still sees cloud sync as configured, so its final flush is
+	// attempted (and, refused, preserves the local data) instead of skipped.
+	if mode, err := NormalizeSyncMode(c.Cloud.SyncMode); err == nil {
+		c.Cloud.SyncMode = mode
 	}
-	c.Cloud.SyncMode = mode
 	if v := os.Getenv("POSTHOOK_ENGINEER_EMAIL"); v != "" {
 		c.Engineer.Email = v
 	}

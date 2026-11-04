@@ -88,12 +88,14 @@ var seededSecrets = []string{
 	"SECRET_STDOUT", "SECRET_REPLY", "SECRET_COMMIT_SUBJECT", "SECRET_PROMPT",
 }
 
-// captureServer records every ingest POST (body + the sync-mode header).
+// captureServer records every ingest POST (body + the sync-mode header) and
+// can answer with an org policy, as the real ingest does.
 type captureServer struct {
 	*httptest.Server
-	mu     sync.Mutex
-	bodies []string
-	modes  []string
+	mu        sync.Mutex
+	bodies    []string
+	modes     []string
+	replyMode string // sync_mode to put in the response; "" for none
 }
 
 func newCaptureServer(t *testing.T) *captureServer {
@@ -109,7 +111,11 @@ func newCaptureServer(t *testing.T) *captureServer {
 		cs.modes = append(cs.modes, r.Header.Get("X-Posthook-Sync-Mode"))
 		cs.mu.Unlock()
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"received":{}}`))
+		reply := `{"received":{}}`
+		if cs.replyMode != "" {
+			reply = `{"received":{},"sync_mode":"` + cs.replyMode + `"}`
+		}
+		_, _ = w.Write([]byte(reply))
 	}))
 	t.Cleanup(cs.Close)
 	return cs
@@ -232,6 +238,54 @@ func TestFlush_MetadataOnlyStripsContentAndKeepsLocalStore(t *testing.T) {
 	res, err = Flush(context.Background(), db, cloudCfg(srv.URL, config.SyncModeMetadataOnly))
 	if err != nil || len(srv.bodies) != 1 || len(res.Synced) != 0 {
 		t.Errorf("second flush should send nothing: res=%+v posts=%d err=%v", res, len(srv.bodies), err)
+	}
+}
+
+// The ingest reply carries the org policy; Flush surfaces it (and only a
+// recognised value) so the command layer can tighten a full-mode machine.
+func TestFlush_SurfacesServerPolicy(t *testing.T) {
+	for _, tc := range []struct{ reply, want string }{
+		{"metadata_only", config.SyncModeMetadataOnly},
+		{"full", config.SyncModeFull},
+		{"", ""},
+		{"bogus", ""},
+	} {
+		db := openTestStore(t)
+		seedContent(t, db)
+		srv := newCaptureServer(t)
+		srv.replyMode = tc.reply
+		res, err := Flush(context.Background(), db, cloudCfg(srv.URL, config.SyncModeFull))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.ServerSyncMode != tc.want {
+			t.Errorf("reply %q: ServerSyncMode = %q, want %q", tc.reply, res.ServerSyncMode, tc.want)
+		}
+	}
+}
+
+// A sync_mode nobody recognises pauses sync entirely: nothing is sent, nothing
+// is marked, and the rows wait for the config to be fixed.
+func TestFlush_UnknownSyncModeFailsClosed(t *testing.T) {
+	db := openTestStore(t)
+	seedContent(t, db)
+	srv := newCaptureServer(t)
+
+	cfg := cloudCfg(srv.URL, "metdata_only")
+	if !cfg.MetadataOnly() {
+		t.Errorf("an unknown mode must never read as full")
+	}
+	if _, err := Flush(context.Background(), db, cfg); err == nil || !strings.Contains(err.Error(), "unknown sync mode") {
+		t.Fatalf("Flush err = %v, want unknown sync mode", err)
+	}
+	if len(srv.bodies) != 0 {
+		t.Errorf("flush with an unknown mode must not POST")
+	}
+	if left, _ := Pending(db); left == 0 {
+		t.Errorf("rows must stay pending")
+	}
+	if _, err := Preview(db, cfg); err == nil {
+		t.Errorf("Preview must refuse an unknown mode too")
 	}
 }
 
