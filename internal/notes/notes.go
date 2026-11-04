@@ -193,15 +193,17 @@ func RemoveTransport(repoRoot string) bool {
 	return changed
 }
 
-// DeleteLocalRefs removes every local ref under refs/notes/posthook: the
-// notes ref itself and the fetch tracking ref. Strictly local — the remote's
-// copy of the notes is never touched, so a later install can fetch them
-// straight back. Other notes refs (refs/notes/commits, refs/notes/ai, …) are
-// not ours and are left alone. Returns the number of refs deleted.
+// DeleteLocalRefs removes the two local refs posthook creates — the notes
+// ref (refs/notes/posthook) and the fetch tracking ref
+// (refs/notes/posthook-remote) — and nothing else: other notes refs
+// (refs/notes/commits, refs/notes/ai, even refs/notes/posthook-custom) are
+// someone else's. The remote is never contacted; notes already pushed stay
+// there and a reinstall fetches them straight back. Returns how many refs
+// were deleted.
 func DeleteLocalRefs(repoRoot string) int {
 	n := 0
-	for _, ref := range strings.Split(gitx.Run(repoRoot, "for-each-ref", "--format=%(refname)", "refs/notes/"), "\n") {
-		if !strings.HasPrefix(ref, paths.NotesRef) {
+	for _, ref := range []string{paths.NotesRef, TrackingRef} {
+		if !RefExists(repoRoot, ref) {
 			continue
 		}
 		if err := gitx.Exec(repoRoot, "update-ref", "-d", ref); err != nil {

@@ -31,14 +31,18 @@ func newUninstallCmd() *cobra.Command {
 		Long: `Remove every trace of posthook from this machine, so a later install starts
 from scratch. In order:
 
-  1. stop the background sync daemon, the dashboard server and the spool worker
+  1. stop the background sync daemon and the dashboard server
   2. remove posthook's hook entries from Claude Code, Cursor and Codex CLI
      (your own hooks in those files are untouched)
-  3. drain any queued events and, if cloud sync is configured, flush once more
-     so nothing already captured is lost
+  3. stop the spool worker, drain any queued events and, if cloud sync is
+     configured, flush once more so nothing already captured is lost. If that
+     hand-off fails, the database, config and queued events are kept and the
+     binary is left in place so you can retry.
   4. in every repo posthook has recorded: remove its post-commit hook, its
-     notes refspec, and the local refs/notes/posthook* refs (notes already
-     pushed to a remote are never touched)
+     notes refspec, and the local refs/notes/posthook refs (notes already
+     pushed to a remote are never touched). A repo created with git init
+     while posthook was installed, but never committed in, is not recorded;
+     its hook stays behind and does nothing.
   5. remove the git shadow symlink and unset init.templateDir
   6. delete ~/.posthook (database, config, dashboard bundle, logs)
   7. delete the posthook binary
@@ -81,13 +85,15 @@ func runUninstall(yes, dryRun, keepData bool) error {
 
 // uninstallPlan is everything posthook has left on this machine, gathered up
 // front so one list drives --dry-run, the confirmation prompt and the removal
-// itself. Gathering is read-only.
+// itself. Gathering is read-only: it never creates, migrates or writes a
+// file.
 type uninstallPlan struct {
 	keepData bool
 
 	serviceInstalled bool
 	serviceStatus    string
-	dashPID          int // 0 when no dashboard server is tracked
+	syncLoopPIDs     []int // resident `posthook sync --loop` processes, daemon or hand-run
+	dashPID          int   // 0 when no dashboard server is running
 	workerRunning    bool
 	spoolPending     int
 	cloudConfigured  bool
@@ -97,6 +103,7 @@ type uninstallPlan struct {
 	shadow      ShadowHealth
 	templateDir bool
 	repos       []string
+	reposErr    error // the repo list could not be read from the database
 
 	dataDir       string
 	dataDirExists bool
@@ -122,6 +129,10 @@ var keepDataFiles = map[string]bool{
 	"config.json":     true,
 }
 
+// spoolDirName is the ~/.posthook entry that holds queued events; kept
+// alongside keepDataFiles when a drain did not finish.
+const spoolDirName = "spool"
+
 func gatherUninstallPlan(keepData bool) uninstallPlan {
 	p := uninstallPlan{keepData: keepData, dataDir: paths.PosthookDir()}
 
@@ -129,7 +140,10 @@ func gatherUninstallPlan(keepData bool) uninstallPlan {
 	if p.serviceInstalled {
 		p.serviceStatus = service.Status()
 	}
-	p.dashPID = trackedDashPID()
+	p.syncLoopPIDs = syncLoopPIDs()
+	if pid := trackedDashPID(); pid > 0 && processAlive(pid) {
+		p.dashPID = pid
+	}
 	// workerRunning probes with O_CREATE, so only ask when the lock file is
 	// already there — a dry run must not leave anything behind.
 	if _, err := os.Stat(workerLockPath()); err == nil {
@@ -155,7 +169,7 @@ func gatherUninstallPlan(keepData bool) uninstallPlan {
 
 	if _, err := os.Stat(paths.DBPath()); err == nil {
 		p.dbExists = true
-		p.repos = knownRepos()
+		p.repos, p.reposErr = knownRepos()
 	}
 	if st, err := os.Stat(p.dataDir); err == nil && st.IsDir() {
 		p.dataDirExists = true
@@ -172,15 +186,24 @@ func (p uninstallPlan) drainFirst() bool {
 	return p.spoolPending > 0 && p.dbExists && (p.keepData || p.cloudConfigured)
 }
 
+// flushFirst reports whether a final cloud flush is due before the database
+// goes.
+func (p uninstallPlan) flushFirst() bool {
+	return p.cloudConfigured && p.dbExists
+}
+
 func (p uninstallPlan) print() {
 	line := func(label, text string) { fmt.Printf("  %-18s %s\n", label, text) }
 
 	fmt.Println("posthook uninstall will remove from this machine:")
 	fmt.Println()
 	fmt.Println("Background processes")
-	if p.serviceInstalled {
+	switch {
+	case p.serviceInstalled:
 		line("sync daemon", p.serviceStatus+" — stop and remove")
-	} else {
+	case len(p.syncLoopPIDs) > 0:
+		line("sync loop", fmt.Sprintf("running (pid %s) — stop", pidList(p.syncLoopPIDs)))
+	default:
 		line("sync daemon", "not installed")
 	}
 	if p.dashPID > 0 {
@@ -215,8 +238,13 @@ func (p uninstallPlan) print() {
 	} else {
 		line("init.templateDir", "not set by posthook")
 	}
-	line("repos", fmt.Sprintf("%d known repo(s): post-commit hook, notes refspec, local refs/notes/posthook*", len(p.repos)))
-	line("", "(notes already pushed to a remote are never touched)")
+	if p.reposErr != nil {
+		line("repos", "could not read the repo list from the database: "+p.reposErr.Error())
+		line("", "(the sweep retries with a full open; if that fails too, no repo is cleaned)")
+	} else {
+		line("repos", fmt.Sprintf("%d known repo(s): post-commit hook, notes refspec, local refs/notes/posthook refs", len(p.repos)))
+		line("", "(notes already pushed to a remote are never touched)")
+	}
 
 	fmt.Println()
 	fmt.Println("Data")
@@ -235,8 +263,11 @@ func (p uninstallPlan) print() {
 			line("queued events", fmt.Sprintf("%d — discarded with the database", p.spoolPending))
 		}
 	}
-	if p.cloudConfigured && p.dbExists {
+	if p.flushFirst() {
 		line("cloud sync", "configured — one final flush before the database goes")
+		if !p.keepData {
+			line("", "(if the flush fails, the data and the binary stay so you can retry)")
+		}
 	}
 
 	fmt.Println()
@@ -258,29 +289,40 @@ func (p uninstallPlan) execute() error {
 	step := func(format string, args ...any) { fmt.Printf("  "+format+"\n", args...) }
 
 	fmt.Println("Stopping background processes")
+	stopped := false
 	if p.serviceInstalled {
 		if err := service.Uninstall(); err != nil {
 			problem("sync daemon", err)
 		} else {
 			step("sync daemon stopped and removed")
 		}
+		stopped = true
+	}
+	// launchctl / systemctl report success even when they could not reach a
+	// live unit, and a loop started by hand has no unit at all. Look for the
+	// process itself and stop whatever is left.
+	if pids := syncLoopPIDs(); len(pids) > 0 {
+		if alive := terminateAndWait(pids, stopGrace); len(alive) > 0 {
+			problem("sync loop", fmt.Errorf("pid %s still running", pidList(alive)))
+		} else {
+			step("stopped sync loop (pid %s)", pidList(pids))
+		}
+		stopped = true
 	}
 	if p.dashPID > 0 {
 		if err := stopDash(); err != nil {
 			problem("dashboard", err)
 		}
+		stopped = true
 	}
-	if p.workerRunning {
-		if _, err := stopWorker(); err != nil {
-			problem("spool worker", err)
-		} else {
-			step("spool worker stopped")
-		}
-	}
-	if !p.serviceInstalled && p.dashPID == 0 && !p.workerRunning {
+	if !stopped {
 		step("nothing running")
 	}
 
+	// Hooks go before the worker is stopped: a hook fire spawns a worker, so
+	// the fewer places left that can fire, the better. Sessions that already
+	// loaded the hooks keep firing until restarted; the final pass below
+	// catches what slips through.
 	fmt.Println("Agent hooks")
 	if len(p.agents) == 0 {
 		step("none found")
@@ -294,27 +336,55 @@ func (p uninstallPlan) execute() error {
 		step("%s", res.Message)
 	}
 
-	if p.drainFirst() || (p.cloudConfigured && p.dbExists) {
+	var drainErr, flushErr error
+	workerUp := workerLockExists() && workerRunning()
+	if workerUp || p.drainFirst() || p.flushFirst() {
 		fmt.Println("Captured data")
+		if workerUp {
+			if _, err := stopWorker(); err != nil {
+				problem("spool worker", err)
+			} else {
+				step("spool worker stopped")
+			}
+		}
 		if p.drainFirst() {
 			n, err := spool.Drain(ingest.ProcessAgentEnvelope)
 			if err != nil {
+				drainErr = err
 				problem("spool drain", err)
 			}
 			step("drained %d queued event(s) into the database", n)
 		}
-		if p.cloudConfigured && p.dbExists {
+		if p.flushFirst() {
 			if err := flushOnce(); err != nil {
+				flushErr = err
 				problem("final cloud flush", err)
 			}
 		}
 	}
+	// A failed drain leaves events in the spool and a failed flush leaves
+	// rows in the database. Deleting either now would lose captured data
+	// with no way to retry, so keep them — and the binary to retry with.
+	// With --keep-data the database stays anyway.
+	preserve := !p.keepData && (drainErr != nil || flushErr != nil)
 
 	fmt.Println("Git")
-	if len(p.repos) > 0 {
-		hooks, refspecs, refs := sweepRepos(p.repos)
+	repos := p.repos
+	if p.reposErr != nil {
+		// The read-only open failed while gathering the plan. A full open —
+		// which may migrate the database — is fine now that we are removing.
+		if db, err := store.Open(); err != nil {
+			problem("repo list", err)
+		} else if roots, err := existingRepos(db); err != nil {
+			problem("repo list", err)
+		} else {
+			repos = roots
+		}
+	}
+	if len(repos) > 0 {
+		hooks, refspecs, refs := sweepRepos(repos)
 		step("swept %d repo(s): removed %d post-commit hook(s), %d notes refspec(s), %d local notes ref(s)",
-			len(p.repos), hooks, refspecs, refs)
+			len(repos), hooks, refspecs, refs)
 	}
 	if p.shadow.SymlinkExists {
 		removed, shadowPath, err := removeShadow(resolvePosthookBinaryPath())
@@ -333,42 +403,87 @@ func (p uninstallPlan) execute() error {
 			step("%s", res.Message)
 		}
 	}
-	if len(p.repos) == 0 && !p.shadow.SymlinkExists && !p.templateDir {
+	if len(repos) == 0 && !p.shadow.SymlinkExists && !p.templateDir {
 		step("nothing to remove")
 	}
 
 	fmt.Println("Data")
-	if p.dataDirExists {
-		if err := store.Close(); err != nil {
-			logx.Debugf("uninstall: close db: %v", err)
+	if err := store.Close(); err != nil {
+		logx.Debugf("uninstall: close db: %v", err)
+	}
+	switch {
+	case !p.dataDirExists:
+		step("%s not present", tildify(p.dataDir))
+	case preserve || p.keepData:
+		keep := map[string]bool{}
+		for name := range keepDataFiles {
+			keep[name] = true
 		}
-		if p.keepData {
-			if err := removeAllExcept(p.dataDir, keepDataFiles); err != nil {
-				problem("data dir", err)
-			} else {
-				step("removed everything in %s except posthook.db and config.json", tildify(p.dataDir))
-			}
-		} else if err := os.RemoveAll(p.dataDir); err != nil {
+		kept := "posthook.db and config.json"
+		if preserve || drainErr != nil {
+			keep[spoolDirName] = true
+			kept = "posthook.db, config.json and the queued events"
+		}
+		if err := removeAllExcept(p.dataDir, keep); err != nil {
+			problem("data dir", err)
+		} else if preserve {
+			step("kept %s in %s; removed the rest", kept, tildify(p.dataDir))
+		} else {
+			step("removed everything in %s except %s", tildify(p.dataDir), kept)
+		}
+	default:
+		if err := os.RemoveAll(p.dataDir); err != nil {
 			problem("data dir", err)
 		} else {
 			step("removed %s", tildify(p.dataDir))
 		}
-	} else {
-		step("%s not present", tildify(p.dataDir))
 	}
 
 	fmt.Println("Binary")
-	if p.binary != "" {
+	switch {
+	case p.binary == "":
+		step("left in place")
+	case preserve:
+		step("left in place at %s so the hand-off can be retried", tildify(p.binary))
+	default:
 		if err := os.Remove(p.binary); err != nil {
 			problem("binary", err)
 		} else {
 			step("removed %s", tildify(p.binary))
 		}
-	} else {
-		step("left in place")
+	}
+
+	// A hook that fired while this ran may have respawned the worker and
+	// recreated ~/.posthook. Nothing can fire now that the binary is gone,
+	// so one more pass closes that window.
+	if workerLockExists() {
+		if _, err := stopWorker(); err != nil {
+			problem("spool worker", err)
+		}
+	}
+	if !preserve && !p.keepData {
+		if _, err := os.Stat(p.dataDir); err == nil {
+			if err := os.RemoveAll(p.dataDir); err != nil {
+				problem("data dir", err)
+			} else {
+				step("removed %s again (a hook fired during the uninstall)", tildify(p.dataDir))
+			}
+		}
 	}
 
 	fmt.Println()
+	if preserve {
+		fmt.Println("Stopped short: captured data could not be handed off, so it was kept.")
+		fmt.Printf("  - %s still holds posthook.db, config.json and any queued events.\n", tildify(p.dataDir))
+		if p.binary != "" {
+			fmt.Printf("  - The binary is still at %s.\n", tildify(p.binary))
+		}
+		fmt.Println("  - Re-run `posthook uninstall` once the cloud endpoint is reachable, or")
+		fmt.Println("    `posthook uninstall --keep-data` to remove everything else now and keep the data")
+		fmt.Println("    for a later install.")
+		return fmt.Errorf("uninstall stopped short: %s", strings.Join(problems, ", "))
+	}
+
 	fmt.Println("Done. Three things to know:")
 	fmt.Println("  - Open a new shell (or run `hash -r`): the shell may still have the old git path cached.")
 	fmt.Println("  - Restart any Claude Code / Cursor / Codex session that is running: they loaded the hooks")
@@ -387,7 +502,7 @@ func (p uninstallPlan) execute() error {
 
 // sweepRepos removes posthook's per-repo traces from every root: the
 // post-commit hook, the notes refspec(s) on every remote, and the local
-// refs/notes/posthook* refs. Each repo is independent — one failure never
+// refs/notes/posthook refs. Each repo is independent — one failure never
 // stops the sweep. Returns how many of each were removed.
 func sweepRepos(repos []string) (hooks, refspecs, refs int) {
 	for _, root := range repos {
@@ -412,20 +527,25 @@ func sweepRepos(repos []string) (hooks, refspecs, refs int) {
 }
 
 // knownRepos returns every repository root the store has recorded that still
-// exists on disk, deduplicated. The store knows a repo once posthook has seen
-// it (a commit through the shadow or a hook, an agent event, or `posthook
-// track`), so a repo created from the git template that never committed
-// keeps its hook — it fails silently, since the binary it calls is gone.
-func knownRepos() []string {
-	db, err := store.Open()
+// exists on disk, read through a read-only handle so gathering the plan
+// never creates or migrates the database. The store knows a repo once
+// posthook has seen it (a commit through the shadow or a hook, an agent
+// event, or `posthook track`).
+func knownRepos() ([]string, error) {
+	db, err := store.OpenReadOnly()
 	if err != nil {
-		logx.Debugf("uninstall: open store: %v", err)
-		return nil
+		return nil, err
 	}
+	defer db.Close()
+	return existingRepos(db)
+}
+
+// existingRepos is the recorded repository roots that still have a .git,
+// deduplicated.
+func existingRepos(db *store.DB) ([]string, error) {
 	roots, err := db.RepositoryRoots()
 	if err != nil {
-		logx.Debugf("uninstall: list repositories: %v", err)
-		return nil
+		return nil, err
 	}
 	seen := map[string]bool{}
 	var out []string
@@ -439,7 +559,7 @@ func knownRepos() []string {
 		}
 		out = append(out, root)
 	}
-	return out
+	return out, nil
 }
 
 // trackedDashPID returns the pid in ~/.posthook/dash.pid, or 0 when no
@@ -456,13 +576,20 @@ func trackedDashPID() int {
 	return pid
 }
 
-// deletableBinary resolves the running posthook binary to the file to delete,
-// or "" when deleting it would be wrong: a `go run` / `go build` scratch
-// binary lives in a temp dir and belongs to the developer's build, not to an
-// install.
+func workerLockExists() bool {
+	_, err := os.Stat(workerLockPath())
+	return err == nil
+}
+
+// deletableBinary resolves the running executable to the file to delete, or
+// "" when deleting it would be wrong: a `go run` / `go build` scratch binary
+// lives in a temp dir and belongs to the developer's build, not to an
+// install. POSTHOOK_BIN is deliberately not consulted — it names the binary
+// hooks should call, which need not be the installed one that is running
+// now; only the shadow-target check honours it.
 func deletableBinary() string {
-	exe := resolvePosthookBinaryPath()
-	if exe == "" {
+	exe, err := os.Executable()
+	if err != nil {
 		return ""
 	}
 	if real, err := filepath.EvalSymlinks(exe); err == nil {
@@ -540,6 +667,14 @@ func humanSize(n int64) string {
 		return fmt.Sprintf("%.0f KB", float64(n)/unit)
 	}
 	return fmt.Sprintf("%d B", n)
+}
+
+func pidList(pids []int) string {
+	parts := make([]string, len(pids))
+	for i, pid := range pids {
+		parts[i] = strconv.Itoa(pid)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // tildify shortens a path under the home directory to ~/… for display.

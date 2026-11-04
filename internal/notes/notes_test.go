@@ -347,6 +347,8 @@ func TestDeleteLocalRefsLeavesRemoteAndOtherNotesAlone(t *testing.T) {
 	sha := git(t, a, "rev-parse", "HEAD")
 	addNote(t, a, "HEAD", `{"from":"a"}`)
 	git(t, a, "notes", "--ref=refs/notes/ai", "add", "-f", "-m", "another tool", "HEAD")
+	// Shares posthook's prefix but is not one of its refs.
+	git(t, a, "notes", "--ref=refs/notes/posthook-custom", "add", "-f", "-m", "someone's own", "HEAD")
 	if err := Push(a, "origin"); err != nil {
 		t.Fatalf("push: %v", err)
 	}
@@ -365,6 +367,9 @@ func TestDeleteLocalRefsLeavesRemoteAndOtherNotesAlone(t *testing.T) {
 	}
 	if !RefExists(a, "refs/notes/ai") {
 		t.Fatal("another tool's notes ref was deleted")
+	}
+	if !RefExists(a, "refs/notes/posthook-custom") {
+		t.Fatal("a notes ref that merely shares posthook's prefix was deleted")
 	}
 	if DeleteLocalRefs(a) != 0 {
 		t.Fatal("second DeleteLocalRefs should find nothing")

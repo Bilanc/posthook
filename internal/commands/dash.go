@@ -274,19 +274,17 @@ func stopDash() error {
 		_ = os.Remove(paths.DashPidFile())
 		return nil
 	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		if sigErr := proc.Signal(syscall.SIGTERM); sigErr != nil && !errIsFinished(sigErr) {
-			logx.Warnf("could not signal dashboard process %d: %v", pid, sigErr)
-		} else {
-			logx.Infof("Stopped dashboard server (pid %d).", pid)
+	// Wait for the server to actually go away: it holds the database open
+	// and, during an uninstall, the directory it runs from is about to be
+	// deleted. A stale pid file (server already gone) is just cleaned up.
+	if processAlive(pid) {
+		if alive := terminateAndWait([]int{pid}, stopGrace); len(alive) > 0 {
+			return fmt.Errorf("dashboard server (pid %d) did not exit", pid)
 		}
+		logx.Infof("Stopped dashboard server (pid %d).", pid)
 	}
 	_ = os.Remove(paths.DashPidFile())
 	return nil
-}
-
-func errIsFinished(err error) bool {
-	return err == os.ErrProcessDone || err.Error() == "os: process already finished"
 }
 
 // portOpen reports whether something is accepting TCP connections at addr.

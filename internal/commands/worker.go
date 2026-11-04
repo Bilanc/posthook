@@ -117,14 +117,10 @@ func runWorker(managed bool) error {
 	}
 }
 
-// workerStopWait bounds how long stopWorker waits for a signalled worker to
-// release the singleton lock.
-const workerStopWait = 5 * time.Second
-
-// stopWorker asks a running worker to exit and waits for it to release the
-// singleton lock. The worker records its pid in the lock file; one started by
-// an older binary left it empty, so pgrep is the fallback. Returns true when
-// a worker was running (whether or not it could be stopped — the error says).
+// stopWorker asks a running spool worker to exit and waits for it to let go
+// of the lock: SIGTERM, a grace period, then SIGKILL. Returns whether a
+// worker was running at all, and an error if one is still holding the lock
+// afterwards (or could not be identified).
 func stopWorker() (bool, error) {
 	if !workerRunning() {
 		return false, nil
@@ -133,43 +129,25 @@ func stopWorker() (bool, error) {
 	if len(pids) == 0 {
 		return true, errors.New("a worker holds the lock but its pid could not be found; it exits on its own within 2 minutes")
 	}
-	for _, pid := range pids {
-		if proc, err := os.FindProcess(pid); err == nil {
-			_ = proc.Signal(syscall.SIGTERM)
-		}
+	if alive := terminateAndWait(pids, stopGrace); len(alive) > 0 {
+		return true, fmt.Errorf("worker (pid %v) did not exit", alive)
 	}
-	deadline := time.Now().Add(workerStopWait)
-	for workerRunning() {
-		if time.Now().After(deadline) {
-			return true, fmt.Errorf("worker (pid %v) did not exit within %s", pids, workerStopWait)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if workerRunning() {
+		return true, fmt.Errorf("worker lock %s is still held after stopping pid %v", workerLockPath(), pids)
 	}
 	return true, nil
 }
 
-// workerPIDs returns the pid recorded in the lock file, or — when it is empty
-// (worker started by an older binary) — every process whose command line is
-// `posthook worker`, excluding ourselves.
+// workerPIDs finds the running worker: the pid it wrote into the lock file,
+// or — for a worker started by an older binary that did not record one — a
+// pgrep for its command line.
 func workerPIDs() []int {
 	if data, err := os.ReadFile(workerLockPath()); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
 			return []int{pid}
 		}
 	}
-	out, err := exec.Command("pgrep", "-f", "posthook worker").Output()
-	if err != nil {
-		return nil
-	}
-	var pids []int
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		pid, err := strconv.Atoi(strings.TrimSpace(line))
-		if err != nil || pid <= 0 || pid == os.Getpid() {
-			continue
-		}
-		pids = append(pids, pid)
-	}
-	return pids
+	return pgrepPIDs(ownProcessPattern("worker"))
 }
 
 // workerRunning reports whether a worker currently holds the singleton lock.
