@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 )
@@ -129,24 +128,44 @@ func TestOwnProcessPatternMatchesOnlyThisBinaryOrBarePosthook(t *testing.T) {
 	}
 }
 
-func TestProcessCommandReportsTheCommandLine(t *testing.T) {
-	marker := fmt.Sprintf("posthook-cmdline-test-%d", time.Now().UnixNano())
-	cmd := startChild(t, "sleep 30; echo "+marker)
-	deadline := time.Now().Add(2 * time.Second)
-	var got string
-	for !strings.Contains(got, marker) && time.Now().Before(deadline) {
-		got = processCommand(cmd.Process.Pid)
-		time.Sleep(50 * time.Millisecond)
+func TestParseElapsed(t *testing.T) {
+	cases := map[string]time.Duration{
+		"00:01":       time.Second,
+		"45:07":       45*time.Minute + 7*time.Second,
+		"01:02:03":    time.Hour + 2*time.Minute + 3*time.Second,
+		"44-10:01:05": 44*24*time.Hour + 10*time.Hour + time.Minute + 5*time.Second,
 	}
-	if !strings.Contains(got, marker) {
-		t.Fatalf("processCommand(%d) = %q, want it to contain %q", cmd.Process.Pid, got, marker)
+	for in, want := range cases {
+		got, ok := parseElapsed(in)
+		if !ok || got != want {
+			t.Errorf("parseElapsed(%q) = %v, %v; want %v, true", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "7", "a:b", "1:2:3:4", "x-01:02"} {
+		if _, ok := parseElapsed(bad); ok {
+			t.Errorf("parseElapsed(%q) should fail", bad)
+		}
+	}
+}
+
+func TestProcessStartedBeforeTellsAFreshPidFromAnOldOne(t *testing.T) {
+	cmd := startChild(t, "sleep 30; :")
+	pid := cmd.Process.Pid
+	time.Sleep(200 * time.Millisecond)
+	if !processStartedBefore(pid, time.Now()) {
+		t.Fatal("a process started a moment ago should count as started before now")
+	}
+	// A pid file written a minute before this process existed must not vouch
+	// for it: that is what pid reuse looks like.
+	if processStartedBefore(pid, time.Now().Add(-time.Minute)) {
+		t.Fatal("a process should not count as started before a time that predates it")
 	}
 	_ = cmd.Process.Kill()
-	deadline = time.Now().Add(2 * time.Second)
-	for processCommand(cmd.Process.Pid) != "" && time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
+	deadline := time.Now().Add(2 * time.Second)
+	for processAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
 	}
-	if got := processCommand(cmd.Process.Pid); got != "" {
-		t.Fatalf("processCommand after exit = %q, want empty", got)
+	if processStartedBefore(pid, time.Now()) {
+		t.Fatal("an exited process should not count as started at all")
 	}
 }

@@ -276,13 +276,13 @@ func stopDash() error {
 	}
 	// The pid file can outlive the server (a crash leaves it behind) and the
 	// OS may hand that pid to some other process, so never signal — let
-	// alone kill — a pid that is not running the dashboard bundle. A stale
-	// file is just cleaned up. When it is the server, wait for it to go
-	// away: it holds the database open and, during an uninstall, the
-	// directory it runs from is about to be deleted.
-	if cmdline := processCommand(pid); cmdline != "" {
-		if !isDashServerCommand(cmdline) {
-			logx.Warnf("pid %d in %s is not the dashboard server any more; removing the stale pid file.", pid, paths.DashPidFile())
+	// alone kill — a pid the file no longer vouches for. A stale file is
+	// just cleaned up. When it is the server, wait for it to go away: it
+	// holds the database open and, during an uninstall, the directory it
+	// runs from is about to be deleted.
+	if processAlive(pid) {
+		if !dashPidFileOwnedBy(pid) {
+			logx.Warnf("pid %d in %s started after the file was written, so it is not the dashboard; removing the stale pid file.", pid, paths.DashPidFile())
 			_ = os.Remove(paths.DashPidFile())
 			return nil
 		}
@@ -295,18 +295,24 @@ func stopDash() error {
 	return nil
 }
 
-// isDashServerCommand reports whether a process command line is the
-// dashboard server startDashDaemon launched: node running the bundle's
-// server.js.
-func isDashServerCommand(cmdline string) bool {
-	return strings.Contains(cmdline, paths.DashServer())
+// dashPidFileOwnedBy reports whether pid is still the server that wrote
+// dash.pid: it must already have been running when the file was written.
+// A pid the OS has since reused fails this, because its new owner started
+// later. The command line is no use as an identity check — Next.js
+// retitles its process to "next-server (v…)", which is all ps shows.
+func dashPidFileOwnedBy(pid int) bool {
+	st, err := os.Stat(paths.DashPidFile())
+	if err != nil {
+		return false
+	}
+	return processStartedBefore(pid, st.ModTime())
 }
 
 // runningDashPID returns the pid in dash.pid when that process is still the
 // dashboard server, else 0.
 func runningDashPID() int {
 	pid := trackedDashPID()
-	if pid <= 0 || !isDashServerCommand(processCommand(pid)) {
+	if pid <= 0 || !processAlive(pid) || !dashPidFileOwnedBy(pid) {
 		return 0
 	}
 	return pid

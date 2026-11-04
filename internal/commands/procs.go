@@ -92,15 +92,57 @@ func ownProcessPattern(subcommand string) string {
 	return "^(" + strings.Join(alts, "|") + ") " + regexp.QuoteMeta(subcommand) + "( .*)?$"
 }
 
-// processCommand returns pid's command line as ps reports it, or "" when
-// the process is gone. Used to check that a pid read from a file still
-// belongs to the process that wrote it, since the OS reuses pids.
-func processCommand(pid int) string {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
-	if err != nil {
-		return ""
+// pidFileTolerance absorbs the one-second resolution of ps's elapsed time
+// plus the moment between a process starting and its pid being written down.
+const pidFileTolerance = 5 * time.Second
+
+// processStartedBefore reports whether pid was already running at t. A pid
+// read from a file is only as good as the process that wrote it: once that
+// process is gone the OS may hand the pid to something else, and that
+// something necessarily started after the file was written. Start time is
+// derived from ps's elapsed time, which both macOS and Linux report.
+func processStartedBefore(pid int, t time.Time) bool {
+	elapsed, ok := processElapsed(pid)
+	if !ok {
+		return false
 	}
-	return strings.TrimSpace(string(out))
+	started := time.Now().Add(-elapsed)
+	return !started.After(t.Add(pidFileTolerance))
+}
+
+// processElapsed is how long pid has been running according to ps, or
+// ok=false when the process is gone.
+func processElapsed(pid int) (time.Duration, bool) {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "etime=").Output()
+	if err != nil {
+		return 0, false
+	}
+	return parseElapsed(strings.TrimSpace(string(out)))
+}
+
+// parseElapsed parses ps's etime column: [[dd-]hh:]mm:ss.
+func parseElapsed(s string) (time.Duration, bool) {
+	var days int64
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		d, err := strconv.ParseInt(s[:i], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		days, s = d, s[i+1:]
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, false
+	}
+	var secs int64
+	for _, part := range parts {
+		n, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		secs = secs*60 + n
+	}
+	return time.Duration(days*86400+secs) * time.Second, true
 }
 
 // syncLoopPIDs finds this install's resident sync daemon (`posthook sync
