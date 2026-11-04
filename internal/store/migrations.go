@@ -150,3 +150,64 @@ func (db *DB) normalizeEventTypes() error {
 	_, err := db.Exec(`UPDATE events SET event_type = 'PostToolUse' WHERE event_type = 'postToolUse'`)
 	return err
 }
+
+// trimStoredPayloads rewrites every event payload through TrimPayload (the
+// v14 step). Rows are read in rowid batches and updated in one transaction
+// per batch so the write lock is held briefly; rows already in the stored
+// shape come back byte-identical and are skipped. synced_at is left alone:
+// the cloud holds the full rows and the trimmed copy is a strict subset.
+// Returns the rows rewritten and the bytes dropped.
+func (db *DB) trimStoredPayloads() (rows int, dropped int64, err error) {
+	const batch = 500
+	type row struct {
+		rowid   int64
+		payload []byte
+	}
+	last := int64(0)
+	for {
+		rs, err := db.Query(`
+			SELECT rowid, payload FROM events
+			WHERE rowid > ? AND payload IS NOT NULL
+			ORDER BY rowid LIMIT ?`, last, batch)
+		if err != nil {
+			return rows, dropped, err
+		}
+		var pending []row
+		for rs.Next() {
+			var r row
+			if err := rs.Scan(&r.rowid, &r.payload); err != nil {
+				rs.Close()
+				return rows, dropped, err
+			}
+			pending = append(pending, r)
+		}
+		rs.Close()
+		if err := rs.Err(); err != nil {
+			return rows, dropped, err
+		}
+		if len(pending) == 0 {
+			return rows, dropped, nil
+		}
+		last = pending[len(pending)-1].rowid
+
+		tx, err := db.Begin()
+		if err != nil {
+			return rows, dropped, err
+		}
+		for _, r := range pending {
+			trimmed, n := TrimPayload(r.payload)
+			if n == 0 {
+				continue
+			}
+			if _, err := tx.Exec(`UPDATE events SET payload = ? WHERE rowid = ?`, string(trimmed), r.rowid); err != nil {
+				_ = tx.Rollback()
+				return rows, dropped, err
+			}
+			rows++
+			dropped += int64(n)
+		}
+		if err := tx.Commit(); err != nil {
+			return rows, dropped, err
+		}
+	}
+}

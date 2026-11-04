@@ -70,7 +70,7 @@ posthook dash                   # open the web dashboard (needs Node >=24)
 
 | Source | How | What |
 |---|---|---|
-| **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call, full payload, session end, model. `Bash` heredoc writes are line-attributed too. |
+| **Claude Code** | hooks in `~/.claude/settings.json` (`PostToolUse`, `Stop`) | every edit/tool call (inputs, not tool output — see [Privacy](#privacy)), session end, model. `Bash` heredoc writes are line-attributed too. |
 | **Cursor** | hooks in `~/.cursor/hooks.json` (`postToolUse`, `beforeSubmitPrompt`, `afterFileEdit`) | every tool call + prompt submission |
 | **Codex CLI** | inline hooks in `~/.codex/config.toml` (`PostToolUse`, `Stop`) + `features.hooks = true` | every tool call + session end |
 | **Devin** (cloud agent) | Devin hooks (`PostToolUse`, `UserPromptSubmit`, `Stop`) calling `posthook ingest --agent devin`, installed via the [`plugins/devin`](plugins/devin) Devin plugin or `.devin/hooks.v1.json`; binary installed by the Devin blueprint. See the [docs](https://docs.bilanc.co/posthook/cloud-agents). | every tool call + prompt submission, with line ranges for `edit`/`write` |
@@ -165,7 +165,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 By default, everything stays in `~/.posthook/posthook.db` on your machine. No HTTP calls, no telemetry, no account.
 
 **What's stored locally:**
-- **Tool-call payloads, verbatim**, in `events.payload`. For `Edit` calls this includes `old_string` and `new_string`; for `Bash` calls, the command. If your environment requires redaction, the place to add it is `internal/ingest/ingest.go` (see `ProcessAgentEnvelope`).
+- **Tool-call payloads minus the tool output**, in `events.payload`. The hook payload's `tool_response` / `tool_output` (the file a `Read` returned, a `Bash` command's stdout, the pre-edit file an `Edit` echoes back, images) is dropped before the row is written; only its boolean/number flags and the first 2 KB of `stderr` are kept, and a `_posthook_trim` marker records how many bytes were dropped. Everything else is kept as sent — for `Edit` calls that includes `old_string` and `new_string`; for `Bash` calls, the command — with any single string capped at 256 KB. The rule lives in `internal/store/payload.go` (`TrimPayload`); if your environment needs more redaction, that is the place to add it. Upgrading to this version rewrites existing rows the same way once and compacts the file.
 - Absolute file paths, plus a derived repo-relative path.
 - Commit metadata (author email, message subject, file paths) from your local git.
 
