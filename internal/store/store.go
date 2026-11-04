@@ -125,6 +125,11 @@ func (db *DB) migrate() error {
 	// every backfill here would make a performance-only upgrade scan the whole
 	// database again.
 	if currentVersion >= 12 {
+		if currentVersion < 14 {
+			if err := db.compactStoredPayloads(); err != nil {
+				return err
+			}
+		}
 		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
 			return err
 		}
@@ -180,11 +185,35 @@ func (db *DB) migrate() error {
 		return err
 	}
 
+	if currentVersion < 14 {
+		if err := db.compactStoredPayloads(); err != nil {
+			return err
+		}
+	}
+
 	if currentVersion < schemaVersion {
 		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// compactStoredPayloads is the v14 upgrade step: trim every stored payload,
+// then VACUUM so the freed pages leave the file. A VACUUM needs the database
+// to itself for a moment and as much free disk as the file is large, so a
+// failure there (dashboard holding a read, disk full) is not an upgrade
+// failure — the rows are already trimmed and `posthook prune --vacuum`
+// reclaims the space later.
+func (db *DB) compactStoredPayloads() error {
+	if _, _, err := db.trimStoredPayloads(); err != nil {
+		return fmt.Errorf("trim stored payloads: %w", err)
+	}
+	_, _ = db.Exec(`VACUUM`)
+	// VACUUM writes the rebuilt file through the WAL; fold it back in now so
+	// the shrink shows on disk instead of sitting in posthook.db-wal until
+	// the next checkpoint.
+	_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
 	return nil
 }
 
