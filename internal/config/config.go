@@ -1,12 +1,12 @@
 // Package config loads and saves the posthook user-level config from
 // ~/.posthook/config.json. It carries cloud-sync settings — endpoint, install
-// token, enabled flag, flush interval — and the engineer identity stamped on
-// every session.
+// token, enabled flag, flush interval — the engineer identity stamped on
+// every session, and the local storage retention window.
 //
 // Env vars override the on-disk file so devs can point a single binary at a
 // staging endpoint without rewriting their config: POSTHOOK_CLOUD_ENDPOINT,
 // POSTHOOK_CLOUD_TOKEN, POSTHOOK_CLOUD_ENABLED, POSTHOOK_CLOUD_FLUSH_SECS,
-// POSTHOOK_ENGINEER_EMAIL, POSTHOOK_ENGINEER_NAME.
+// POSTHOOK_ENGINEER_EMAIL, POSTHOOK_ENGINEER_NAME, POSTHOOK_RETENTION_DAYS.
 package config
 
 import (
@@ -26,11 +26,37 @@ import (
 // near-real-time landing, not more load when idle.
 const defaultFlushSeconds = 5
 
+// DefaultRetentionDays is how long events and prompts are kept in the local
+// store when storage.retention_days is unset. A year covers every dashboard
+// window while bounding the database on a busy machine.
+const DefaultRetentionDays = 365
+
 // Config is the on-disk shape of ~/.posthook/config.json. Add fields as the
 // product grows; unknown JSON fields are ignored on load.
 type Config struct {
 	Cloud    CloudConfig    `json:"cloud"`
 	Engineer EngineerConfig `json:"engineer"`
+	Storage  StorageConfig  `json:"storage"`
+}
+
+// StorageConfig bounds the local SQLite store. RetentionDays is a pointer so
+// an absent key (default: DefaultRetentionDays) is distinguishable from an
+// explicit 0, which means keep everything forever.
+type StorageConfig struct {
+	RetentionDays *int `json:"retention_days,omitempty"`
+}
+
+// RetentionDays resolves the configured retention window: nil means
+// DefaultRetentionDays; an explicit zero or negative value means 0, i.e. keep
+// forever and never prune.
+func (c Config) RetentionDays() int {
+	if c.Storage.RetentionDays == nil {
+		return DefaultRetentionDays
+	}
+	if *c.Storage.RetentionDays <= 0 {
+		return 0
+	}
+	return *c.Storage.RetentionDays
 }
 
 // EngineerConfig identifies the human behind this machine's sessions. Email is
@@ -49,10 +75,10 @@ type EngineerConfig struct {
 // Endpoint is the FastAPI base URL (e.g. https://api.bilanc.co); the sync
 // command appends /posthook/ingest. Token is the team install token.
 type CloudConfig struct {
-	Endpoint            string `json:"endpoint,omitempty"`
-	Token               string `json:"token,omitempty"`
-	Enabled             bool   `json:"enabled"`
-	FlushIntervalSecs   int    `json:"flush_interval_seconds,omitempty"`
+	Endpoint          string `json:"endpoint,omitempty"`
+	Token             string `json:"token,omitempty"`
+	Enabled           bool   `json:"enabled"`
+	FlushIntervalSecs int    `json:"flush_interval_seconds,omitempty"`
 }
 
 // Path returns the absolute path to the on-disk config file.
@@ -90,6 +116,11 @@ func Load() (Config, error) {
 	}
 	if v := os.Getenv("POSTHOOK_ENGINEER_NAME"); v != "" {
 		c.Engineer.Name = v
+	}
+	if v := os.Getenv("POSTHOOK_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Storage.RetentionDays = &n
+		}
 	}
 	if c.Cloud.FlushIntervalSecs <= 0 {
 		c.Cloud.FlushIntervalSecs = defaultFlushSeconds
