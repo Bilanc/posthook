@@ -93,7 +93,7 @@ type uninstallPlan struct {
 	serviceInstalled bool
 	serviceStatus    string
 	syncLoopPIDs     []int // resident `posthook sync --loop` processes, daemon or hand-run
-	dashPID          int   // 0 when no dashboard server is running
+	dashPID          int   // 0 when no dashboard server is running (a stale pid file does not count)
 	workerRunning    bool
 	spoolPending     int
 	cloudConfigured  bool
@@ -141,9 +141,7 @@ func gatherUninstallPlan(keepData bool) uninstallPlan {
 		p.serviceStatus = service.Status()
 	}
 	p.syncLoopPIDs = syncLoopPIDs()
-	if pid := trackedDashPID(); pid > 0 && processAlive(pid) {
-		p.dashPID = pid
-	}
+	p.dashPID = runningDashPID()
 	// workerRunning probes with O_CREATE, so only ask when the lock file is
 	// already there — a dry run must not leave anything behind.
 	if _, err := os.Stat(workerLockPath()); err == nil {

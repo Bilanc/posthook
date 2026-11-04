@@ -274,10 +274,18 @@ func stopDash() error {
 		_ = os.Remove(paths.DashPidFile())
 		return nil
 	}
-	// Wait for the server to actually go away: it holds the database open
-	// and, during an uninstall, the directory it runs from is about to be
-	// deleted. A stale pid file (server already gone) is just cleaned up.
-	if processAlive(pid) {
+	// The pid file can outlive the server (a crash leaves it behind) and the
+	// OS may hand that pid to some other process, so never signal — let
+	// alone kill — a pid that is not running the dashboard bundle. A stale
+	// file is just cleaned up. When it is the server, wait for it to go
+	// away: it holds the database open and, during an uninstall, the
+	// directory it runs from is about to be deleted.
+	if cmdline := processCommand(pid); cmdline != "" {
+		if !isDashServerCommand(cmdline) {
+			logx.Warnf("pid %d in %s is not the dashboard server any more; removing the stale pid file.", pid, paths.DashPidFile())
+			_ = os.Remove(paths.DashPidFile())
+			return nil
+		}
 		if alive := terminateAndWait([]int{pid}, stopGrace); len(alive) > 0 {
 			return fmt.Errorf("dashboard server (pid %d) did not exit", pid)
 		}
@@ -285,6 +293,23 @@ func stopDash() error {
 	}
 	_ = os.Remove(paths.DashPidFile())
 	return nil
+}
+
+// isDashServerCommand reports whether a process command line is the
+// dashboard server startDashDaemon launched: node running the bundle's
+// server.js.
+func isDashServerCommand(cmdline string) bool {
+	return strings.Contains(cmdline, paths.DashServer())
+}
+
+// runningDashPID returns the pid in dash.pid when that process is still the
+// dashboard server, else 0.
+func runningDashPID() int {
+	pid := trackedDashPID()
+	if pid <= 0 || !isDashServerCommand(processCommand(pid)) {
+		return 0
+	}
+	return pid
 }
 
 // portOpen reports whether something is accepting TCP connections at addr.

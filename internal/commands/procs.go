@@ -78,7 +78,8 @@ func pgrepPIDs(pattern string) []int {
 // ownProcessPattern builds a pgrep -f pattern for one of posthook's own
 // background processes running subcommand: this executable by path (how
 // launchd / systemd and spawnWorker start it) or a bare `posthook` from PATH
-// (how a person starts one by hand). Processes of another install — a dev
+// (how a person starts one by hand), followed by the subcommand and any
+// further flags (`worker --managed`). Processes of another install — a dev
 // build running from a scratch HOME, say — are not ours to stop.
 func ownProcessPattern(subcommand string) string {
 	alts := []string{"posthook"}
@@ -88,7 +89,18 @@ func ownProcessPattern(subcommand string) string {
 			alts = append(alts, regexp.QuoteMeta(real))
 		}
 	}
-	return "^(" + strings.Join(alts, "|") + ") " + regexp.QuoteMeta(subcommand) + "$"
+	return "^(" + strings.Join(alts, "|") + ") " + regexp.QuoteMeta(subcommand) + "( .*)?$"
+}
+
+// processCommand returns pid's command line as ps reports it, or "" when
+// the process is gone. Used to check that a pid read from a file still
+// belongs to the process that wrote it, since the OS reuses pids.
+func processCommand(pid int) string {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // syncLoopPIDs finds this install's resident sync daemon (`posthook sync

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,11 +107,46 @@ func TestOwnProcessPatternMatchesOnlyThisBinaryOrBarePosthook(t *testing.T) {
 	for _, dont := range []string{
 		"/somewhere/else/posthook sync --loop", // another install's daemon
 		exe + " sync",                          // one-shot flush, not the loop
+		exe + " sync --loopy",
 		"posthook worker",
 		"vim posthook sync --loop",
 	} {
 		if pat.MatchString(dont) {
 			t.Errorf("%q should not match %s", dont, pat)
 		}
+	}
+
+	// Trailing flags belong to the same process: a managed worker is still
+	// a worker.
+	worker := regexp.MustCompile(ownProcessPattern("worker"))
+	for _, want := range []string{exe + " worker", exe + " worker --managed", "posthook worker --managed"} {
+		if !worker.MatchString(want) {
+			t.Errorf("%q should match %s", want, worker)
+		}
+	}
+	if worker.MatchString(exe + " workers") {
+		t.Errorf("%q should not match %s", exe+" workers", worker)
+	}
+}
+
+func TestProcessCommandReportsTheCommandLine(t *testing.T) {
+	marker := fmt.Sprintf("posthook-cmdline-test-%d", time.Now().UnixNano())
+	cmd := startChild(t, "sleep 30; echo "+marker)
+	deadline := time.Now().Add(2 * time.Second)
+	var got string
+	for !strings.Contains(got, marker) && time.Now().Before(deadline) {
+		got = processCommand(cmd.Process.Pid)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(got, marker) {
+		t.Fatalf("processCommand(%d) = %q, want it to contain %q", cmd.Process.Pid, got, marker)
+	}
+	_ = cmd.Process.Kill()
+	deadline = time.Now().Add(2 * time.Second)
+	for processCommand(cmd.Process.Pid) != "" && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := processCommand(cmd.Process.Pid); got != "" {
+		t.Fatalf("processCommand after exit = %q, want empty", got)
 	}
 }
