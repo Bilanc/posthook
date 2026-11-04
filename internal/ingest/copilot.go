@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/bilanc/posthook/internal/lineranges"
 	"github.com/bilanc/posthook/internal/paths"
 )
 
@@ -72,6 +71,9 @@ func normalizeCopilotPayload(payload map[string]any) map[string]any {
 
 	toolName, _ := payload["tool_name"].(string)
 	if name, input, ok := canonicalCopilotTool(toolName, payload["tool_input"]); ok {
+		if name != toolName {
+			payload["copilot_tool_name"] = toolName
+		}
 		payload["tool_name"] = name
 		payload["tool_input"] = input
 	}
@@ -133,6 +135,10 @@ func canonicalCopilotToolMap(toolName string, ti map[string]any) (string, any, b
 	}
 
 	// VS Code multi_replace_string_in_file: {replacements: [{filePath, oldString, newString}]}.
+	// One file becomes a MultiEdit; several files become a synthetic
+	// apply_patch so the stored event carries lines_added/lines_removed and
+	// every downstream reader (metrics, dashboard, backfills) treats it like
+	// Codex's and Copilot's own multi-file patches.
 	if reps, ok := ti["replacements"].([]any); ok {
 		files := groupCopilotReplacements(reps)
 		if len(files) == 0 {
@@ -141,11 +147,7 @@ func canonicalCopilotToolMap(toolName string, ti map[string]any) (string, any, b
 		if len(files) == 1 {
 			return "MultiEdit", map[string]any{"file_path": files[0]["file_path"], "edits": files[0]["edits"]}, true
 		}
-		asAny := make([]any, len(files))
-		for i, f := range files {
-			asAny[i] = f
-		}
-		return "multi_replace_string_in_file", map[string]any{"file_path": files[0]["file_path"], "files": asAny}, true
+		return "apply_patch", map[string]any{"command": replacementsAsPatch(files)}, true
 	}
 
 	filePath, hasPath := firstString(ti, "file_path", "path", "filePath")
@@ -220,47 +222,39 @@ func groupCopilotReplacements(reps []any) []map[string]any {
 	return files
 }
 
-// copilotMultiFileEdits turns a normalized multi-file replacement into the
-// per-file edit list the apply_patch line-range path consumes.
-func copilotMultiFileEdits(payload map[string]any) []lineranges.ApplyPatchFile {
-	if payload["tool_name"] != "multi_replace_string_in_file" {
-		return nil
-	}
-	ti, _ := payload["tool_input"].(map[string]any)
-	files, _ := ti["files"].([]any)
-	var out []lineranges.ApplyPatchFile
+// replacementsAsPatch renders grouped replacements as apply_patch text: one
+// "*** Update File:" section per file, each replacement as a hunk of "-"
+// old lines followed by "+" new lines, which is what lineranges.ParseApplyPatch
+// reads back.
+func replacementsAsPatch(files []map[string]any) string {
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n")
 	for _, f := range files {
-		fm, ok := f.(map[string]any)
-		if !ok {
-			continue
-		}
-		fp, _ := fm["file_path"].(string)
-		edits, _ := fm["edits"].([]any)
-		if fp == "" || len(edits) == 0 {
-			continue
-		}
-		file := lineranges.ApplyPatchFile{FilePath: fp}
+		fp, _ := f["file_path"].(string)
+		edits, _ := f["edits"].([]any)
+		b.WriteString("*** Update File: " + fp + "\n")
 		for _, e := range edits {
-			em, ok := e.(map[string]any)
-			if !ok {
-				continue
-			}
+			em, _ := e.(map[string]any)
 			oldStr, _ := em["old_string"].(string)
 			newStr, _ := em["new_string"].(string)
-			file.Edits = append(file.Edits, lineranges.Edit{OldString: oldStr, NewString: newStr})
-			file.LinesAdded += countLines(newStr)
-			file.LinesRemoved += countLines(oldStr)
+			b.WriteString("@@\n")
+			for _, line := range patchLines(oldStr) {
+				b.WriteString("-" + line + "\n")
+			}
+			for _, line := range patchLines(newStr) {
+				b.WriteString("+" + line + "\n")
+			}
 		}
-		out = append(out, file)
 	}
-	return out
+	b.WriteString("*** End Patch\n")
+	return b.String()
 }
 
-func countLines(s string) int {
+func patchLines(s string) []string {
 	if s == "" {
-		return 0
+		return nil
 	}
-	return strings.Count(strings.TrimSuffix(s, "\n"), "\n") + 1
+	return strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 }
 
 // copilotTranscriptPath returns the transcript for a Copilot session: the

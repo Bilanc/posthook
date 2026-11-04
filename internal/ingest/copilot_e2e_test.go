@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,6 +117,7 @@ func TestCopilotEndToEnd(t *testing.T) {
 	home := isolateIngest(t)
 	t.Run("cli apply_patch then Stop", func(t *testing.T) { testCopilotCLISession(t, home) })
 	t.Run("vscode apply_patch", func(t *testing.T) { testCopilotVSCodeApplyPatch(t, home) })
+	t.Run("cli create without located ranges", func(t *testing.T) { testCopilotCreateWithoutRanges(t, home) })
 	t.Run("claude-code delivery of a Copilot event is dropped", func(t *testing.T) { testCopilotCompatDuplicateDropped(t, home) })
 }
 
@@ -154,6 +156,18 @@ func testCopilotCLISession(t *testing.T, home string) {
 	if linesAdded.Int64 != 2 || linesRemoved.Int64 != 1 {
 		t.Errorf("patch totals = +%d/-%d, want +2/-1", linesAdded.Int64, linesRemoved.Int64)
 	}
+	// The stored payload is the normalized one: metrics and the dashboard
+	// select edits by json_extract(payload, '$.tool_name') and count lines
+	// from lines_added for apply_patch, so the CLI's "Edit" + patch string
+	// must be persisted as apply_patch.
+	var storedTool, originalTool, patch sql.NullString
+	if err := db.QueryRow(`SELECT json_extract(payload, '$.tool_name'), json_extract(payload, '$.copilot_tool_name'), json_extract(payload, '$.tool_input.command') FROM events WHERE session_id = ? AND event_type = 'PostToolUse'`, "60a0ed8e").
+		Scan(&storedTool, &originalTool, &patch); err != nil {
+		t.Fatalf("stored payload: %v", err)
+	}
+	if storedTool.String != "apply_patch" || originalTool.String != "Edit" || !patch.Valid {
+		t.Errorf("stored payload tool=%q original=%q patch present=%v", storedTool.String, originalTool.String, patch.Valid)
+	}
 	if got := rangesForSession(t, db, "60a0ed8e"); len(got) != 1 || got[0] != (rangeRow{4, 5}) {
 		t.Errorf("line ranges = %+v, want [{4 5}]", got)
 	}
@@ -186,6 +200,34 @@ func testCopilotCLISession(t *testing.T, home string) {
 	}
 	if prompts != 1 {
 		t.Errorf("prompts = %d, want 1", prompts)
+	}
+}
+
+// testCopilotCreateWithoutRanges covers the metrics fallback: a Copilot CLI
+// create whose file cannot be read back yields no line ranges, so the stored
+// payload must carry Write + content for the line count to come from the
+// payload (the metrics CASE: located ranges, else apply_patch totals, else
+// new_string/content newlines).
+func testCopilotCreateWithoutRanges(t *testing.T, home string) {
+	repo := filepath.Join(home, "repo-create")
+	initRepo(t, repo)
+	deliver(t, copilotAgentSlug, repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "create-1", "cwd": repo,
+		"tool_name":   "Write",
+		"tool_input":  map[string]any{"path": "src/new.go", "file_text": "package x\n\nfunc A() {}\n"},
+		"tool_result": map[string]any{"result_type": "success", "text_result_for_llm": "Created src/new.go"},
+	})
+	db := openDB(t)
+	var storedTool, content, filePath sql.NullString
+	if err := db.QueryRow(`SELECT json_extract(payload, '$.tool_name'), json_extract(payload, '$.tool_input.content'), file_path FROM events WHERE session_id = ?`, "create-1").
+		Scan(&storedTool, &content, &filePath); err != nil {
+		t.Fatalf("stored payload: %v", err)
+	}
+	if storedTool.String != "Write" || content.String != "package x\n\nfunc A() {}\n" || !strings.HasSuffix(filePath.String, "src/new.go") {
+		t.Errorf("stored tool=%q content=%q file=%q", storedTool.String, content.String, filePath.String)
+	}
+	if got := rangesForSession(t, db, "create-1"); len(got) != 0 {
+		t.Errorf("no file on disk, so no ranges expected, got %+v", got)
 	}
 }
 

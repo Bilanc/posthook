@@ -153,28 +153,39 @@ func TestNormalizeCopilotPayloadLeavesNonToolEventsAlone(t *testing.T) {
 	}
 }
 
-func TestCopilotMultiFileEdits(t *testing.T) {
+func TestCopilotMultiFileReplacementsBecomeApplyPatch(t *testing.T) {
 	p := normalizeCopilotPayload(map[string]any{"hook_event_name": "PostToolUse", "tool_name": "multi_replace_string_in_file",
 		"tool_input": map[string]any{"replacements": []any{
 			map[string]any{"filePath": "/w/a.go", "oldString": "x", "newString": "y\nz"},
 			map[string]any{"filePath": "/w/b.go", "oldString": "p\nq", "newString": "r"},
 			map[string]any{"filePath": "/w/a.go", "oldString": "m", "newString": "n"},
 		}}})
-	if p["tool_name"] != "multi_replace_string_in_file" {
-		t.Fatalf("tool_name = %v", p["tool_name"])
+	if p["tool_name"] != "apply_patch" || p["copilot_tool_name"] != "multi_replace_string_in_file" {
+		t.Fatalf("tool_name = %v (from %v)", p["tool_name"], p["copilot_tool_name"])
 	}
-	if extractFilePath(p) != "/w/a.go" {
-		t.Errorf("first file should be the event's file_path, got %q", extractFilePath(p))
-	}
-	files := copilotMultiFileEdits(p)
+	files := applyPatchFilesForPayload(p)
 	if len(files) != 2 {
 		t.Fatalf("files = %+v", files)
 	}
 	if files[0].FilePath != "/w/a.go" || len(files[0].Edits) != 2 || files[0].LinesAdded != 3 || files[0].LinesRemoved != 2 {
 		t.Errorf("a.go = %+v", files[0])
 	}
+	if files[0].Edits[0].NewString != "y\nz" || files[0].Edits[1].NewString != "n" {
+		t.Errorf("a.go edits = %+v", files[0].Edits)
+	}
 	if files[1].FilePath != "/w/b.go" || len(files[1].Edits) != 1 || files[1].LinesAdded != 1 || files[1].LinesRemoved != 2 {
 		t.Errorf("b.go = %+v", files[1])
+	}
+}
+
+func TestNormalizeCopilotPayloadRecordsOriginalToolName(t *testing.T) {
+	p := normalizeCopilotPayload(map[string]any{"tool_name": "create", "tool_input": map[string]any{"path": "a.go", "file_text": "x"}})
+	if p["tool_name"] != "Write" || p["copilot_tool_name"] != "create" {
+		t.Errorf("got %v / %v", p["tool_name"], p["copilot_tool_name"])
+	}
+	p = normalizeCopilotPayload(map[string]any{"tool_name": "Edit", "tool_input": map[string]any{"file_path": "a.go", "old_string": "x", "new_string": "y"}})
+	if _, ok := p["copilot_tool_name"]; ok {
+		t.Error("an already-canonical name should not be recorded as renamed")
 	}
 }
 

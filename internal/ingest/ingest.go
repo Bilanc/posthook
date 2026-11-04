@@ -108,8 +108,16 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		logx.Debugf("ingest --agent %s: dropping copilot-compat duplicate event", agentSlug)
 		return nil
 	}
+	// Copilot's payload is stored in its normalized form: metrics, the
+	// dashboard and the backfills read tool_name / tool_input straight from
+	// events.payload and only know the canonical shapes (Edit/Write/MultiEdit
+	// with new_string/content, apply_patch with lines_added). The original
+	// tool name is kept under copilot_tool_name.
 	if agentSlug == copilotAgentSlug {
 		payload = normalizeCopilotPayload(payload)
+		if normalized, err := json.Marshal(payload); err == nil {
+			raw = normalized
+		}
 	}
 
 	id := uuid.NewString()
@@ -132,9 +140,6 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	}
 	workspaceRoots := extractWorkspaceRoots(payload)
 	applyPatchFiles := applyPatchFilesForPayload(payload)
-	if len(applyPatchFiles) == 0 {
-		applyPatchFiles = copilotMultiFileEdits(payload)
-	}
 	shellWrites := shellWritesForPayload(payload, eventType)
 	filePath := extractFilePath(payload)
 	if filePath == "" && len(applyPatchFiles) > 0 {
