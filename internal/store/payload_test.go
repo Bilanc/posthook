@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -147,6 +148,30 @@ func TestTrimPayloadIdempotentAndCumulative(t *testing.T) {
 	marker := decode(t, third)[TrimMarkerKey].(map[string]any)
 	if int(marker["dropped_bytes"].(float64)) != d1+d3 {
 		t.Errorf("marker %v, want %d", marker, d1+d3)
+	}
+}
+
+func TestTrimPayloadTruncationIsIdempotent(t *testing.T) {
+	huge := strings.Repeat("x", 2*MaxStoredStringBytes)
+	raw := []byte(`{"tool_name":"Write","tool_input":{"content":` + mustJSON(huge) + `},` +
+		`"tool_response":{"stderr":` + mustJSON(strings.Repeat("e", 2*MaxStoredStderrBytes)) + `}}`)
+	once, _ := TrimPayload(raw)
+	twice, d2 := TrimPayload(once)
+	if d2 != 0 || !bytes.Equal(once, twice) {
+		t.Fatalf("second pass changed a truncated payload (dropped %d)", d2)
+	}
+	m := decode(t, once)
+	content := m["tool_input"].(map[string]any)["content"].(string)
+	if len(content) > MaxStoredStringBytes {
+		t.Errorf("truncated content is %d bytes, over the %d cap", len(content), MaxStoredStringBytes)
+	}
+	wantCut := len(huge) - (MaxStoredStringBytes - truncMarkerReserve)
+	if !strings.HasSuffix(content, "[...posthook truncated "+strconv.Itoa(wantCut)+" bytes]") {
+		t.Errorf("marker should name the original cut: %q", content[len(content)-48:])
+	}
+	stderr := m["tool_response"].(map[string]any)["stderr"].(string)
+	if len(stderr) > MaxStoredStderrBytes {
+		t.Errorf("truncated stderr is %d bytes, over the %d cap", len(stderr), MaxStoredStderrBytes)
 	}
 }
 

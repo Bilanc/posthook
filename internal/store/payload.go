@@ -217,13 +217,22 @@ func truncateWalk(val any) (any, bool) {
 	return val, false
 }
 
-// truncateString keeps the first max bytes of s (on a rune boundary) and
-// records how much was cut in a trailing marker.
+// truncMarkerReserve is the room truncateString leaves inside max for its
+// marker, so a truncated string is itself within max and a second pass
+// returns it unchanged instead of re-cutting it and rewriting the marker.
+const truncMarkerReserve = 64
+
+// truncateString keeps the first max bytes of s (on a rune boundary, less
+// the marker reserve) and records how much was cut in a trailing marker.
 func truncateString(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	head := truncateUTF8([]byte(s), max)
+	keep := max - truncMarkerReserve
+	if keep < 0 {
+		keep = 0
+	}
+	head := truncateUTF8([]byte(s), keep)
 	return fmt.Sprintf("%s[...posthook truncated %d bytes]", head, len(s)-len(head))
 }
 
