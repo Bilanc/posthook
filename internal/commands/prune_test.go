@@ -56,3 +56,23 @@ func TestFmtBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestSatisfiesRetentionGate(t *testing.T) {
+	day := 24 * time.Hour
+	cases := []struct {
+		name          string
+		age           time.Duration
+		retentionDays int
+		want          bool
+	}{
+		{"configured age", 30 * day, 30, true},
+		{"stricter than configured", 7 * day, 30, true},
+		{"looser than configured", 90 * day, 30, false},
+		{"retention off", 90 * day, 0, false},
+	}
+	for _, c := range cases {
+		if got := satisfiesRetentionGate(c.age, c.retentionDays); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}

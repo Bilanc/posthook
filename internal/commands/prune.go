@@ -57,6 +57,17 @@ rebuilds the file so the space goes back to the filesystem.
 	return cmd
 }
 
+// satisfiesRetentionGate reports whether a manual prune of the given age
+// counts as the worker's daily pass. Only a pass at least as strict as the
+// configured retention does: recording a looser --older-than would postpone
+// the configured prune by a day.
+func satisfiesRetentionGate(age time.Duration, retentionDays int) bool {
+	if retentionDays <= 0 {
+		return false
+	}
+	return age <= time.Duration(retentionDays)*24*time.Hour
+}
+
 func runPrune(olderThan string, dryRun, vacuum, includeUnsynced bool) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -96,7 +107,7 @@ func runPrune(olderThan string, dryRun, vacuum, includeUnsynced bool) error {
 	if err != nil {
 		return err
 	}
-	if !dryRun {
+	if !dryRun && satisfiesRetentionGate(age, cfg.RetentionDays()) {
 		if err := db.RecordPrune(time.Now()); err != nil {
 			return err
 		}
