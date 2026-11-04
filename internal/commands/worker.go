@@ -1,10 +1,14 @@
 package commands
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -69,6 +73,11 @@ func runWorker(managed bool) error {
 		return nil
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	// Record our pid in the lock file so `posthook uninstall` can signal us.
+	// The flock is the real guard; the pid is advisory and only read while
+	// the lock is held.
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -106,6 +115,61 @@ func runWorker(managed bool) error {
 		case <-time.After(workerPollInterval):
 		}
 	}
+}
+
+// workerStopWait bounds how long stopWorker waits for a signalled worker to
+// release the singleton lock.
+const workerStopWait = 5 * time.Second
+
+// stopWorker asks a running worker to exit and waits for it to release the
+// singleton lock. The worker records its pid in the lock file; one started by
+// an older binary left it empty, so pgrep is the fallback. Returns true when
+// a worker was running (whether or not it could be stopped — the error says).
+func stopWorker() (bool, error) {
+	if !workerRunning() {
+		return false, nil
+	}
+	pids := workerPIDs()
+	if len(pids) == 0 {
+		return true, errors.New("a worker holds the lock but its pid could not be found; it exits on its own within 2 minutes")
+	}
+	for _, pid := range pids {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+		}
+	}
+	deadline := time.Now().Add(workerStopWait)
+	for workerRunning() {
+		if time.Now().After(deadline) {
+			return true, fmt.Errorf("worker (pid %v) did not exit within %s", pids, workerStopWait)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return true, nil
+}
+
+// workerPIDs returns the pid recorded in the lock file, or — when it is empty
+// (worker started by an older binary) — every process whose command line is
+// `posthook worker`, excluding ourselves.
+func workerPIDs() []int {
+	if data, err := os.ReadFile(workerLockPath()); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+			return []int{pid}
+		}
+	}
+	out, err := exec.Command("pgrep", "-f", "posthook worker").Output()
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid <= 0 || pid == os.Getpid() {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids
 }
 
 // workerRunning reports whether a worker currently holds the singleton lock.

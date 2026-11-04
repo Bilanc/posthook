@@ -15,6 +15,18 @@ import (
 
 const hookMarker = "# posthook v3"
 
+// hookMarkerPrefix matches the header line every version of the hook has
+// carried ("# posthook v1" … "# posthook v3"), so hooks left by older
+// releases are recognised as ours too — for overwriting on upgrade and for
+// removal on uninstall.
+const hookMarkerPrefix = "# posthook v"
+
+// isPosthookHook reports whether a post-commit hook's contents were written
+// by posthook (any version).
+func isPosthookHook(content string) bool {
+	return strings.Contains(content, hookMarkerPrefix)
+}
+
 func hookScript(binaryPath string) string {
 	// Fallback mode (no git shadow) can only observe commits, so the hook
 	// configures the notes fetch refspec here: an ordinary `git fetch` then
@@ -41,7 +53,7 @@ func writeHookFile(path, binaryPath string) (bool, error) {
 		if string(existing) == desired {
 			return false, nil
 		}
-		if !strings.Contains(string(existing), hookMarker) && strings.TrimSpace(string(existing)) != "" {
+		if !isPosthookHook(string(existing)) && strings.TrimSpace(string(existing)) != "" {
 			return false, fmt.Errorf(
 				"refusing to overwrite existing post-commit hook at %s. Move it aside and rerun.",
 				path)
@@ -118,4 +130,67 @@ func InstallRepoHook(repoPath, binaryPath string) (Result, error) {
 		Path:    hookPath,
 		Message: fmt.Sprintf("Repo hook (%s): %s", hookPath, strings.Join(parts, ", ")),
 	}, nil
+}
+
+// GlobalGitTemplateActive reports whether init.templateDir currently points
+// at posthook's template dir.
+func GlobalGitTemplateActive() bool {
+	return gitx.Run("", "config", "--global", "--get", "init.templateDir") == paths.GitTemplateDir()
+}
+
+// UninstallGlobalGitTemplate unsets init.templateDir when it points at
+// posthook's template dir, so `git init` stops copying our hook into new
+// repos. A templateDir pointing anywhere else is the user's and is left
+// alone. The template dir itself is removed along with ~/.posthook.
+func UninstallGlobalGitTemplate() (Result, error) {
+	current := gitx.Run("", "config", "--global", "--get", "init.templateDir")
+	switch {
+	case current == "":
+		return Result{Message: "Git template: init.templateDir not set"}, nil
+	case current != paths.GitTemplateDir():
+		return Result{Message: fmt.Sprintf("Git template: init.templateDir points at %s, not posthook's — left as is", current)}, nil
+	}
+	if err := gitx.Exec("", "config", "--global", "--unset", "init.templateDir"); err != nil {
+		return Result{}, err
+	}
+	return Result{Changed: true, Message: "Git template: init.templateDir unset"}, nil
+}
+
+// RemoveRepoHook deletes the per-repo post-commit hook from repoPath when it
+// is one posthook wrote (any version). A hook posthook didn't write, or a
+// path that isn't a git repo, is left untouched. Both the repo's own git dir
+// and the common dir are checked, so a worktree is cleaned too. Returns true
+// iff a hook was removed.
+func RemoveRepoHook(repoPath string) (bool, error) {
+	removed := false
+	seen := map[string]bool{}
+	for _, flag := range []string{"--git-dir", "--git-common-dir"} {
+		gitDir := gitx.Run(repoPath, "rev-parse", flag)
+		if gitDir == "" {
+			continue
+		}
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(repoPath, gitDir)
+		}
+		hookPath := filepath.Join(gitDir, "hooks", "post-commit")
+		if seen[hookPath] {
+			continue
+		}
+		seen[hookPath] = true
+		existing, err := os.ReadFile(hookPath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return removed, err
+		}
+		if !isPosthookHook(string(existing)) {
+			continue
+		}
+		if err := os.Remove(hookPath); err != nil {
+			return removed, err
+		}
+		removed = true
+	}
+	return removed, nil
 }

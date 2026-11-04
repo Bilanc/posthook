@@ -2,6 +2,7 @@ package installers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -164,7 +165,9 @@ func InstallClaudeCodeHooks(binaryPath string) (Result, error) {
 
 // stripClaudeHook removes posthook's command from every block under a hook
 // type, dropping blocks left empty and the hook-type key if no blocks remain.
-// No-op when the type isn't present. Used to retire deprecated event types.
+// Only blocks it actually removed something from are touched, so a user's
+// own (even empty) blocks never change. No-op when the type isn't present.
+// Used to retire deprecated event types on install and for uninstall.
 func stripClaudeHook(hooksObj map[string]any, hookType string) {
 	blocks, ok := hooksObj[hookType].([]any)
 	if !ok {
@@ -190,18 +193,61 @@ func stripClaudeHook(hooksObj map[string]any, hookType string) {
 				kept = append(kept, h)
 			}
 		}
-		// Drop a block that only ever held our (now-removed) command.
-		if len(kept) == 0 {
-			continue
+		if len(kept) != len(inner) {
+			// Drop a block that only ever held our (now-removed) command.
+			if len(kept) == 0 {
+				continue
+			}
+			bm["hooks"] = kept
 		}
-		bm["hooks"] = kept
 		keptBlocks = append(keptBlocks, bm)
 	}
-	if len(keptBlocks) == 0 {
+	if len(keptBlocks) == 0 && len(blocks) > 0 {
 		delete(hooksObj, hookType)
 		return
 	}
 	hooksObj[hookType] = keptBlocks
+}
+
+// UninstallClaudeCodeHooks removes posthook's command from every hook type in
+// ~/.claude/settings.json — the ones the current release registers and any an
+// older one did — dropping matcher blocks and hook types left empty.
+// Everything else in the file, including the user's own hooks under the same
+// types, is untouched. A missing file is a no-op.
+func UninstallClaudeCodeHooks() (Result, error) {
+	path := paths.ClaudeSettingsPath()
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return Result{Path: path, Message: "Claude Code: no settings file, nothing to remove"}, nil
+	}
+	before, err := ReadJSONOrEmpty(path)
+	if err != nil {
+		return Result{}, err
+	}
+	beforeJSON, _ := json.Marshal(before)
+	after := cloneJSON(before)
+
+	if hooksObj, ok := after["hooks"].(map[string]any); ok {
+		hadTypes := len(hooksObj) > 0
+		for hookType := range hooksObj {
+			stripClaudeHook(hooksObj, hookType)
+		}
+		if hadTypes && len(hooksObj) == 0 {
+			delete(after, "hooks")
+		}
+	}
+
+	afterJSON, _ := json.Marshal(after)
+	changed := string(beforeJSON) != string(afterJSON)
+	if changed {
+		if err := WriteJSONAtomic(path, after); err != nil {
+			return Result{}, err
+		}
+	}
+	msg := "Claude Code: no posthook hooks found"
+	if changed {
+		msg = fmt.Sprintf("Claude Code: hooks removed from %s", path)
+	}
+	return Result{Changed: changed, Path: path, Message: msg}, nil
 }
 
 func getOrMakeMap(parent map[string]any, key string) map[string]any {

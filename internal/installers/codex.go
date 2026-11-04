@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -193,43 +194,59 @@ func InstallCodexHooks(binaryPath string) (Result, error) {
 	return Result{Changed: changed, Path: path, Message: msg}, nil
 }
 
-// stripCodexHook removes posthook's command from a deprecated event type:
-// it filters our command out of every block, drops blocks left empty, removes
-// the event key if nothing remains, and clears matching trust-state entries.
-func stripCodexHook(hooksTable map[string]any, configPath, event string) {
-	if blocks, ok := hooksTable[event].([]any); ok {
-		kept := make([]any, 0, len(blocks))
-		for _, b := range blocks {
-			bm, ok := b.(map[string]any)
-			if !ok {
-				kept = append(kept, b)
-				continue
-			}
-			inner, _ := bm["hooks"].([]any)
-			keptInner := make([]any, 0, len(inner))
-			for _, h := range inner {
-				hm, ok := h.(map[string]any)
-				if ok {
-					if cmd, _ := hm["command"].(string); IsPosthookCommand(cmd, codexAgentSlug) {
-						continue
-					}
+// removeCodexHookCommands filters posthook's command out of every block under
+// an event, dropping blocks left empty and the event key if no blocks remain.
+// Returns the command strings it removed (nil when the event is absent or
+// held none of ours, in which case nothing is touched). User hooks under the
+// same event stay.
+func removeCodexHookCommands(hooksTable map[string]any, event string) []string {
+	blocks, ok := hooksTable[event].([]any)
+	if !ok {
+		return nil
+	}
+	var removed []string
+	kept := make([]any, 0, len(blocks))
+	for _, b := range blocks {
+		bm, ok := b.(map[string]any)
+		if !ok {
+			kept = append(kept, b)
+			continue
+		}
+		inner, _ := bm["hooks"].([]any)
+		keptInner := make([]any, 0, len(inner))
+		for _, h := range inner {
+			if hm, ok := h.(map[string]any); ok {
+				if cmd, _ := hm["command"].(string); IsPosthookCommand(cmd, codexAgentSlug) {
+					removed = append(removed, cmd)
+					continue
 				}
-				keptInner = append(keptInner, h)
 			}
+			keptInner = append(keptInner, h)
+		}
+		if len(keptInner) != len(inner) {
 			if len(keptInner) == 0 {
 				continue
 			}
 			bm["hooks"] = keptInner
-			kept = append(kept, bm)
 		}
-		if len(kept) == 0 {
-			delete(hooksTable, event)
-		} else {
-			hooksTable[event] = kept
-		}
+		kept = append(kept, bm)
 	}
+	if len(removed) == 0 {
+		return nil
+	}
+	if len(kept) == 0 {
+		delete(hooksTable, event)
+	} else {
+		hooksTable[event] = kept
+	}
+	return removed
+}
 
-	// Drop trust-state entries for this event (keyed configPath:event_name:…).
+// stripCodexHook retires a deprecated event type: it removes our command
+// (and any now-empty blocks) and clears every trust-state entry recorded for
+// that event.
+func stripCodexHook(hooksTable map[string]any, configPath, event string) {
+	removeCodexHookCommands(hooksTable, event)
 	if state, ok := hooksTable["state"].(map[string]any); ok {
 		prefix := configPath + ":" + eventNameToSnakeCase(event) + ":"
 		for k := range state {
@@ -238,6 +255,145 @@ func stripCodexHook(hooksTable map[string]any, configPath, event string) {
 			}
 		}
 	}
+}
+
+// dropCodexTrustState removes the trust-state entries recorded for the given
+// posthook commands under one event. Entries are matched by trusted hash
+// (computed from the command exactly as trustCodexHook did), not by position,
+// so the user's own entries under the same event survive. When the event has
+// no hooks left at all its remaining entries are orphans and go too.
+func dropCodexTrustState(hooksTable map[string]any, configPath, event string, commands []string) {
+	state, ok := hooksTable["state"].(map[string]any)
+	if !ok {
+		return
+	}
+	eventName := eventNameToSnakeCase(event)
+	ours := map[string]bool{}
+	for _, cmd := range commands {
+		ours[computeTrustHash(eventName, cmd)] = true
+	}
+	_, eventHasHooks := hooksTable[event]
+	prefix := configPath + ":" + eventName + ":"
+	for k, v := range state {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		entry, _ := v.(map[string]any)
+		hash, _ := entry["trusted_hash"].(string)
+		if ours[hash] || !eventHasHooks {
+			delete(state, k)
+		}
+	}
+}
+
+// UninstallCodexHooks removes posthook from ~/.codex/config.toml: our command
+// under every hook event (current and deprecated), the trust-state entries
+// recorded for those commands, and ~/.posthook from the sandbox writable
+// roots. features.hooks is dropped only when no hooks of any kind remain —
+// posthook sets it, but so might the user, and it is harmless on its own.
+// User hooks and their trust entries stay. A missing file is a no-op.
+func UninstallCodexHooks() (Result, error) {
+	path := paths.CodexConfigPath()
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Result{Path: path, Message: "Codex CLI: no config file, nothing to remove"}, nil
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	var config map[string]any
+	if strings.TrimSpace(string(data)) != "" {
+		if err := toml.Unmarshal(data, &config); err != nil {
+			return Result{}, fmt.Errorf("parse %s: %w", path, err)
+		}
+	}
+	if config == nil {
+		config = map[string]any{}
+	}
+	beforeJSON, _ := json.Marshal(config)
+
+	removedAny := false
+	if hooksTable, ok := config["hooks"].(map[string]any); ok {
+		for event := range hooksTable {
+			if event == "state" {
+				continue
+			}
+			if removed := removeCodexHookCommands(hooksTable, event); len(removed) > 0 {
+				removedAny = true
+				dropCodexTrustState(hooksTable, path, event, removed)
+			}
+		}
+		if removedAny {
+			if state, ok := hooksTable["state"].(map[string]any); ok && len(state) == 0 {
+				delete(hooksTable, "state")
+			}
+			if len(hooksTable) == 0 {
+				delete(config, "hooks")
+			}
+		}
+	}
+	if removeWritableRoot(config) {
+		removedAny = true
+	}
+	// Only drop the feature flag once nothing is left that needs it.
+	if _, hooksLeft := config["hooks"]; removedAny && !hooksLeft {
+		if features, ok := config["features"].(map[string]any); ok {
+			delete(features, "hooks")
+			if len(features) == 0 {
+				delete(config, "features")
+			}
+		}
+	}
+
+	afterJSON, _ := json.Marshal(config)
+	changed := string(beforeJSON) != string(afterJSON)
+	if changed {
+		buf, err := toml.Marshal(config)
+		if err != nil {
+			return Result{}, err
+		}
+		if err := atomicfs.Write(path, buf, 0o644); err != nil {
+			return Result{}, err
+		}
+	}
+	msg := "Codex CLI: no posthook hooks found"
+	if changed {
+		msg = fmt.Sprintf("Codex CLI: hooks removed from %s", path)
+	}
+	return Result{Changed: changed, Path: path, Message: msg}, nil
+}
+
+// removeWritableRoot drops ~/.posthook from sandbox_workspace_write.writable_roots
+// (the inverse of ensureWritableRoot), removing the list and the table when
+// they are left empty. Returns true iff anything changed.
+func removeWritableRoot(config map[string]any) bool {
+	ww, ok := config["sandbox_workspace_write"].(map[string]any)
+	if !ok {
+		return false
+	}
+	roots, ok := ww["writable_roots"].([]any)
+	if !ok {
+		return false
+	}
+	kept := make([]any, 0, len(roots))
+	for _, r := range roots {
+		if s, ok := r.(string); ok && s == paths.PosthookDir() {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if len(kept) == len(roots) {
+		return false
+	}
+	if len(kept) == 0 {
+		delete(ww, "writable_roots")
+		if len(ww) == 0 {
+			delete(config, "sandbox_workspace_write")
+		}
+	} else {
+		ww["writable_roots"] = kept
+	}
+	return true
 }
 
 func trustCodexHook(

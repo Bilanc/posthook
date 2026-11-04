@@ -132,35 +132,47 @@ func runUninstallShadow() error {
 	if posthookPath == "" {
 		return errors.New("cannot determine posthook binary path.")
 	}
-	installDir := filepath.Dir(posthookPath)
-	shadowPath := filepath.Join(installDir, "git")
+	removed, shadowPath, err := removeShadow(posthookPath)
+	if err != nil {
+		return err
+	}
+	if removed {
+		logx.Infof("Shadow removed: %s", shadowPath)
+		if proxy.LoadRealGitPath() != "" {
+			logx.Info("Saved real-git path is preserved at ~/.posthook/git-path (safe to delete if no longer wanted).")
+		}
+	}
+	return nil
+}
 
+// removeShadow deletes the `git` symlink next to posthookPath when it points
+// at our binary. Anything else at that path — a real file, or a symlink to
+// something that isn't posthook — is left alone with a warning. Returns
+// whether the symlink was removed and the path it looked at.
+func removeShadow(posthookPath string) (removed bool, shadowPath string, err error) {
+	shadowPath = filepath.Join(filepath.Dir(posthookPath), "git")
 	st, err := os.Lstat(shadowPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			logx.Infof("No shadow found at %s.", shadowPath)
-			return nil
+			return false, shadowPath, nil
 		}
-		return err
+		return false, shadowPath, err
 	}
 	if st.Mode()&os.ModeSymlink == 0 {
 		logx.Warnf("Refusing to remove %s: not a symlink. Inspect it manually before deleting.", shadowPath)
-		return nil
+		return false, shadowPath, nil
 	}
 	target, _ := os.Readlink(shadowPath)
 	if !sameFile(target, posthookPath) && target != posthookPath {
 		logx.Warnf("Refusing to remove %s: symlink target is %s, not our posthook binary at %s. Inspect manually.",
 			shadowPath, target, posthookPath)
-		return nil
+		return false, shadowPath, nil
 	}
 	if err := os.Remove(shadowPath); err != nil {
-		return err
+		return false, shadowPath, err
 	}
-	logx.Infof("Shadow removed: %s", shadowPath)
-	if proxy.LoadRealGitPath() != "" {
-		logx.Info("Saved real-git path is preserved at ~/.posthook/git-path (safe to delete if no longer wanted).")
-	}
-	return nil
+	return true, shadowPath, nil
 }
 
 func resolvePosthookBinaryPath() string {
