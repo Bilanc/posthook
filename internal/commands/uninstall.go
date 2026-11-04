@@ -32,8 +32,8 @@ func newUninstallCmd() *cobra.Command {
 from scratch. In order:
 
   1. stop the background sync daemon and the dashboard server
-  2. remove posthook's hook entries from Claude Code, Cursor and Codex CLI
-     (your own hooks in those files are untouched)
+  2. remove posthook's hook entries from Claude Code, Cursor, Codex CLI and
+     GitHub Copilot (your own hooks in those files are untouched)
   3. stop the spool worker, drain any queued events and, if cloud sync is
      configured, flush once more so nothing already captured is lost. If that
      hand-off fails, the database, config and queued events are kept and the
@@ -156,6 +156,7 @@ func gatherUninstallPlan(keepData bool) uninstallPlan {
 		{"Claude Code", paths.ClaudeSettingsPath(), installers.UninstallClaudeCodeHooks},
 		{"Cursor", paths.CursorHooksPath(), installers.UninstallCursorHooks},
 		{"Codex CLI", paths.CodexConfigPath(), installers.UninstallCodexHooks},
+		{"GitHub Copilot", paths.CopilotHooksPath(), installers.UninstallCopilotHooks},
 	} {
 		if fileContains(a.path, paths.PosthookMarker) {
 			p.agents = append(p.agents, a)
@@ -484,7 +485,7 @@ func (p uninstallPlan) execute() error {
 
 	fmt.Println("Done. Three things to know:")
 	fmt.Println("  - Open a new shell (or run `hash -r`): the shell may still have the old git path cached.")
-	fmt.Println("  - Restart any Claude Code / Cursor / Codex session that is running: they loaded the hooks")
+	fmt.Println("  - Restart any Claude Code / Cursor / Codex / Copilot session that is running: they loaded the hooks")
 	fmt.Println("    at startup and will report a failed hook until restarted.")
 	fmt.Println("  - If you added ~/.local/bin to PATH in your shell rc, that line was left alone — it is a")
 	fmt.Println("    standard directory other tools use too.")
