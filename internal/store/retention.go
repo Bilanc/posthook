@@ -24,9 +24,12 @@ import (
 //   - session_prompts (the engineer's typed prompts) are pruned by age like
 //     non-edit events.
 //
-// Timestamps are the RFC3339Nano UTC strings ingest writes, so the cutoff is
-// rendered in the same shape and compared as text (`ts < ?`) rather than
-// parsed per row.
+// Timestamps are compared through SQLite's datetime(), which brings the
+// RFC3339Nano strings ingest writes, the millisecond "Z" times transcripts
+// carry and the `datetime('now')` default on session_prompts.created_at to
+// one shape. Compared as text, the space in that last form sorts before the
+// "T" of an RFC3339 cutoff and every created_at on the cutoff day reads as
+// older than it.
 
 // PruneOptions controls one prune pass.
 type PruneOptions struct {
@@ -56,9 +59,9 @@ const pruneBatchSize = 5000
 // pruneInterval is how often PruneIfDue lets an automatic prune run.
 const pruneInterval = 24 * time.Hour
 
-// cutoffLayout renders the cutoff in the shape ingest writes `ts`
-// (RFC3339Nano in UTC, 'Z' suffix) so the text comparison orders correctly.
-const cutoffLayout = "2006-01-02T15:04:05.000000Z"
+// cutoffLayout renders the cutoff the way SQLite's datetime() prints, so both
+// sides of the comparison are in the same shape.
+const cutoffLayout = "2006-01-02 15:04:05"
 
 // lastPruneKey is the maintenance row holding the last successful prune time.
 const lastPruneKey = "retention_last_prune_at"
@@ -82,11 +85,11 @@ func (db *DB) Prune(opts PruneOptions) (PruneResult, error) {
 	// Edit events are the ones event_line_ranges points at; they back commit
 	// attribution and must outlive the retention window. Everything else
 	// (reads, bash calls, stop/start markers, misfires) is prunable.
-	eventsWhere := `e.ts < ?
+	eventsWhere := `datetime(e.ts) < datetime(?)
 		AND NOT EXISTS (SELECT 1 FROM event_line_ranges r WHERE r.event_id = e.id)` + synced
 	// Transcript-derived prompts carry the agent's timestamp in ts; hook-
 	// delivered ones may not, so fall back to the row's own created_at.
-	promptsWhere := `COALESCE(e.ts, e.created_at) < ?` + synced
+	promptsWhere := `datetime(COALESCE(e.ts, e.created_at)) < datetime(?)` + synced
 
 	var err error
 	if res.Events, err = db.pruneTable("events", eventsWhere, cut, opts.DryRun); err != nil {

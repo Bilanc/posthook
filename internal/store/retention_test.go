@@ -144,6 +144,30 @@ func TestPruneDeletesOldPrompts(t *testing.T) {
 	}
 }
 
+func TestPruneReadsCreatedAtInSQLiteShape(t *testing.T) {
+	db := newRetentionDB(t)
+	// session_prompts.created_at defaults to datetime('now'), "YYYY-MM-DD
+	// HH:MM:SS" with a space. Compared as text against an RFC3339 cutoff the
+	// space sorts before the "T", so a prompt created an hour ago on the
+	// cutoff day would be deleted.
+	const sqliteLayout = "2006-01-02 15:04:05"
+	insertPrompt(t, db, "p-fresh", sql.NullString{}, time.Now().UTC().Add(-time.Hour).Format(sqliteLayout), 1, false)
+	insertPrompt(t, db, "p-stale", sql.NullString{}, time.Now().UTC().Add(-3*time.Hour).Format(sqliteLayout), 2, false)
+
+	res, err := db.Prune(PruneOptions{OlderThan: 2 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Prompts != 1 {
+		t.Fatalf("prompts deleted = %d, want 1", res.Prompts)
+	}
+	var remaining string
+	mustQueryRow(t, db, `SELECT id FROM session_prompts`, nil, &remaining)
+	if remaining != "p-fresh" {
+		t.Fatalf("remaining prompt = %q, want p-fresh", remaining)
+	}
+}
+
 func TestPruneRequireSyncedKeepsUnsyncedRows(t *testing.T) {
 	db := newRetentionDB(t)
 	insertEvent(t, db, "unsynced", oldTS, false)
