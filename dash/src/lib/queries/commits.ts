@@ -1,4 +1,4 @@
-import { db } from "../db";
+import { db } from "../db.ts";
 import type { CommitRow } from "@/types/posthook";
 
 // Commits whose captured AI line ranges are attributed to this session.

@@ -1,5 +1,11 @@
-import { db } from "../db";
-import { filterSqlForSessions, type Filters } from "../filters";
+import { db } from "../db.ts";
+import { filterSqlForSessions, type Filters, type Outcome } from "../filters.ts";
+import { sessionActiveSql } from "./activity.ts";
+import { AI_EDIT_EVENT_CONDITION, LINES_GENERATED } from "./edit-condition.ts";
+import { ATTRIBUTED, OUTCOME_EXPR, SESSION_OUTCOMES_CTE } from "./outcomes.ts";
+
+// Re-exported for callers that still import these from here.
+export { NL, LINE_RANGE_LINES, LINES_GENERATED, AI_EDIT_EVENT_CONDITION } from "./edit-condition.ts";
 import type { SessionRow } from "@/types/posthook";
 
 export interface SessionListRow {
@@ -10,63 +16,53 @@ export interface SessionListRow {
   engineer_name: string | null;
   repo_id: string | null;
   repo_name: string | null;
+  branch: string | null;
   started_at: string;
   ended_at: string | null;
-  duration_hours: number | null;
+  // First real prompt (compaction summaries skipped), capped at 500 chars; null
+  // when the session captured none.
+  first_prompt: string | null;
+  prompts: number;
+  // Gap-capped active minutes (see activity.ts), 0 for single-event sessions.
+  active_minutes: number;
   lines_generated: number;
-  edits: number;
-  files_touched: number;
+  lines_committed: number;
   commits_attributed: number;
   input_tokens: number | null;
   output_tokens: number | null;
+  outcome: Outcome;
+  // Activity-strip data, each sorted ascending: Stop-event timestamps (one per
+  // turn), AI edit timestamps and committed_at of the attributed commits.
+  stop_ts: string[];
+  edit_ts: string[];
+  commit_ts: string[];
 }
 
-const NL = (col: string) => `(length(${col}) - length(replace(${col}, char(10), '')))`;
-const LINE_RANGE_LINES = `COALESCE((
-  SELECT SUM(elr.new_text_lines)
-  FROM event_line_ranges elr
-  WHERE elr.event_id = e.id
-), 0)`;
-const LINES_GENERATED = `CASE
-  WHEN ${LINE_RANGE_LINES} > 0 THEN ${LINE_RANGE_LINES}
-  WHEN json_extract(e.payload, '$.tool_name') = 'apply_patch' THEN COALESCE(e.lines_added, 0)
-  ELSE ${NL("COALESCE(json_extract(e.payload, '$.tool_input.new_string'), '')")}
-    + ${NL("COALESCE(json_extract(e.payload, '$.tool_input.content'), '')")}
-END`;
-// Cursor reports an edit through both PostToolUse and afterFileEdit. Keep the
-// afterFileEdit event and suppress PostToolUse when a matching afterFileEdit
-// exists for the same file/session within five seconds.
-const AI_EDIT_EVENT_CONDITION = `(
-  (
-    e.event_type IN ('PostToolUse', 'postToolUse')
-    AND (
-      json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
-      -- shell commands (Bash heredocs …) count once lines were located in the file
-      OR EXISTS (SELECT 1 FROM event_line_ranges selr WHERE selr.event_id = e.id)
-    )
-    AND NOT (
-      e.agent_slug = 'cursor'
-      AND EXISTS (
-        SELECT 1
-        FROM events afe
-        WHERE afe.agent_slug = 'cursor'
-          AND afe.event_type = 'afterFileEdit'
-          AND afe.file_path = e.file_path
-          AND (
-            afe.session_id = e.session_id
-            OR (afe.session_id IS NULL AND e.session_id IS NULL)
-          )
-          AND ABS((julianday(afe.ts) - julianday(e.ts)) * 86400.0) <= 5
-      )
-    )
-  )
-  OR e.event_type = 'afterFileEdit'
-)`;
+// Prompts that open with a compaction summary are not the session's title.
+export const CONTINUED_PROMPT_PREFIX = "This session is being continued";
+
+// group_concat output -> sorted timestamps. Null/empty in, [] out; entries that
+// do not parse as dates are dropped so the strip never sees NaN.
+export function splitTimestamps(joined: string | null | undefined): string[] {
+  if (!joined) return [];
+  return joined
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s && Number.isFinite(Date.parse(s)))
+    .sort((a, b) => Date.parse(a) - Date.parse(b));
+}
 
 export interface ListSessionsResult {
   rows: SessionListRow[];
   total: number;
 }
+
+type RawListRow = Omit<SessionListRow, "outcome" | "stop_ts" | "edit_ts" | "commit_ts"> & {
+  outcome: string;
+  stop_ts: string | null;
+  edit_ts: string | null;
+  commit_ts: string | null;
+};
 
 export function listSessions(
   f: Filters,
@@ -75,39 +71,31 @@ export function listSessions(
 ): ListSessionsResult {
   const conn = db();
   const fchunk = filterSqlForSessions(f);
+  const outcomeSql = f.outcome ? ` AND ${OUTCOME_EXPR} = '${f.outcome}'` : "";
 
-  const totalRow = conn
-    .prepare(`SELECT COUNT(*) AS n FROM sessions s WHERE 1=1${fchunk.sql}`)
-    .get(...fchunk.params) as { n: number };
+  // The outcome join only costs something when an outcome filter is set.
+  const countSql = f.outcome
+    ? `WITH ${SESSION_OUTCOMES_CTE}
+       SELECT COUNT(*) AS n
+       FROM sessions s JOIN session_outcomes so ON so.session_id = s.id
+       WHERE 1=1${fchunk.sql}${outcomeSql}`
+    : `SELECT COUNT(*) AS n FROM sessions s WHERE 1=1${fchunk.sql}`;
+  const totalRow = conn.prepare(countSql).get(...fchunk.params) as { n: number };
 
   const offset = (page - 1) * perPage;
 
-  // Aggregate per-session edit stats and attributed commit counts in a single query so
-  // pagination still works.
+  // One statement: pick the page of session ids first, then compute the
+  // per-session aggregates and strip timestamps only for those rows.
   const sql = `
-    WITH filtered_sessions AS (
-      SELECT s.id
-      FROM sessions s
-      WHERE 1=1${fchunk.sql}
+    WITH ${SESSION_OUTCOMES_CTE},
+    page AS (
+      SELECT s.id, so.has_edits, so.has_commits
+      FROM sessions s JOIN session_outcomes so ON so.session_id = s.id
+      WHERE 1=1${fchunk.sql}${outcomeSql}
+      ORDER BY datetime(s.started_at) DESC, s.id DESC
+      LIMIT ? OFFSET ?
     ),
-    per_session_edits AS (
-      SELECT
-        e.session_id,
-        COUNT(*) AS edits,
-        COUNT(DISTINCT e.rel_file_path) AS files_touched,
-        SUM(${LINES_GENERATED}) AS lines_generated
-      FROM events e
-      JOIN filtered_sessions fs ON fs.id = e.session_id
-      WHERE ${AI_EDIT_EVENT_CONDITION}
-      GROUP BY e.session_id
-    ),
-    per_session_commits AS (
-      SELECT
-        session_id,
-        COUNT(DISTINCT commit_id) AS commits_attributed
-      FROM commit_sessions
-      GROUP BY session_id
-    )
+    active AS (${sessionActiveSql(" AND e.session_id IN (SELECT id FROM page)")})
     SELECT
       s.id,
       s.agent_slug,
@@ -116,26 +104,64 @@ export function listSessions(
       s.engineer_name,
       s.repo_id,
       r.name AS repo_name,
+      s.branch,
       s.started_at,
       s.ended_at,
-      (julianday(COALESCE(s.ended_at, s.started_at)) - julianday(s.started_at)) * 24 AS duration_hours,
       s.input_tokens,
       s.output_tokens,
-      COALESCE(pse.lines_generated, 0) AS lines_generated,
-      COALESCE(pse.edits, 0) AS edits,
-      COALESCE(pse.files_touched, 0) AS files_touched,
-      COALESCE(psc.commits_attributed, 0) AS commits_attributed
-    FROM sessions s
+      (
+        SELECT substr(p.prompt_text, 1, 500)
+        FROM session_prompts p
+        WHERE p.session_id = s.id AND p.prompt_text NOT LIKE ? ESCAPE '\\'
+        ORDER BY p.seq LIMIT 1
+      ) AS first_prompt,
+      (SELECT COUNT(*) FROM session_prompts p WHERE p.session_id = s.id) AS prompts,
+      COALESCE(a.active_minutes, 0) AS active_minutes,
+      COALESCE((
+        SELECT SUM(${LINES_GENERATED}) FROM events e
+        WHERE e.session_id = s.id AND ${AI_EDIT_EVENT_CONDITION}
+      ), 0) AS lines_generated,
+      COALESCE((
+        SELECT SUM(cs.lines_attributed) FROM commit_sessions cs WHERE cs.session_id = s.id
+      ), 0) AS lines_committed,
+      (
+        SELECT COUNT(DISTINCT cs.commit_id) FROM commit_sessions cs
+        WHERE cs.session_id = s.id AND ${ATTRIBUTED}
+      ) AS commits_attributed,
+      ${OUTCOME_EXPR} AS outcome,
+      (
+        SELECT group_concat(e.ts) FROM events e
+        WHERE e.session_id = s.id AND e.event_type = 'Stop'
+      ) AS stop_ts,
+      (
+        SELECT group_concat(e.ts) FROM events e
+        WHERE e.session_id = s.id AND ${AI_EDIT_EVENT_CONDITION}
+      ) AS edit_ts,
+      (
+        SELECT group_concat(c.committed_at)
+        FROM commit_sessions cs JOIN commits c ON c.id = cs.commit_id
+        WHERE cs.session_id = s.id AND ${ATTRIBUTED}
+      ) AS commit_ts
+    FROM page so
+    JOIN sessions s ON s.id = so.id
     LEFT JOIN repositories r ON r.id = s.repo_id
-    LEFT JOIN per_session_edits pse ON pse.session_id = s.id
-    LEFT JOIN per_session_commits psc ON psc.session_id = s.id
-    WHERE 1=1${fchunk.sql}
-    ORDER BY datetime(s.started_at) DESC
-    LIMIT ? OFFSET ?`;
+    LEFT JOIN active a ON a.session_id = s.id
+    ORDER BY datetime(s.started_at) DESC, s.id DESC`;
 
-  const rows = conn
+  // Placeholders bind in textual order: page filter, LIMIT/OFFSET, then the
+  // first-prompt prefix pattern in the outer SELECT.
+  const continuedLike = `${CONTINUED_PROMPT_PREFIX.replace(/[\\%_]/g, "\\$&")}%`;
+  const raw = conn
     .prepare(sql)
-    .all(...fchunk.params, ...fchunk.params, perPage, offset) as SessionListRow[];
+    .all(...fchunk.params, perPage, offset, continuedLike) as RawListRow[];
+
+  const rows: SessionListRow[] = raw.map((r) => ({
+    ...r,
+    outcome: r.outcome === "shipped" || r.outcome === "edited" ? r.outcome : "explored",
+    stop_ts: splitTimestamps(r.stop_ts),
+    edit_ts: splitTimestamps(r.edit_ts),
+    commit_ts: splitTimestamps(r.commit_ts),
+  }));
   return { rows, total: totalRow.n };
 }
 

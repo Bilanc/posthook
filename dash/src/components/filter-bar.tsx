@@ -4,13 +4,20 @@ import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 import { formatISO, subDays } from "date-fns";
 import type { FilterOptions } from "@/lib/queries/breakdowns";
-import type { Filters } from "@/lib/filters";
+import type { Filters, Outcome } from "@/lib/filters";
 
 const QUICK_RANGES: Array<{ key: string; label: string; days: number }> = [
   { key: "today", label: "Today", days: 0 },
   { key: "7d", label: "7d", days: 6 },
   { key: "30d", label: "30d", days: 29 },
   { key: "90d", label: "90d", days: 89 },
+];
+
+const OUTCOME_CHOICES: Array<{ key: Outcome | null; label: string }> = [
+  { key: null, label: "Any" },
+  { key: "shipped", label: "Shipped" },
+  { key: "edited", label: "Edited" },
+  { key: "explored", label: "Explored" },
 ];
 
 function isoDate(d: Date): string {
@@ -27,9 +34,11 @@ interface Props {
   options: FilterOptions;
   // Free-text session search; only the sessions list supports it.
   searchable?: boolean;
+  // Outcome control (Any / Shipped / Edited / Explored); only the sessions list uses it.
+  outcomes?: boolean;
 }
 
-export function FilterBar({ filters, options, searchable = false }: Props) {
+export function FilterBar({ filters, options, searchable = false, outcomes = false }: Props) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -131,12 +140,36 @@ export function FilterBar({ filters, options, searchable = false }: Props) {
           open={open === "repos"}
           onClick={() => setOpen(open === "repos" ? null : "repos")}
         />
-        <Pill
-          label="Engineer"
-          count={filters.engineers.length}
-          open={open === "engineers"}
-          onClick={() => setOpen(open === "engineers" ? null : "engineers")}
-        />
+
+        {outcomes ? (
+          <div className="flex items-center gap-2 text-xs text-[var(--color-fg-muted)]">
+            <span>Outcome</span>
+            <div
+              role="group"
+              aria-label="Outcome"
+              className="flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-0.5"
+            >
+              {OUTCOME_CHOICES.map((c) => {
+                const isActive = (filters.outcome ?? null) === c.key;
+                return (
+                  <button
+                    key={c.label}
+                    type="button"
+                    aria-pressed={isActive}
+                    onClick={() => apply({ outcome: c.key })}
+                    className={`text-xs rounded px-2.5 py-1 transition-colors ${
+                      isActive
+                        ? "bg-[var(--color-accent)] text-white"
+                        : "text-[var(--color-fg-muted)] hover:text-[var(--color-fg)]"
+                    }`}
+                  >
+                    {c.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
 
         {searchable ? (
           <SearchInput value={query} onChange={setQuery} />
@@ -148,11 +181,21 @@ export function FilterBar({ filters, options, searchable = false }: Props) {
           filters.engineers.length ||
           filters.from ||
           filters.to ||
-          filters.q) ? (
+          filters.q ||
+          filters.outcome) ? (
           <button
             type="button"
             onClick={() =>
-              apply({ from: null, to: null, agents: null, models: null, repos: null, engineers: null, q: null })
+              apply({
+                from: null,
+                to: null,
+                agents: null,
+                models: null,
+                repos: null,
+                engineers: null,
+                q: null,
+                outcome: null,
+              })
             }
             className="ml-auto text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
           >
@@ -180,16 +223,6 @@ export function FilterBar({ filters, options, searchable = false }: Props) {
           values={options.repos.map((r) => ({ key: r.id, label: r.name }))}
           selected={filters.repos}
           onToggle={(v) => toggleMulti("repos", v)}
-        />
-      ) : null}
-      {open === "engineers" ? (
-        <MultiList
-          values={options.engineers.map((e) => ({
-            key: e.email,
-            label: e.name ? `${e.name} <${e.email}>` : e.email,
-          }))}
-          selected={filters.engineers}
-          onToggle={(v) => toggleMulti("engineers", v)}
         />
       ) : null}
     </div>
@@ -222,7 +255,7 @@ function SearchInput({
         type="search"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="Search session ID, branch, engineer, repo…"
+        placeholder="Search prompts, branch, repo…"
         aria-label="Search sessions"
         className="bg-transparent rounded pl-7 pr-2 py-1 text-sm text-[var(--color-fg)] outline-none w-[18rem] placeholder:text-[var(--color-fg-muted)]"
       />
