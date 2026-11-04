@@ -1,5 +1,5 @@
 // Package installers writes posthook's hook command into each AI agent's
-// configuration file (Claude Code, Cursor, Codex). All installers follow the
+// configuration file (Claude Code, Cursor, Codex, GitHub Copilot). All installers follow the
 // same idempotent merge-and-deduplicate pattern: read existing config,
 // surgically add/update only posthook's command, write atomically. Existing
 // user hooks are preserved.

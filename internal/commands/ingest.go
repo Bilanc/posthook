@@ -54,7 +54,7 @@ func newIngestCmd() *cobra.Command {
 			}
 		},
 	}
-	cmd.Flags().StringVar(&agent, "agent", "", "Agent slug (claude-code, cursor, codex)")
+	cmd.Flags().StringVar(&agent, "agent", "", "Agent slug (claude-code, cursor, codex, github-copilot)")
 	cmd.Flags().StringVar(&kind, "kind", "", "Ingest kind (git-commit)")
 	cmd.Flags().StringVar(&repoRoot, "repo-root", "", "Repo root for git-commit ingest")
 	cmd.Flags().StringVar(&sha, "sha", "", "Commit SHA for git-commit ingest")
