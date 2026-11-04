@@ -76,6 +76,37 @@ func Open() (*DB, error) {
 	return cached, nil
 }
 
+// OpenReadOnly opens the database as it is on disk — no directory or file
+// creation, no migration, no shared cache — for callers that must not
+// change anything, such as `posthook uninstall --dry-run`. The handle is
+// the caller's to close. Fails when the file is missing.
+func OpenReadOnly() (*DB, error) {
+	return openReadOnly(paths.DBPath())
+}
+
+func openReadOnly(path string) (*DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+	// A file: URI so SQLite itself sees mode=ro; the driver passes the URI
+	// through untouched and still applies the _pragma params.
+	q := url.Values{}
+	q.Set("mode", "ro")
+	q.Add("_pragma", "query_only(1)")
+	q.Add("_pragma", "busy_timeout(5000)")
+	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	if err := sqlDB.Ping(); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("open sqlite read-only: %w", err)
+	}
+	return &DB{DB: sqlDB}, nil
+}
+
 // migrate brings an out-of-date database up to the current schemaVersion: it
 // applies the schema + idempotent column migrations, runs the data-repair
 // backfills, refreshes attribution, and records the new version. Gated by

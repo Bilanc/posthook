@@ -306,3 +306,82 @@ func TestRepairRefspecIgnoresRefspecsFromOtherConfigScopes(t *testing.T) {
 		t.Fatal("nothing should have been written to local config")
 	}
 }
+
+// configAll returns every value of a git config key, "" when unset.
+func configAll(dir, key string) string {
+	cmd := exec.Command("git", "config", "--get-all", key)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "POSTHOOK_BYPASS=1")
+	out, _ := cmd.Output()
+	return strings.TrimSpace(string(out))
+}
+
+func TestRemoveTransportStripsEveryPosthookRefspec(t *testing.T) {
+	_, a, _ := setup(t)
+	if !EnsureRefspec(a, "origin") {
+		t.Fatal("EnsureRefspec should add the fetch refspec")
+	}
+	git(t, a, "config", "--add", "remote.origin.fetch", exactRefspec)
+	git(t, a, "config", "--add", "remote.origin.push", legacyRefspec)
+
+	if !RemoveTransport(a) {
+		t.Fatal("RemoveTransport should report a change")
+	}
+	fetch := configAll(a, "remote.origin.fetch")
+	if strings.Contains(fetch, "posthook") {
+		t.Fatalf("posthook fetch refspec still present: %q", fetch)
+	}
+	if !strings.Contains(fetch, "+refs/heads/*:refs/remotes/origin/*") {
+		t.Fatalf("the repo's own fetch refspec was lost: %q", fetch)
+	}
+	if push := configAll(a, "remote.origin.push"); push != "" {
+		t.Fatalf("legacy push refspec still present: %q", push)
+	}
+	if RemoveTransport(a) {
+		t.Fatal("second RemoveTransport should be a no-op")
+	}
+}
+
+func TestDeleteLocalRefsLeavesRemoteAndOtherNotesAlone(t *testing.T) {
+	remote, a, b := setup(t)
+	sha := git(t, a, "rev-parse", "HEAD")
+	addNote(t, a, "HEAD", `{"from":"a"}`)
+	git(t, a, "notes", "--ref=refs/notes/ai", "add", "-f", "-m", "another tool", "HEAD")
+	// Shares posthook's prefix but is not one of its refs.
+	git(t, a, "notes", "--ref=refs/notes/posthook-custom", "add", "-f", "-m", "someone's own", "HEAD")
+	if err := Push(a, "origin"); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if err := Fetch(a, "origin"); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !RefExists(a, TrackingRef) {
+		t.Fatal("expected the tracking ref after a fetch")
+	}
+
+	if n := DeleteLocalRefs(a); n != 2 {
+		t.Fatalf("deleted %d refs, want 2 (notes + tracking)", n)
+	}
+	if RefExists(a, paths.NotesRef) || RefExists(a, TrackingRef) {
+		t.Fatal("posthook notes refs still exist locally")
+	}
+	if !RefExists(a, "refs/notes/ai") {
+		t.Fatal("another tool's notes ref was deleted")
+	}
+	if !RefExists(a, "refs/notes/posthook-custom") {
+		t.Fatal("a notes ref that merely shares posthook's prefix was deleted")
+	}
+	if DeleteLocalRefs(a) != 0 {
+		t.Fatal("second DeleteLocalRefs should find nothing")
+	}
+
+	// The remote still has the notes, so a teammate (or a reinstall) can
+	// fetch them back.
+	git(t, remote, "rev-parse", "--verify", paths.NotesRef)
+	if err := Fetch(b, "origin"); err != nil {
+		t.Fatalf("fetch into b: %v", err)
+	}
+	if got := showNote(t, b, sha); got != `{"from":"a"}` {
+		t.Fatalf("remote notes should be untouched, b sees %q", got)
+	}
+}

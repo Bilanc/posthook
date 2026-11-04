@@ -1,10 +1,14 @@
 package commands
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -69,6 +73,11 @@ func runWorker(managed bool) error {
 		return nil
 	}
 	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	// Record our pid in the lock file so `posthook uninstall` can signal us.
+	// The flock is the real guard; the pid is advisory and only read while
+	// the lock is held.
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -106,6 +115,39 @@ func runWorker(managed bool) error {
 		case <-time.After(workerPollInterval):
 		}
 	}
+}
+
+// stopWorker asks a running spool worker to exit and waits for it to let go
+// of the lock: SIGTERM, a grace period, then SIGKILL. Returns whether a
+// worker was running at all, and an error if one is still holding the lock
+// afterwards (or could not be identified).
+func stopWorker() (bool, error) {
+	if !workerRunning() {
+		return false, nil
+	}
+	pids := workerPIDs()
+	if len(pids) == 0 {
+		return true, errors.New("a worker holds the lock but its pid could not be found; it exits on its own within 2 minutes")
+	}
+	if alive := terminateAndWait(pids, stopGrace); len(alive) > 0 {
+		return true, fmt.Errorf("worker (pid %v) did not exit", alive)
+	}
+	if workerRunning() {
+		return true, fmt.Errorf("worker lock %s is still held after stopping pid %v", workerLockPath(), pids)
+	}
+	return true, nil
+}
+
+// workerPIDs finds the running worker: the pid it wrote into the lock file,
+// or — for a worker started by an older binary that did not record one — a
+// pgrep for its command line.
+func workerPIDs() []int {
+	if data, err := os.ReadFile(workerLockPath()); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 0 {
+			return []int{pid}
+		}
+	}
+	return pgrepPIDs(ownProcessPattern("worker"))
 }
 
 // workerRunning reports whether a worker currently holds the singleton lock.

@@ -160,6 +160,61 @@ func RepairRefspec(repoRoot, remote string) bool {
 	return changed
 }
 
+// RemoveTransport strips every refspec posthook has ever written — the
+// current pattern fetch refspec, the exact and legacy fetch forms, and the
+// legacy push form — from every remote in the repo's local config. The
+// inverse of EnsureRefspec, for uninstall. Returns true iff config was
+// modified. Purely local; never touches the network.
+func RemoveTransport(repoRoot string) bool {
+	changed := false
+	for _, line := range strings.Split(gitx.Run(repoRoot, "config", "--local", "--get-regexp", `^remote\..*\.(fetch|push)$`), "\n") {
+		key, value, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		name, kind := splitRemoteKey(key)
+		if name == "" {
+			continue
+		}
+		ours := false
+		switch kind {
+		case "fetch":
+			ours = value == FetchRefspec || value == exactRefspec || value == legacyRefspec
+		case "push":
+			ours = value == legacyRefspec
+		}
+		if !ours {
+			continue
+		}
+		if err := gitx.Exec(repoRoot, "config", "--local", "--unset-all", key, "^"+regexpQuote(value)+"$"); err == nil {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// DeleteLocalRefs removes the two local refs posthook creates — the notes
+// ref (refs/notes/posthook) and the fetch tracking ref
+// (refs/notes/posthook-remote) — and nothing else: other notes refs
+// (refs/notes/commits, refs/notes/ai, even refs/notes/posthook-custom) are
+// someone else's. The remote is never contacted; notes already pushed stay
+// there and a reinstall fetches them straight back. Returns how many refs
+// were deleted.
+func DeleteLocalRefs(repoRoot string) int {
+	n := 0
+	for _, ref := range []string{paths.NotesRef, TrackingRef} {
+		if !RefExists(repoRoot, ref) {
+			continue
+		}
+		if err := gitx.Exec(repoRoot, "update-ref", "-d", ref); err != nil {
+			logx.Debugf("notes: delete %s: %v", ref, err)
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // splitRemoteKey turns "remote.<name>.fetch" into ("<name>", "fetch").
 func splitRemoteKey(key string) (name, kind string) {
 	rest, ok := strings.CutPrefix(key, "remote.")

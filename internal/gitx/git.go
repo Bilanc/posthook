@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,4 +92,22 @@ func Output(cwd string, args ...string) ([]byte, error) {
 	cmd.Dir = cwd
 	cmd.Env = BypassEnv()
 	return cmd.Output()
+}
+
+// Exec runs `git <args>` in cwd with POSTHOOK_BYPASS=1 and returns an error
+// carrying git's combined output when it exits non-zero. For commands that
+// print nothing on success (config --unset, update-ref -d), where Run's empty
+// return can't tell success from failure.
+func Exec(cwd string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	cmd.Env = BypassEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("git %s: %s", strings.Join(args, " "), msg)
+		}
+		return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return nil
 }

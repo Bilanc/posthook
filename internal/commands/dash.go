@@ -274,19 +274,48 @@ func stopDash() error {
 		_ = os.Remove(paths.DashPidFile())
 		return nil
 	}
-	if proc, err := os.FindProcess(pid); err == nil {
-		if sigErr := proc.Signal(syscall.SIGTERM); sigErr != nil && !errIsFinished(sigErr) {
-			logx.Warnf("could not signal dashboard process %d: %v", pid, sigErr)
-		} else {
-			logx.Infof("Stopped dashboard server (pid %d).", pid)
+	// The pid file can outlive the server (a crash leaves it behind) and the
+	// OS may hand that pid to some other process, so never signal — let
+	// alone kill — a pid the file no longer vouches for. A stale file is
+	// just cleaned up. When it is the server, wait for it to go away: it
+	// holds the database open and, during an uninstall, the directory it
+	// runs from is about to be deleted.
+	if processAlive(pid) {
+		if !dashPidFileOwnedBy(pid) {
+			logx.Warnf("pid %d in %s started after the file was written, so it is not the dashboard; removing the stale pid file.", pid, paths.DashPidFile())
+			_ = os.Remove(paths.DashPidFile())
+			return nil
 		}
+		if alive := terminateAndWait([]int{pid}, stopGrace); len(alive) > 0 {
+			return fmt.Errorf("dashboard server (pid %d) did not exit", pid)
+		}
+		logx.Infof("Stopped dashboard server (pid %d).", pid)
 	}
 	_ = os.Remove(paths.DashPidFile())
 	return nil
 }
 
-func errIsFinished(err error) bool {
-	return err == os.ErrProcessDone || err.Error() == "os: process already finished"
+// dashPidFileOwnedBy reports whether pid is still the server that wrote
+// dash.pid: it must already have been running when the file was written.
+// A pid the OS has since reused fails this, because its new owner started
+// later. The command line is no use as an identity check — Next.js
+// retitles its process to "next-server (v…)", which is all ps shows.
+func dashPidFileOwnedBy(pid int) bool {
+	st, err := os.Stat(paths.DashPidFile())
+	if err != nil {
+		return false
+	}
+	return processStartedBefore(pid, st.ModTime())
+}
+
+// runningDashPID returns the pid in dash.pid when that process is still the
+// dashboard server, else 0.
+func runningDashPID() int {
+	pid := trackedDashPID()
+	if pid <= 0 || !processAlive(pid) || !dashPidFileOwnedBy(pid) {
+		return 0
+	}
+	return pid
 }
 
 // portOpen reports whether something is accepting TCP connections at addr.
