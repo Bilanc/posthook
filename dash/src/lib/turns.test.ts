@@ -89,6 +89,39 @@ test("buildTurns cuts at Stops and buckets prompts, tools, commits and usage by 
   assert.equal(t2.output_tokens, 300);
 });
 
+test("buildTurns places a commit made just after a Stop in that turn only", () => {
+  const commit = (id: string, committed_at: string) => ({
+    id,
+    sha: id,
+    committed_at,
+    message: null,
+    lines_added: 1,
+    lines_removed: 0,
+    files_changed: 1,
+    lines_attributed: 1,
+    files_touched: 1,
+  });
+  const turns = buildTurns({
+    started_at: "2026-10-10T10:00:00Z",
+    ended_at: "2026-10-10T10:30:00Z",
+    stops: [stop("2026-10-10T10:00:30Z", "a"), stop("2026-10-10T10:10:00Z", "b"), stop("2026-10-10T10:20:00Z", "c")],
+    prompts: [
+      { ts: "2026-10-10T10:00:05Z", seq: 1, text: "one" },
+      { ts: "2026-10-10T10:01:30Z", seq: 2, text: "two" },
+      { ts: "2026-10-10T10:15:00Z", seq: 3, text: "three" },
+    ],
+    tools: [],
+    commits: [
+      commit("in-slack", "2026-10-10T10:01:00Z"), // 30s after Stop 1, inside turn 2's window too
+      commit("mid-turn", "2026-10-10T10:05:00Z"), // well inside turn 2
+      commit("trailing", "2026-10-10T10:40:00Z"), // after the session ended
+    ],
+    usage: null,
+  });
+  assert.equal(turns.length, 3);
+  assert.deepEqual(turns.map((x) => x.commits.map((c) => c.id)), [["in-slack"], ["mid-turn"], ["trailing"]]);
+});
+
 test("buildTurns adds an open turn for activity after the last Stop and leaves tokens null without usage", () => {
   const turns = buildTurns({
     started_at: "2026-10-10T10:00:00Z",

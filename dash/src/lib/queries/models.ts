@@ -2,6 +2,7 @@ import { db } from "../db.ts";
 import { sessionScopeSql, type Filters } from "../filters.ts";
 import { IDLE_GAP_MINUTES } from "./activity.ts";
 import { AI_EDIT_EVENT_CONDITION, LINES_GENERATED } from "./edit-condition.ts";
+import { ATTRIBUTED } from "./outcomes.ts";
 
 export interface ModelRow {
   agent: string;
@@ -76,7 +77,8 @@ export function modelTable(f: Filters): ModelRow[] {
     ),
     cm AS (
       SELECT cs.session_id, SUM(cs.lines_attributed) AS lines_committed, COUNT(DISTINCT cs.commit_id) AS commits
-      FROM commit_sessions cs JOIN scoped sc ON sc.id = cs.session_id GROUP BY 1
+      FROM commit_sessions cs JOIN scoped sc ON sc.id = cs.session_id
+      WHERE ${ATTRIBUTED} GROUP BY 1
     )
     SELECT sc.agent_slug AS agent, sc.model,
            COUNT(*) AS sessions,

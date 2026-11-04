@@ -12,7 +12,10 @@ interface Part {
 }
 
 // Active time split into what the model was doing versus what it waited on,
-// then the slowest tool calls of the period.
+// then the slowest tool calls of the period. Waits are capped per call at the
+// idle threshold, the same cap active time applies to the gap around the call,
+// so the model remainder is active minus waits; the max(0, …) only guards the
+// rare session where overlapping subagent calls still push waits past active.
 export function TimeSplitPanel({ ts }: { ts: TimeSplit }) {
   const wait = (fams: string[]) =>
     ts.waits.filter((w) => fams.includes(w.family)).reduce((a, w) => a + w.minutes, 0);

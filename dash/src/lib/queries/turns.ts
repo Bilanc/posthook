@@ -1,6 +1,7 @@
 import { db } from "../db.ts";
 import { AI_EDIT_EVENT_CONDITION, LINES_GENERATED } from "./edit-condition.ts";
 import { IDLE_GAP_MINUTES } from "./activity.ts";
+import { ATTRIBUTED } from "./outcomes.ts";
 
 // Everything the session page needs, in time order. The grouping into turns
 // happens in ../turns.ts so it can be unit-tested without a database.
@@ -120,7 +121,7 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
       `SELECT c.id, c.sha, c.committed_at, c.message, c.lines_added, c.lines_removed, c.files_changed,
               cs.lines_attributed, cs.files_touched
        FROM commit_sessions cs JOIN commits c ON c.id = cs.commit_id
-       WHERE cs.session_id = ?
+       WHERE cs.session_id = ? AND ${ATTRIBUTED}
        ORDER BY datetime(c.committed_at)`,
     )
     .all(sessionId) as SessionCommit[];

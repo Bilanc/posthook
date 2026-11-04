@@ -3,13 +3,19 @@ import { filterSql, sessionScopeSql, type Filters, type Outcome } from "../filte
 import { aiEditsCte } from "./overview.ts";
 import { AI_EDIT_EVENT_CONDITION } from "./edit-condition.ts";
 
+// posthook keeps a 0-line commit_sessions row when a recalculation finds that
+// a commit took nothing from a session after all (the row overwrites an earlier,
+// inflated one in the cloud). Such a row is not evidence of shipped code, so
+// every "has a commit" test here requires attributed lines.
+export const ATTRIBUTED = `cs.lines_attributed > 0`;
+
 // Per-session outcome flags as a CTE. Correlated EXISTS over the session
 // indexes; cheap at any realistic session count.
 export const SESSION_OUTCOMES_CTE = `session_outcomes AS (
   SELECT
     s.id AS session_id,
     EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.id AND ${AI_EDIT_EVENT_CONDITION}) AS has_edits,
-    EXISTS (SELECT 1 FROM commit_sessions cs WHERE cs.session_id = s.id) AS has_commits
+    EXISTS (SELECT 1 FROM commit_sessions cs WHERE cs.session_id = s.id AND ${ATTRIBUTED}) AS has_commits
   FROM sessions s
 )`;
 
@@ -37,8 +43,11 @@ export interface Funnel {
   commits: number;
 }
 
-// Sessions started in the window, by what they left behind, plus the line
-// funnel from the overview CTE.
+// Sessions started in the window, by what they left behind; lines generated
+// from edits in the window; lines committed from commits in the window. The
+// commit side reads commit_sessions directly rather than the overview CTE's
+// committed_ai, which only keeps commits whose session also has an edit in the
+// window and so drops a commit made the day after the edits.
 export function funnel(f: Filters): Funnel {
   const conn = db();
   const scope = sessionScopeSql(f, "s", "s.started_at");
@@ -60,12 +69,12 @@ export function funnel(f: Filters): Funnel {
       `${aiEditsCte(fchunk.sql)}
        SELECT
          (SELECT COALESCE(SUM(lines_generated), 0) FROM ai_edits_scored) AS lines_generated,
-         (SELECT COALESCE(SUM(ca.lines_generated), 0)
-            FROM committed_ai ca JOIN commits c ON c.id = ca.commit_id
-            LEFT JOIN sessions s ON s.id = ca.session_id WHERE 1=1${comScope.sql}) AS lines_committed,
-         (SELECT COUNT(DISTINCT ca.commit_id)
-            FROM committed_ai ca JOIN commits c ON c.id = ca.commit_id
-            LEFT JOIN sessions s ON s.id = ca.session_id WHERE 1=1${comScope.sql}) AS commits`,
+         (SELECT COALESCE(SUM(cs.lines_attributed), 0)
+            FROM commit_sessions cs JOIN commits c ON c.id = cs.commit_id
+            LEFT JOIN sessions s ON s.id = cs.session_id WHERE ${ATTRIBUTED}${comScope.sql}) AS lines_committed,
+         (SELECT COUNT(DISTINCT cs.commit_id)
+            FROM commit_sessions cs JOIN commits c ON c.id = cs.commit_id
+            LEFT JOIN sessions s ON s.id = cs.session_id WHERE ${ATTRIBUTED}${comScope.sql}) AS commits`,
     )
     .get(...fchunk.params, ...comScope.params, ...comScope.params) as {
     lines_generated: number;
@@ -95,7 +104,7 @@ export function leadTime(f: Filters): LeadTime {
          FROM commit_sessions cs
          JOIN commits c ON c.id = cs.commit_id
          LEFT JOIN sessions s ON s.id = cs.session_id
-         WHERE 1=1${scope.sql}
+         WHERE ${ATTRIBUTED}${scope.sql}
        )`,
     )
     .get(...scope.params) as LeadTime;

@@ -38,7 +38,9 @@ export default async function OverviewPage({
   const ts = timeSplit(filters);
   const days = windowDayKeys(filters, rows);
 
-  const empty = totals.sessions === 0 && fn.sessions === 0;
+  // Empty only when nothing at all happened in the window: a session that
+  // started before it can still contribute edits, commits and active time.
+  const empty = rows.length === 0 && fn.sessions === 0;
 
   return (
     <div>

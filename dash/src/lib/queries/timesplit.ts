@@ -7,13 +7,18 @@ const TOOL_NAME = `json_extract(e.payload, '$.tool_name')`;
 // Claude Code reports duration_ms; Cursor reports duration (ms). Codex reports
 // neither, so its waits are unknown rather than zero.
 const DURATION_MS = `COALESCE(json_extract(e.payload, '$.duration_ms'), json_extract(e.payload, '$.duration'))`;
+// Waits are summed on the same basis as active time: the gap a tool call
+// leaves between its Pre and Post events is capped at the idle threshold, so
+// the call's reported duration is capped the same way. Without this a single
+// 40-minute shell call would outweigh the active minutes it sits inside.
+const WAIT_MS = `MIN(${DURATION_MS}, ${IDLE_GAP_MINUTES * 60000})`;
 const POST_TOOL = `e.event_type IN ('PostToolUse', 'postToolUse') AND json_valid(e.payload)`;
 
 export interface FamilyWait {
   family: ToolFamily;
   calls: number;
   calls_with_duration: number;
-  minutes: number;
+  minutes: number; // each call capped at IDLE_GAP_MINUTES, like the active-time gap it sits in
 }
 
 export interface SlowCall {
@@ -28,7 +33,7 @@ export interface SlowCall {
 
 export interface TimeSplit {
   active_minutes: number;
-  waits: FamilyWait[];
+  waits: FamilyWait[]; // same per-call cap as active_minutes, so they sum inside it
   // Agents in scope whose tool calls carry no duration (their time in tools
   // is unknown, not zero).
   agents_without_durations: string[];
@@ -44,7 +49,7 @@ export function timeSplit(f: Filters, slowestN = 5): TimeSplit {
       `SELECT ${toolFamilySql(TOOL_NAME)} AS family,
               COUNT(*) AS calls,
               SUM(${DURATION_MS} IS NOT NULL) AS calls_with_duration,
-              COALESCE(SUM(${DURATION_MS}), 0) / 60000.0 AS minutes
+              COALESCE(SUM(${WAIT_MS}), 0) / 60000.0 AS minutes
        FROM events e LEFT JOIN sessions s ON s.id = e.session_id
        WHERE ${POST_TOOL}${fchunk.sql}
        GROUP BY 1

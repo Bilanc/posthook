@@ -1,5 +1,5 @@
 import { FilterBar } from "@/components/filter-bar";
-import { Panel } from "@/components/ui/panel";
+import { Empty, Panel } from "@/components/ui/panel";
 import { ModelsTable } from "@/components/agents/models-table";
 import { Dumbbell } from "@/components/agents/dumbbell";
 import { ToolMix } from "@/components/agents/tool-mix";
@@ -49,7 +49,7 @@ export default async function AgentsPage({
 
       <FilterBar filters={filters} options={options} />
 
-      {rows.length === 0 ? (
+      {rows.length === 0 && mix.length === 0 ? (
         <Panel>
           <div className="text-sm text-[var(--color-fg)]">No sessions in this range.</div>
           <div className="mt-1 text-xs text-[var(--color-fg-muted)]">
@@ -58,8 +58,14 @@ export default async function AgentsPage({
         </Panel>
       ) : (
         <>
+          {/* The table is per session started in the window; the tool mix is
+              per call, so it can have data when a session started earlier. */}
           <Panel title="Models" sub="sessions started in window" className="mb-4">
-            <ModelsTable rows={sorted} sort={key} dir={dir} preserved={preservedQuery(sp)} />
+            {rows.length === 0 ? (
+              <Empty>No sessions started in this range; the tool calls below come from sessions that started earlier.</Empty>
+            ) : (
+              <ModelsTable rows={sorted} sort={key} dir={dir} preserved={preservedQuery(sp)} />
+            )}
           </Panel>
           <div className="grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
             <Panel title="Generated → committed" sub="lines per model">

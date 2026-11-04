@@ -5,6 +5,7 @@ import {
   type Filters,
 } from "../filters.ts";
 import { aiEditsCte } from "./overview.ts";
+import { ATTRIBUTED } from "./outcomes.ts";
 
 // Active time is the sum of gaps between consecutive events in a session, each
 // gap capped at this many minutes. It replaces wall-clock session span, which
@@ -42,9 +43,11 @@ export interface DailyActivityRow {
   commits: number;
 }
 
-// One row per local day per agent. Generated/committed lines reuse the
-// overview CTE so the numbers match the funnel; sessions, prompts and active
-// minutes scope on the sessions table.
+// One row per local day per agent. Generated lines reuse the overview CTE;
+// committed lines come straight from commit_sessions bucketed by commit date,
+// so a commit made after the window's first day counts even when its edits
+// predate the window. Sessions, prompts and active minutes scope on the
+// sessions table.
 export function dailyActivity(f: Filters): DailyActivityRow[] {
   const conn = db();
   const fchunk = filterSql(f);
@@ -82,13 +85,13 @@ export function dailyActivity(f: Filters): DailyActivityRow[] {
       FROM ai_edits_scored e GROUP BY 1, 2
     ),
     com AS (
-      SELECT date(c.committed_at, 'localtime') AS day, ca.agent_slug,
-             COALESCE(SUM(ca.lines_generated), 0) AS lines_committed,
-             COUNT(DISTINCT ca.commit_id) AS commits
-      FROM committed_ai ca
-      JOIN commits c ON c.id = ca.commit_id
-      LEFT JOIN sessions s ON s.id = ca.session_id
-      WHERE 1=1${comScope.sql} GROUP BY 1, 2
+      SELECT date(c.committed_at, 'localtime') AS day, cs.agent_slug,
+             COALESCE(SUM(cs.lines_attributed), 0) AS lines_committed,
+             COUNT(DISTINCT cs.commit_id) AS commits
+      FROM commit_sessions cs
+      JOIN commits c ON c.id = cs.commit_id
+      LEFT JOIN sessions s ON s.id = cs.session_id
+      WHERE ${ATTRIBUTED}${comScope.sql} GROUP BY 1, 2
     ),
     keys AS (
       SELECT day, agent_slug FROM act UNION SELECT day, agent_slug FROM ses

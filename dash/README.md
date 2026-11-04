@@ -56,13 +56,18 @@ apply to every chart on a page.
   it caused, the edits, the agent's closing message. Prompts are bucketed into
   turns by timestamp.
 - **Outcome**: *Shipped* = at least one commit has AI lines attributed to the
-  session; *Edited* = the session edited a file but nothing is committed yet;
-  *Explored* = no file edits.
+  session (a 0-line attribution row, which posthook writes when a recount finds
+  nothing, does not count); *Edited* = the session edited a file but nothing
+  is committed yet; *Explored* = no file edits.
+- **Committed lines** are counted on the commit's date, so a commit made the
+  morning after the edits lands in the day and window it was made in.
 - **Keep rate** = AI lines committed ÷ AI lines generated. Lines written through
   shell commands (heredocs) are counted from the line ranges posthook located
   in the file, so a file can show more committed than generated lines.
 - Tool durations come from Claude Code (`duration_ms`) and Cursor; Codex
-  reports none, so its time in tools is shown as unknown rather than zero.
+  reports none, so its time in tools is shown as unknown rather than zero. In
+  "Where agent time goes" each call's wait is capped at the idle threshold,
+  the same cap active time applies, so the parts add up to active time.
   Token usage comes from Claude Code and Codex transcripts; Cursor reports none.
 
 ## Environment

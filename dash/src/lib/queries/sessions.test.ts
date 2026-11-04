@@ -18,6 +18,11 @@ const dbPath = installFixture();
       ('p5', 'D', '2026-11-02T10:00:05Z', 1, 'claude-code', 'This session is being continued from a previous conversation that ran out of context.'),
       ('p6', 'D', '2026-11-02T10:01:00Z', 2, 'claude-code', 'Carry on with the migration'),
       ('p7', 'E', '2026-11-03T10:00:05Z', 1, 'claude-code', 'This session is being continued from a previous conversation.');
+    -- A 0-line attribution row (posthook's recount tombstone) on D: not a shipped session.
+    INSERT INTO commits (id, repo_id, sha, committed_at, message, lines_added, lines_removed, files_changed)
+    VALUES ('c9', 'r1', '9999999', '2026-11-02T11:00:00Z', 'nothing of D', 5, 0, 1);
+    INSERT INTO commit_sessions (commit_id, session_id, agent_slug, model_slug, first_event_ts, last_event_ts, event_count, files_touched, lines_attributed)
+    VALUES ('c9', 'D', 'claude-code', 'claude-fable-5-1', '2026-11-02T10:01:00Z', '2026-11-02T10:01:00Z', 0, 0, 0);
   `);
   w.close();
 }
@@ -119,6 +124,9 @@ test("first_prompt skips compaction summaries and is null when nothing else was 
   assert.equal(d.first_prompt, "Carry on with the migration");
   assert.equal(d.prompts, 2);
   assert.equal(d.outcome, "explored");
+  assert.equal(d.commits_attributed, 0);
+  assert.deepEqual(d.commit_ts, []);
+  assert.equal(listSessions({ ...nov, outcome: "shipped" }, 1, 50).total, 0);
   assert.equal(d.ended_at, null);
   assert.equal(d.active_minutes, 0);
   assert.deepEqual(d.stop_ts, []);

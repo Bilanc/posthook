@@ -2,7 +2,7 @@ import { db } from "../db.ts";
 import { filterSqlForSessions, type Filters, type Outcome } from "../filters.ts";
 import { sessionActiveSql } from "./activity.ts";
 import { AI_EDIT_EVENT_CONDITION, LINES_GENERATED } from "./edit-condition.ts";
-import { OUTCOME_EXPR, SESSION_OUTCOMES_CTE } from "./outcomes.ts";
+import { ATTRIBUTED, OUTCOME_EXPR, SESSION_OUTCOMES_CTE } from "./outcomes.ts";
 
 // Re-exported for callers that still import these from here.
 export { NL, LINE_RANGE_LINES, LINES_GENERATED, AI_EDIT_EVENT_CONDITION } from "./edit-condition.ts";
@@ -125,7 +125,8 @@ export function listSessions(
         SELECT SUM(cs.lines_attributed) FROM commit_sessions cs WHERE cs.session_id = s.id
       ), 0) AS lines_committed,
       (
-        SELECT COUNT(DISTINCT cs.commit_id) FROM commit_sessions cs WHERE cs.session_id = s.id
+        SELECT COUNT(DISTINCT cs.commit_id) FROM commit_sessions cs
+        WHERE cs.session_id = s.id AND ${ATTRIBUTED}
       ) AS commits_attributed,
       ${OUTCOME_EXPR} AS outcome,
       (
@@ -139,7 +140,7 @@ export function listSessions(
       (
         SELECT group_concat(c.committed_at)
         FROM commit_sessions cs JOIN commits c ON c.id = cs.commit_id
-        WHERE cs.session_id = s.id
+        WHERE cs.session_id = s.id AND ${ATTRIBUTED}
       ) AS commit_ts
     FROM page so
     JOIN sessions s ON s.id = so.id

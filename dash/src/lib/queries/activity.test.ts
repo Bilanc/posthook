@@ -1,8 +1,37 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { installFixture } from "../test-fixture.ts";
 
-installFixture();
+const dbPath = installFixture();
+
+// Two November sessions on top of the fixture, written before the read-only
+// connection opens. F edits on 1 Nov and its commit lands on 3 Nov; G edits on
+// 5 Nov and carries a 0-line attribution row (posthook's "recount found
+// nothing" tombstone) on a 6 Nov commit.
+{
+  const w = new DatabaseSync(dbPath);
+  w.exec(`
+    INSERT INTO sessions (id, agent_slug, model_slug, repo_id, branch, started_at, ended_at)
+    VALUES ('F', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-11-01T10:00:00Z', '2026-11-01T10:05:00Z'),
+           ('G', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-11-05T10:00:00Z', '2026-11-05T10:05:00Z');
+    INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, payload) VALUES
+      ('f1', 'F', '2026-11-01T10:00:10Z', 'PostToolUse', 'claude-code', 'r1', 'src/f.ts',
+       '{"hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{"content":"a\nb\nc\nd\n"},"duration_ms":10}'),
+      ('f2', 'F', '2026-11-01T10:00:20Z', 'Stop', 'claude-code', 'r1', NULL, '{"hook_event_name":"Stop"}'),
+      ('g1', 'G', '2026-11-05T10:00:10Z', 'PostToolUse', 'claude-code', 'r1', 'src/g.ts',
+       '{"hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{"content":"a\n"},"duration_ms":10}'),
+      ('g2', 'G', '2026-11-05T10:00:20Z', 'Stop', 'claude-code', 'r1', NULL, '{"hook_event_name":"Stop"}');
+    INSERT INTO commits (id, repo_id, sha, committed_at, message, lines_added, lines_removed, files_changed) VALUES
+      ('c2', 'r1', 'def5678', '2026-11-03T09:00:00Z', 'later', 4, 0, 1),
+      ('c3', 'r1', '0000000', '2026-11-06T09:00:00Z', 'nothing of G', 7, 0, 1);
+    INSERT INTO commit_sessions (commit_id, session_id, agent_slug, model_slug, first_event_ts, last_event_ts, event_count, files_touched, lines_attributed) VALUES
+      ('c2', 'F', 'claude-code', 'claude-fable-5-1', '2026-11-01T10:00:10Z', '2026-11-01T10:00:10Z', 1, 1, 3),
+      ('c3', 'G', 'claude-code', 'claude-fable-5-1', '2026-11-05T10:00:10Z', '2026-11-05T10:00:10Z', 0, 0, 0);
+  `);
+  w.close();
+}
+
 const { dailyActivity, activityTotals } = await import("./activity.ts");
 const { funnel, leadTime } = await import("./outcomes.ts");
 const { modelTable } = await import("./models.ts");
@@ -47,6 +76,41 @@ test("dailyActivity respects the agent filter", () => {
   const rows = dailyActivity({ ...f, agents: ["codex"] });
   assert.deepEqual([...new Set(rows.map((r) => r.agent))], ["codex"]);
   assert.equal(activityTotals(rows).sessions, 1);
+});
+
+test("a commit counts on its own date even when its edits predate the window", () => {
+  // 2–30 Nov: F's edit (1 Nov) is outside, its commit (3 Nov) inside.
+  const nov = resolveFilters(parseFilters({ from: "2026-11-02", to: "2026-11-30" }));
+  const rows = dailyActivity(nov);
+  const day = rows.find((r) => r.day.endsWith("11-03"));
+  assert.ok(day, "the commit's day exists");
+  assert.equal(day.lines_committed, 3);
+  assert.equal(day.commits, 1);
+  assert.equal(day.sessions, 0);
+  const t = activityTotals(rows);
+  assert.equal(t.lines_committed, 3);
+  assert.equal(t.commits, 1);
+  const fn = funnel(nov);
+  assert.equal(fn.lines_committed, 3);
+  assert.equal(fn.commits, 1);
+});
+
+test("a 0-line attribution row does not make a session shipped or count as a commit", () => {
+  const nov = resolveFilters(parseFilters({ from: "2026-11-01", to: "2026-11-30" }));
+  const fn = funnel(nov);
+  assert.equal(fn.sessions, 2);
+  assert.equal(fn.with_edits, 2);
+  assert.equal(fn.with_commits, 1); // F only
+  assert.equal(fn.commits, 1);
+  assert.equal(fn.lines_committed, 3);
+  const rows = dailyActivity(nov);
+  assert.equal(rows.find((r) => r.day.endsWith("11-06"))?.commits ?? 0, 0);
+  const g = modelTable(nov).find((r) => r.agent === "claude-code");
+  assert.ok(g);
+  assert.equal(g.sessions, 2);
+  assert.equal(g.sessions_with_commits, 1);
+  assert.equal(g.commits, 1);
+  assert.equal(leadTime(nov).total, 1);
 });
 
 test("funnel counts sessions by outcome and lines by stage", () => {

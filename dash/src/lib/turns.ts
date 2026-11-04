@@ -98,6 +98,22 @@ export function buildTurns(input: BuildTurnsInput): Turn[] {
     bounds.push({ start: windowStart, end: input.ended_at ?? new Date().toISOString(), stop: null });
   }
 
+  // Each commit lands in exactly one turn. Turns share their boundary (one ends
+  // at the Stop the next starts from), and the slack after a Stop overlaps the
+  // next turn's window, so the earliest turn whose slack-extended window holds
+  // the commit wins: a commit made just after a Stop belongs to the turn that
+  // produced the code, not to the prompt typed afterwards. The last turn also
+  // absorbs anything committed after it. Commits from before the session are
+  // left unplaced; the page lists them separately.
+  const commitsByTurn: SessionCommit[][] = bounds.map(() => []);
+  for (const c of input.commits) {
+    const ct = t(c.committed_at);
+    const i = bounds.findIndex(
+      (b, k) => ct > t(b.start) && (k === bounds.length - 1 || ct <= t(b.end) + COMMIT_SLACK_MS),
+    );
+    if (i >= 0) commitsByTurn[i].push(c);
+  }
+
   bounds.forEach((b, i) => {
     const s = t(b.start), e = t(b.end);
     const inWin = (ts: string | null) => ts != null && t(ts) > s && t(ts) <= e;
@@ -106,11 +122,7 @@ export function buildTurns(input: BuildTurnsInput): Turn[] {
     const tools: TurnToolCall[] = input.tools
       .filter((x) => inWin(x.ts) || (firstWindow && t(x.ts) <= s))
       .map((x) => ({ ...x, family: x.ranged ? "edit" : toolFamily(x.tool_name) }));
-    const nextStart = bounds[i + 1] ? t(bounds[i + 1].start) : Infinity;
-    const commits = input.commits.filter((c) => {
-      const ct = t(c.committed_at);
-      return ct > s && (ct <= e + COMMIT_SLACK_MS || (ct <= nextStart && i === bounds.length - 1));
-    });
+    const commits = commitsByTurn[i];
     const usage = input.usage ? input.usage.filter((u) => inWin(u.ts) || (firstWindow && t(u.ts) <= s)) : null;
     const families: Partial<Record<ToolFamily, number>> = {};
     for (const x of tools) families[x.family] = (families[x.family] ?? 0) + 1;
