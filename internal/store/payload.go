@@ -32,8 +32,9 @@ const (
 )
 
 // toolOutputKeys name what a tool returned: tool_response for Claude Code,
-// Codex and Devin; tool_output for Cursor; tool_result for GitHub Copilot.
-var toolOutputKeys = []string{"tool_response", "tool_output", "tool_result"}
+// Codex and Devin; tool_output for Cursor; tool_result for GitHub Copilot,
+// whose normalization keeps the camelCase toolResult it arrived under too.
+var toolOutputKeys = []string{"tool_response", "tool_output", "tool_result", "toolResult"}
 
 // keptOutputStrings are the string members of a tool output worth keeping,
 // capped at MaxStoredStderrBytes: they say whether the call failed, not what
