@@ -111,6 +111,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 - `posthook inspect [--agent X] [--type Y] [--session Z] [--since ISO] [--limit N]` — raw event payloads.
 - `posthook dash` — open the local web dashboard. Starts the bundled server (reading `~/.posthook/posthook.db`) if it isn't running, waits for it, then opens your browser. `--no-open` starts it headless; `--stop` shuts it down; `--restart` stops and starts it (do this after upgrading posthook so it serves the new bundle). Binds `127.0.0.1:3847` by default.
 - `posthook sync` — flush local rows to a cloud endpoint (see [Team / cloud](#team--cloud)). `--loop` flushes continuously, `--status` shows pending counts and last-flush state, `--set-endpoint/--set-token/--set-enabled` write `~/.posthook/config.json`.
+- `posthook prune` — delete events and prompts older than the retention window (default 365 days) from the local store; sessions, commits, attribution and the edit events behind it are always kept. The background worker does this automatically once a day, so you only need it by hand to tighten the window or reclaim space: `--older-than 90d` (also `Nw`, `Nm`, `Ny`), `--dry-run` counts without deleting, `--vacuum` shrinks the file afterwards, `--include-unsynced` lifts the cloud-mode rule that only synced rows are pruned, `--set-retention-days N` writes `storage.retention_days` to `~/.posthook/config.json` (0 = keep forever).
 - `posthook identity` — show or set the engineer identity (work email + name) stamped on every session; it's how the team dashboard attributes activity to people. `--setup` detects a default from git config and confirms it interactively (the team installer runs this), `--set-email/--set-name` write it directly. The confirmed identity takes precedence over per-repo git config.
 - `posthook service install|uninstall|status` — manage a background daemon (launchd on macOS, systemd `--user` on Linux) that runs `posthook sync --loop` so a connected machine keeps flushing across reboots. The team installer sets this up automatically.
 - `posthook update` — update posthook to the latest release by re-running the official installer (the same as installing from curl again): downloads the latest binary for your OS/arch (sha256 verified), refreshes the dashboard bundle, and re-runs `posthook init`. Your local database and cloud-sync config are left untouched. `--version X.Y.Z` pins a specific release.
@@ -133,7 +134,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 | Path | What |
 |---|---|
 | `~/.posthook/posthook.db` | SQLite — all your data (`repositories`, `sessions`, `events`, `event_line_ranges`, `commits`, `commit_files`, `commit_sessions`, `commit_session_files`) |
-| `~/.posthook/config.json` | Cloud-sync settings (endpoint, install token, enabled flag, flush interval) and the engineer identity (work email + name). Absent until you configure sync or set an identity. |
+| `~/.posthook/config.json` | Cloud-sync settings (endpoint, install token, enabled flag, flush interval), the engineer identity (work email + name) and the storage retention window (`storage.retention_days`). Absent until you configure one of them. |
 | `~/.posthook/git-path` | Absolute path to the real git binary. Written at install time, read on every shadow invocation. |
 | `~/.posthook/dash/` | Staged dashboard build, spawned by `posthook dash`. |
 | `~/.posthook/dash.pid` / `dash.log` | PID + logs of the background dashboard server. |
@@ -147,6 +148,8 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 
 `posthook uninstall` removes everything in this table (see [Commands](#commands)); `posthook uninstall --dry-run` shows exactly what that means on your machine.
 
+**Retention.** The database does not grow forever: events and typed prompts older than **365 days** are pruned by default. Pruning only ever removes non-edit events (tool reads, shell calls, session start/stop markers, misfires) and `session_prompts`; sessions, repositories, commits, attribution (`commit_sessions`, `commit_session_files`, `event_line_ranges`) and the edit events that back it are kept forever, so `posthook blame` and the committed-lines figures never lose history. When cloud sync is on, only rows already flushed upstream are pruned. The window is `storage.retention_days` in `config.json` (`0` = keep forever; `posthook prune --set-retention-days N` writes it) or the `POSTHOOK_RETENTION_DAYS` env var. The background worker runs the prune at most once a day; `posthook status` shows the database size and the last prune. Deleting rows frees space inside the file but doesn't shrink it — `posthook prune --vacuum` does.
+
 ### Environment variables
 
 - `POSTHOOK_BIN` — override the binary path written into hook configs (useful for dev installs).
@@ -157,6 +160,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 - `POSTHOOK_DASH_PORT` / `POSTHOOK_DASH_HOSTNAME` — override where `posthook dash` binds (default `127.0.0.1:3847`). Read by both the Go command and the dashboard server so they always agree.
 - `POSTHOOK_DASH_AUTOSTART=0` — skip the automatic dashboard start at the end of `posthook init`.
 - `POSTHOOK_CLOUD_ENDPOINT` / `POSTHOOK_CLOUD_TOKEN` / `POSTHOOK_CLOUD_ENABLED` / `POSTHOOK_CLOUD_FLUSH_SECS` — override cloud-sync settings without editing `config.json` (handy for pointing one binary at a staging endpoint).
+- `POSTHOOK_RETENTION_DAYS` — override `storage.retention_days`: how many days of events and prompts the local store keeps (default `365`, `0` = forever).
 - `POSTHOOK_ENGINEER_EMAIL` / `POSTHOOK_ENGINEER_NAME` — override the engineer identity; `posthook identity --setup` persists them without prompting (handy for MDM or dotfiles installs).
 - `POSTHOOK_API_KEY` / `POSTHOOK_VERSION` / `POSTHOOK_INSTALL_DIR` — read by `install.sh`: a team install key enables cloud sync + the background daemon, `POSTHOOK_VERSION` pins a release (default: latest), and `POSTHOOK_INSTALL_DIR` chooses the install directory (default `~/.local/bin`).
 
