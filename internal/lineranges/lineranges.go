@@ -126,17 +126,58 @@ func rangeForMatch(postContent string, matchIndex int, newString string) LineRan
 
 // Extract returns the line ranges that the named tool wrote into postContent.
 //
-// Line endings: agents hand us LF text (hook payloads, apply_patch blocks,
-// shell heredocs) even when the file on disk uses CRLF, and the odd payload
-// carries CRLF into an LF file. Matching therefore runs on LF-normalized
-// copies of both sides. Dropping the CR bytes leaves every '\n' in place, so
-// line numbers computed on the normalized content are the file's real line
-// numbers and the new-text line counts are unchanged.
+// Matching is byte-exact first: that is what every edit to a consistently
+// LF file needs, and in a file with mixed line endings it is the only thing
+// that tells otherwise identical occurrences apart. Only when something is
+// left unlocated is the search retried with CRLF folded to LF on both sides,
+// because agents hand us LF text (hook payloads, apply_patch blocks, shell
+// heredocs) even when the file on disk uses CRLF, and the odd payload carries
+// CRLF into an LF file. Dropping the CR bytes leaves every '\n' in place, so
+// line numbers computed on the folded content are the file's real line
+// numbers and the new-text line counts are unchanged; the retry is kept only
+// if it locates more edits than the exact pass.
 func Extract(toolName string, in ToolInput, postContent string) Extracted {
-	postContent = normalizeNewlines(postContent)
+	out := extract(toolName, in, postContent)
+	if out.Unlocated == 0 || !mentionsCRLF(in, postContent) {
+		return out
+	}
+	retry := extract(toolName, normalizeInput(in), normalizeNewlines(postContent))
+	if retry.Unlocated < out.Unlocated {
+		return retry
+	}
+	return out
+}
+
+func mentionsCRLF(in ToolInput, postContent string) bool {
+	if strings.Contains(postContent, "\r\n") || strings.Contains(in.NewString, "\r\n") || strings.Contains(in.Content, "\r\n") {
+		return true
+	}
+	for _, e := range in.Edits {
+		if strings.Contains(e.NewString, "\r\n") {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeInput(in ToolInput) ToolInput {
+	out := in
+	out.NewString = normalizeNewlines(in.NewString)
+	out.Content = normalizeNewlines(in.Content)
+	if len(in.Edits) > 0 {
+		out.Edits = make([]Edit, len(in.Edits))
+		for i, e := range in.Edits {
+			out.Edits[i] = Edit{OldString: e.OldString, NewString: normalizeNewlines(e.NewString)}
+		}
+	}
+	return out
+}
+
+// extract is one byte-exact pass over postContent.
+func extract(toolName string, in ToolInput, postContent string) Extracted {
 	switch toolName {
 	case "Write":
-		content := normalizeNewlines(in.Content)
+		content := in.Content
 		if content == "" {
 			content = postContent
 		}
@@ -147,55 +188,51 @@ func Extract(toolName string, in ToolInput, postContent string) Extracted {
 		return Extracted{Ranges: []LineRange{{StartLine: 1, EndLine: total, NewTextLines: total}}}
 
 	case "Edit":
-		newString := normalizeNewlines(in.NewString)
-		if newString == "" {
+		if in.NewString == "" {
 			return Extracted{}
 		}
-		idx := strings.Index(postContent, newString)
+		idx := strings.Index(postContent, in.NewString)
 		if idx == -1 {
 			return Extracted{Unlocated: 1}
 		}
-		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, newString)}}
+		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, in.NewString)}}
 
 	case "ShellWrite":
 		// Content recovered from a shell command (heredoc, echo …). A whole
 		// file write matches at offset 0; an append matches at the end, so
 		// prefer the last occurrence.
-		content := normalizeNewlines(in.Content)
-		if content == "" {
+		if in.Content == "" {
 			return Extracted{}
 		}
-		idx := strings.LastIndex(postContent, content)
+		idx := strings.LastIndex(postContent, in.Content)
 		if idx == -1 {
 			return Extracted{Unlocated: 1}
 		}
-		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, content)}}
+		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, in.Content)}}
 
 	case "MultiEdit":
 		var ranges []LineRange
 		var claimed []claimedRange
 		unlocated := 0
 		for _, edit := range in.Edits {
-			newString := normalizeNewlines(edit.NewString)
-			if newString == "" {
+			if edit.NewString == "" {
 				continue
 			}
-			idx := findUnclaimed(postContent, newString, claimed)
+			idx := findUnclaimed(postContent, edit.NewString, claimed)
 			if idx == -1 {
 				unlocated++
 				continue
 			}
-			claimed = append(claimed, claimedRange{start: idx, end: idx + len(newString)})
-			ranges = append(ranges, rangeForMatch(postContent, idx, newString))
+			claimed = append(claimed, claimedRange{start: idx, end: idx + len(edit.NewString)})
+			ranges = append(ranges, rangeForMatch(postContent, idx, edit.NewString))
 		}
 		return Extracted{Ranges: ranges, Unlocated: unlocated}
 	}
 	return Extracted{}
 }
 
-// normalizeNewlines folds CRLF to LF. Lone CRs are left alone: they are not
-// line endings in any format we see, and touching them would change offsets
-// the caller cannot predict.
+// normalizeNewlines folds CRLF to LF for the fallback pass. Lone CRs are
+// left alone: they are not line endings in any format we see.
 func normalizeNewlines(s string) string {
 	if !strings.Contains(s, "\r\n") {
 		return s

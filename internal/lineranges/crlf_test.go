@@ -85,3 +85,42 @@ func TestExtractLFFilesUnchanged(t *testing.T) {
 		t.Fatalf("unlocated edit: got %#v", got)
 	}
 }
+
+// Mixed-ending files: an exact match must win over the folded fallback, so
+// the occurrence whose line ending matches the payload is the one attributed.
+func TestExtractPrefersExactMatchInMixedEndingFile(t *testing.T) {
+	file := "same\nother\nsame\r\n"
+	got := Extract("Edit", ToolInput{NewString: "same\r\n"}, file)
+	want := Extracted{Ranges: []LineRange{{StartLine: 3, EndLine: 3, NewTextLines: 1}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
+	}
+
+	file = "a\r\nfoo\nb\r\nfoo\r\n"
+	got = Extract("MultiEdit", ToolInput{Edits: []Edit{{NewString: "foo\r\n"}}}, file)
+	want = Extracted{Ranges: []LineRange{{StartLine: 4, EndLine: 4, NewTextLines: 1}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestExtractFoldedRetryOnlyWhenItLocatesMore(t *testing.T) {
+	// Exact pass locates one of two edits; the folded pass locates both and wins.
+	file := "x\r\nfoo\r\nbar\r\n"
+	got := Extract("MultiEdit", ToolInput{Edits: []Edit{{NewString: "foo\r\n"}, {NewString: "bar\n"}}}, file)
+	want := Extracted{Ranges: []LineRange{
+		{StartLine: 2, EndLine: 2, NewTextLines: 1},
+		{StartLine: 3, EndLine: 3, NewTextLines: 1},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
+	}
+
+	// Nothing to gain from folding: the exact result (with its unlocated
+	// count) is returned unchanged.
+	got = Extract("MultiEdit", ToolInput{Edits: []Edit{{NewString: "foo\r\n"}, {NewString: "nope\n"}}}, file)
+	want = Extracted{Ranges: []LineRange{{StartLine: 2, EndLine: 2, NewTextLines: 1}}, Unlocated: 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
+	}
+}
