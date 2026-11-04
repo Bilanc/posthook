@@ -125,10 +125,18 @@ func rangeForMatch(postContent string, matchIndex int, newString string) LineRan
 }
 
 // Extract returns the line ranges that the named tool wrote into postContent.
+//
+// Line endings: agents hand us LF text (hook payloads, apply_patch blocks,
+// shell heredocs) even when the file on disk uses CRLF, and the odd payload
+// carries CRLF into an LF file. Matching therefore runs on LF-normalized
+// copies of both sides. Dropping the CR bytes leaves every '\n' in place, so
+// line numbers computed on the normalized content are the file's real line
+// numbers and the new-text line counts are unchanged.
 func Extract(toolName string, in ToolInput, postContent string) Extracted {
+	postContent = normalizeNewlines(postContent)
 	switch toolName {
 	case "Write":
-		content := in.Content
+		content := normalizeNewlines(in.Content)
 		if content == "" {
 			content = postContent
 		}
@@ -139,47 +147,60 @@ func Extract(toolName string, in ToolInput, postContent string) Extracted {
 		return Extracted{Ranges: []LineRange{{StartLine: 1, EndLine: total, NewTextLines: total}}}
 
 	case "Edit":
-		if in.NewString == "" {
+		newString := normalizeNewlines(in.NewString)
+		if newString == "" {
 			return Extracted{}
 		}
-		idx := strings.Index(postContent, in.NewString)
+		idx := strings.Index(postContent, newString)
 		if idx == -1 {
 			return Extracted{Unlocated: 1}
 		}
-		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, in.NewString)}}
+		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, newString)}}
 
 	case "ShellWrite":
 		// Content recovered from a shell command (heredoc, echo …). A whole
 		// file write matches at offset 0; an append matches at the end, so
 		// prefer the last occurrence.
-		if in.Content == "" {
+		content := normalizeNewlines(in.Content)
+		if content == "" {
 			return Extracted{}
 		}
-		idx := strings.LastIndex(postContent, in.Content)
+		idx := strings.LastIndex(postContent, content)
 		if idx == -1 {
 			return Extracted{Unlocated: 1}
 		}
-		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, in.Content)}}
+		return Extracted{Ranges: []LineRange{rangeForMatch(postContent, idx, content)}}
 
 	case "MultiEdit":
 		var ranges []LineRange
 		var claimed []claimedRange
 		unlocated := 0
 		for _, edit := range in.Edits {
-			if edit.NewString == "" {
+			newString := normalizeNewlines(edit.NewString)
+			if newString == "" {
 				continue
 			}
-			idx := findUnclaimed(postContent, edit.NewString, claimed)
+			idx := findUnclaimed(postContent, newString, claimed)
 			if idx == -1 {
 				unlocated++
 				continue
 			}
-			claimed = append(claimed, claimedRange{start: idx, end: idx + len(edit.NewString)})
-			ranges = append(ranges, rangeForMatch(postContent, idx, edit.NewString))
+			claimed = append(claimed, claimedRange{start: idx, end: idx + len(newString)})
+			ranges = append(ranges, rangeForMatch(postContent, idx, newString))
 		}
 		return Extracted{Ranges: ranges, Unlocated: unlocated}
 	}
 	return Extracted{}
+}
+
+// normalizeNewlines folds CRLF to LF. Lone CRs are left alone: they are not
+// line endings in any format we see, and touching them would change offsets
+// the caller cannot predict.
+func normalizeNewlines(s string) string {
+	if !strings.Contains(s, "\r\n") {
+		return s
+	}
+	return strings.ReplaceAll(s, "\r\n", "\n")
 }
 
 // ParseApplyPatch parses Codex CLI's apply_patch command text into a slice of
