@@ -27,6 +27,9 @@
 # Env overrides:
 #   POSTHOOK_API_KEY        team ingest key — enables cloud sync + daemon
 #   POSTHOOK_CLOUD_ENDPOINT ingest base URL (default https://api.bilanc.co)
+#   POSTHOOK_CLOUD_SYNC_MODE  full (default) or metadata_only. The team link
+#                           bakes in the org's setting; metadata_only keeps
+#                           prompts, code and tool output on this machine.
 #   POSTHOOK_ENGINEER_EMAIL work email to attribute sessions to (skips the prompt)
 #   POSTHOOK_ENGINEER_NAME  display name to go with the email
 #   POSTHOOK_VERSION        pin a release, e.g. 0.1.0 (default: latest)
@@ -114,6 +117,23 @@ verify_sha256 "$tmp/$asset" "$tmp/checksums.txt"
 tar -xzf "$tmp/$asset" -C "$tmp"
 [ -f "$tmp/posthook" ] || die "release archive did not contain a posthook binary"
 
+# A team policy of metadata-only is written BEFORE the binary swap, using the
+# freshly downloaded binary. The sync daemon from an earlier install watches
+# the binary on disk and relaunches on the new one the instant it lands,
+# reading config.json as it is at that moment — if the mode were written
+# afterwards, that first relaunch could flush a batch in full mode. Doing it
+# here also means a release that predates --set-sync-mode fails before
+# anything on the machine has changed.
+if [ -n "${POSTHOOK_API_KEY:-}" ] && [ -n "${POSTHOOK_CLOUD_SYNC_MODE:-}" ]; then
+  endpoint="${POSTHOOK_CLOUD_ENDPOINT:-$DEFAULT_ENDPOINT}"
+  info "Configuring cloud sync -> $endpoint (sync mode: $POSTHOOK_CLOUD_SYNC_MODE)"
+  "$tmp/posthook" sync --set-endpoint "$endpoint" --set-token "$POSTHOOK_API_KEY" --set-enabled true --set-sync-mode "$POSTHOOK_CLOUD_SYNC_MODE" || {
+    warn "posthook $ver does not support --set-sync-mode $POSTHOOK_CLOUD_SYNC_MODE. Nothing was installed or changed."
+    warn "Install a newer release (unset POSTHOOK_VERSION) or ask your admin."
+    exit 1
+  }
+fi
+
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp/posthook" "$INSTALL_DIR/posthook"
 BIN="$INSTALL_DIR/posthook"
@@ -135,7 +155,9 @@ fi
 # ---------------------------------------------------------------------------
 # 3. Configure cloud sync (only with a team key)
 # ---------------------------------------------------------------------------
-if [ -n "${POSTHOOK_API_KEY:-}" ]; then
+# (With POSTHOOK_CLOUD_SYNC_MODE set this already happened in step 1, before
+# the binary swap — see the note there.)
+if [ -n "${POSTHOOK_API_KEY:-}" ] && [ -z "${POSTHOOK_CLOUD_SYNC_MODE:-}" ]; then
   endpoint="${POSTHOOK_CLOUD_ENDPOINT:-$DEFAULT_ENDPOINT}"
   info ""
   info "Configuring cloud sync -> $endpoint"

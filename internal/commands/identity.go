@@ -63,7 +63,7 @@ var emailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 func looksLikeEmail(s string) bool { return emailRe.MatchString(s) }
 
 func runIdentityShow() error {
-	disk, err := readDiskConfig()
+	disk, err := config.ReadDisk()
 	if err != nil {
 		return err
 	}
@@ -106,7 +106,7 @@ func runIdentitySet(email, name string) error {
 	if email != "" && !looksLikeEmail(email) {
 		return fmt.Errorf("%q does not look like an email address", email)
 	}
-	disk, err := readDiskConfig()
+	disk, err := config.ReadDisk()
 	if err != nil {
 		return err
 	}
@@ -132,7 +132,7 @@ func runIdentitySet(email, name string) error {
 // `curl | sh` install: no TTY and no env override just means "set it later",
 // reported as a warning with exit 0.
 func runIdentitySetup() error {
-	disk, err := readDiskConfig()
+	disk, err := config.ReadDisk()
 	if err != nil {
 		return err
 	}

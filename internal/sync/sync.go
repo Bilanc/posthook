@@ -1,6 +1,10 @@
 // Package sync flushes locally-captured posthook rows to the cloud ingest
 // endpoint. The local SQLite store is authoritative — sync is a faithful
-// upstream replica, no redaction, no schema rewrites.
+// upstream replica with no schema rewrites. In full mode there is no
+// redaction either; in metadata-only mode (config.SyncModeMetadataOnly) every
+// outgoing row passes through the allowlist in redact.go first, so prompt
+// text, code and tool output stay on the machine. The local store is never
+// altered by either mode.
 //
 // Each syncable table carries a synced_at TEXT column (NULL = pending) — the
 // only sync state we keep, a per-row "what's new since last flush" cursor.
@@ -57,10 +61,15 @@ var tablePrimaryKeys = map[string][]string{
 
 // Result is the per-flush summary surfaced by `posthook sync --once`.
 type Result struct {
-	Synced     map[string]int `json:"synced"`
-	DurationMS int64          `json:"duration_ms"`
-	Skipped    bool           `json:"skipped,omitempty"`
-	Reason     string         `json:"reason,omitempty"`
+	// ServerSyncMode is the org policy the server reported in its response
+	// ("" when it said nothing). The commands layer tightens this machine to
+	// metadata_only when the server says so and the batch went out in full;
+	// a server can only ever tighten a client, never widen it.
+	ServerSyncMode string         `json:"server_sync_mode,omitempty"`
+	Synced         map[string]int `json:"synced"`
+	DurationMS     int64          `json:"duration_ms"`
+	Skipped        bool           `json:"skipped,omitempty"`
+	Reason         string         `json:"reason,omitempty"`
 	// More is set when at least one table returned a full batch, so rows may
 	// still be pending and another Flush is needed to catch up.
 	More bool `json:"more,omitempty"`
@@ -69,6 +78,76 @@ type Result struct {
 type ingestPayload struct {
 	SchemaVersion int                         `json:"schema_version"`
 	Tables        map[string][]map[string]any `json:"tables"`
+}
+
+// schemaVersion is stamped on every batch for observability upstream (the
+// API never gates on it). v9 added session_prompts. v10 adds metadata-only
+// mode: session_prompts rows may carry prompt_chars + redacted with an empty
+// prompt_text, events.payload may be an allowlisted object stamped
+// posthook_redacted, events.lines_added may be set for Edit/Write-style
+// tools, and commits.message may be null.
+const schemaVersion = 10
+
+type pendingRows struct {
+	rows []map[string]any
+	keys []map[string]any
+}
+
+// batch is one flush's worth of pending rows: the wire payload plus the
+// primary keys needed to mark exactly those rows synced afterwards.
+type batch struct {
+	payload ingestPayload
+	pending map[string]pendingRows
+	more    bool
+	mode    string // resolved sync mode the batch was built for
+}
+
+// collectPending reads up to batchSize pending rows per table and, in
+// metadata-only mode, redacts them. Shared by Flush and Preview so the
+// preview is byte-for-byte what the next flush would send.
+func collectPending(db *store.DB, cfg config.CloudConfig, batchSize int) (batch, error) {
+	b := batch{
+		payload: ingestPayload{SchemaVersion: schemaVersion, Tables: map[string][]map[string]any{}},
+		pending: map[string]pendingRows{},
+	}
+	// Fail closed before touching a row: an unrecognised sync_mode (a typo in
+	// config.json or the env) must pause sync entirely, never fall through to
+	// the wider mode.
+	mode, err := cfg.ResolveSyncMode()
+	if err != nil {
+		return b, fmt.Errorf("cloud.sync_mode: %w — sync is paused; fix it with: posthook sync --set-sync-mode %s|%s",
+			err, config.SyncModeFull, config.SyncModeMetadataOnly)
+	}
+	b.mode = mode
+	for _, table := range store.SyncableTables {
+		rows, keys, err := selectPending(db, table, batchSize)
+		if err != nil {
+			recordError(db, table, err)
+			return b, fmt.Errorf("select pending from %s: %w", table, err)
+		}
+		if len(rows) == 0 {
+			continue
+		}
+		b.pending[table] = pendingRows{rows: rows, keys: keys}
+		b.payload.Tables[table] = rows
+		if len(rows) == batchSize {
+			b.more = true
+		}
+	}
+	if mode == config.SyncModeMetadataOnly {
+		RedactTables(b.payload.Tables)
+	}
+	return b, nil
+}
+
+// Preview returns the exact batch the next Flush would POST — same row
+// selection, same redaction — without sending anything or marking rows
+// synced. It ignores cloud.enabled so a machine can show what *would* leave
+// before sync is switched on; a security reviewer can diff full vs
+// metadata-only output on real data.
+func Preview(db *store.DB, cfg config.CloudConfig) (ingestPayload, error) {
+	b, err := collectPending(db, cfg, defaultBatchSize)
+	return b.payload, err
 }
 
 // Flush pulls up to batchSize pending rows per syncable table, ships them in
@@ -87,29 +166,12 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 		return res, nil
 	}
 
-	type pendingRows struct {
-		rows []map[string]any
-		keys []map[string]any
+	b, err := collectPending(db, cfg, defaultBatchSize)
+	if err != nil {
+		return res, err
 	}
-	pending := map[string]pendingRows{}
-	// v9: adds the session_prompts table (typed prompts per session).
-	payload := ingestPayload{SchemaVersion: 9, Tables: map[string][]map[string]any{}}
-
-	for _, table := range store.SyncableTables {
-		rows, keys, err := selectPending(db, table, defaultBatchSize)
-		if err != nil {
-			recordError(db, table, err)
-			return res, fmt.Errorf("select pending from %s: %w", table, err)
-		}
-		if len(rows) == 0 {
-			continue
-		}
-		pending[table] = pendingRows{rows: rows, keys: keys}
-		payload.Tables[table] = rows
-		if len(rows) == defaultBatchSize {
-			res.More = true
-		}
-	}
+	pending, payload := b.pending, b.payload
+	res.More = b.more
 	if len(payload.Tables) == 0 {
 		res.DurationMS = time.Since(start).Milliseconds()
 		return res, nil
@@ -127,6 +189,7 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	req.Header.Set("User-Agent", "posthook-sync/1")
+	req.Header.Set("X-Posthook-Sync-Mode", b.mode)
 
 	client := &http.Client{Timeout: httpTimeout}
 	resp, err := client.Do(req)
@@ -146,7 +209,9 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 		}
 		return res, ingestErr
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// The server answers with the org's policy; surface it so the caller can
+	// tighten this machine when the org is metadata-only (see Result).
+	res.ServerSyncMode = readServerSyncMode(resp.Body)
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, table := range store.SyncableTables {
@@ -162,6 +227,23 @@ func Flush(ctx context.Context, db *store.DB, cfg config.CloudConfig) (Result, e
 	}
 	res.DurationMS = time.Since(start).Milliseconds()
 	return res, nil
+}
+
+// readServerSyncMode pulls sync_mode out of a 2xx ingest response. Anything
+// unexpected — no body, not JSON, unknown value — reads as "" (no policy
+// reported); a malformed response must never change a client's behaviour.
+func readServerSyncMode(body io.Reader) string {
+	var reply struct {
+		SyncMode string `json:"sync_mode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(body, 64<<10)).Decode(&reply); err != nil {
+		return ""
+	}
+	mode, err := config.NormalizeSyncMode(reply.SyncMode)
+	if err != nil || reply.SyncMode == "" {
+		return ""
+	}
+	return mode
 }
 
 // selectPending streams up to limit unsync'd rows from table as
@@ -308,12 +390,12 @@ func Pending(db *store.DB) (int, error) {
 
 // Status row from sync_state, surfaced by `posthook sync --status`.
 type StatusRow struct {
-	Table         string         `json:"table"`
-	LastAttempt   sql.NullString `json:"last_attempt_at"`
-	LastSuccess   sql.NullString `json:"last_success_at"`
-	LastRowCount  sql.NullInt64  `json:"last_row_count"`
-	LastError     sql.NullString `json:"last_error"`
-	PendingRows   int            `json:"pending_rows"`
+	Table        string         `json:"table"`
+	LastAttempt  sql.NullString `json:"last_attempt_at"`
+	LastSuccess  sql.NullString `json:"last_success_at"`
+	LastRowCount sql.NullInt64  `json:"last_row_count"`
+	LastError    sql.NullString `json:"last_error"`
+	PendingRows  int            `json:"pending_rows"`
 }
 
 // ReadStatus returns per-table sync_state plus a live count of pending rows.

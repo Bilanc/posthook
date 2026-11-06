@@ -154,7 +154,7 @@ func runPrune(olderThan string, dryRun, vacuum, includeUnsynced bool) error {
 // it edits the on-disk file rather than the env-merged view, so an env
 // override never gets baked into config.json.
 func runPruneSetRetention(days int) error {
-	disk, err := readDiskConfig()
+	disk, err := config.ReadDisk()
 	if err != nil {
 		return err
 	}

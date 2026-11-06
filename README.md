@@ -111,7 +111,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 - `posthook notes push|fetch|status|configure [repo]` — move `refs/notes/posthook` to and from a remote by hand. The git shadow does this automatically on `push`, `fetch`, `pull` and `clone`; these exist for the fallback install, CI, and checking what is where. `POSTHOOK_NOTES_SYNC=0` turns the automatic transport off.
 - `posthook inspect [--agent X] [--type Y] [--session Z] [--since ISO] [--limit N]` — raw event payloads.
 - `posthook dash` — open the local web dashboard. Starts the bundled server (reading `~/.posthook/posthook.db`) if it isn't running, waits for it, then opens your browser. `--no-open` starts it headless; `--stop` shuts it down; `--restart` stops and starts it (do this after upgrading posthook so it serves the new bundle). Binds `127.0.0.1:3847` by default.
-- `posthook sync` — flush local rows to a cloud endpoint (see [Team / cloud](#team--cloud)). `--loop` flushes continuously, `--status` shows pending counts and last-flush state, `--set-endpoint/--set-token/--set-enabled` write `~/.posthook/config.json`.
+- `posthook sync` — flush local rows to a cloud endpoint (see [Team / cloud](#team--cloud)). `--loop` flushes continuously, `--status` shows pending counts and last-flush state, `--preview` prints the exact JSON the next flush would send without sending it, `--set-endpoint/--set-token/--set-enabled/--set-sync-mode` write `~/.posthook/config.json`. `--set-sync-mode metadata_only` keeps prompts, code and tool output on the machine (see [What team sync sends](#what-team-sync-sends)).
 - `posthook prune` — delete events and prompts older than the retention window (default 365 days) from the local store; sessions, commits, attribution and the edit events behind it are always kept. The background worker does this automatically once a day, so you only need it by hand to tighten the window or reclaim space: `--older-than 90d` (also `Nw`, `Nm`, `Ny`), `--dry-run` counts without deleting, `--vacuum` shrinks the file afterwards, `--include-unsynced` lifts the cloud-mode rule that only synced rows are pruned, `--set-retention-days N` writes `storage.retention_days` to `~/.posthook/config.json` (0 = keep forever).
 - `posthook identity` — show or set the engineer identity (work email + name) stamped on every session; it's how the team dashboard attributes activity to people. `--setup` detects a default from git config and confirms it interactively (the team installer runs this), `--set-email/--set-name` write it directly. The confirmed identity takes precedence over per-repo git config.
 - `posthook service install|uninstall|status` — manage a background daemon (launchd on macOS, systemd `--user` on Linux) that runs `posthook sync --loop` so a connected machine keeps flushing across reboots. The team installer sets this up automatically.
@@ -135,7 +135,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 | Path | What |
 |---|---|
 | `~/.posthook/posthook.db` | SQLite — all your data (`repositories`, `sessions`, `events`, `event_line_ranges`, `commits`, `commit_files`, `commit_sessions`, `commit_session_files`) |
-| `~/.posthook/config.json` | Cloud-sync settings (endpoint, install token, enabled flag, flush interval), the engineer identity (work email + name) and the storage retention window (`storage.retention_days`). Absent until you configure one of them. |
+| `~/.posthook/config.json` | Cloud-sync settings (endpoint, install token, enabled flag, flush interval, sync mode), the engineer identity (work email + name) and the storage retention window (`storage.retention_days`). Absent until you configure one of them. |
 | `~/.posthook/git-path` | Absolute path to the real git binary. Written at install time, read on every shadow invocation. |
 | `~/.posthook/dash/` | Staged dashboard build, spawned by `posthook dash`. |
 | `~/.posthook/dash.pid` / `dash.log` | PID + logs of the background dashboard server. |
@@ -161,10 +161,10 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 - `POSTHOOK_DB` — override the SQLite path the dashboard reads (default `~/.posthook/posthook.db`).
 - `POSTHOOK_DASH_PORT` / `POSTHOOK_DASH_HOSTNAME` — override where `posthook dash` binds (default `127.0.0.1:3847`). Read by both the Go command and the dashboard server so they always agree.
 - `POSTHOOK_DASH_AUTOSTART=0` — skip the automatic dashboard start at the end of `posthook init`.
-- `POSTHOOK_CLOUD_ENDPOINT` / `POSTHOOK_CLOUD_TOKEN` / `POSTHOOK_CLOUD_ENABLED` / `POSTHOOK_CLOUD_FLUSH_SECS` — override cloud-sync settings without editing `config.json` (handy for pointing one binary at a staging endpoint).
+- `POSTHOOK_CLOUD_ENDPOINT` / `POSTHOOK_CLOUD_TOKEN` / `POSTHOOK_CLOUD_ENABLED` / `POSTHOOK_CLOUD_FLUSH_SECS` / `POSTHOOK_CLOUD_SYNC_MODE` — override cloud-sync settings without editing `config.json` (handy for pointing one binary at a staging endpoint). `POSTHOOK_CLOUD_SYNC_MODE` is `full` or `metadata_only`; anything else pauses sync (nothing is sent) until it is fixed with `posthook sync --set-sync-mode`, rather than widening it.
 - `POSTHOOK_RETENTION_DAYS` — override `storage.retention_days`: how many days of events and prompts the local store keeps (default `365`, `0` = forever).
 - `POSTHOOK_ENGINEER_EMAIL` / `POSTHOOK_ENGINEER_NAME` — override the engineer identity; `posthook identity --setup` persists them without prompting (handy for MDM or dotfiles installs).
-- `POSTHOOK_API_KEY` / `POSTHOOK_VERSION` / `POSTHOOK_INSTALL_DIR` — read by `install.sh`: a team install key enables cloud sync + the background daemon, `POSTHOOK_VERSION` pins a release (default: latest), and `POSTHOOK_INSTALL_DIR` chooses the install directory (default `~/.local/bin`).
+- `POSTHOOK_API_KEY` / `POSTHOOK_VERSION` / `POSTHOOK_INSTALL_DIR` — read by `install.sh`: a team install key enables cloud sync + the background daemon, `POSTHOOK_VERSION` pins a release (default: latest), and `POSTHOOK_INSTALL_DIR` chooses the install directory (default `~/.local/bin`). The team install link also exports `POSTHOOK_CLOUD_SYNC_MODE` when the org has chosen metadata-only sync, and the installer refuses to enable sync at all if the binary cannot honour it.
 
 ## Privacy
 
@@ -181,13 +181,30 @@ By default, everything stays in `~/.posthook/posthook.db` on your machine. No HT
 export POSTHOOK_NOTES_SYNC=0   # shadow stops pushing/fetching refs/notes/posthook
 ```
 
-Nothing in the local database is encrypted at rest — treat it like any local git checkout. Data only leaves your machine if you explicitly enable cloud sync.
+Nothing in the local database is encrypted at rest — treat it like any local git checkout. Data only leaves your machine if you explicitly enable cloud sync, and even then your team can choose [metadata-only sync](#what-team-sync-sends), which keeps the prompt text and tool-call content above on your machine.
 
 ## Team / cloud
 
 Posthook has a hosted team version (by Bilanc) that rolls the same local data up across your whole team — org-wide AI-adoption metrics, per-engineer and per-repo breakdowns, and shared attribution — without anyone changing their workflow.
 
-**What team sync sends:** the local tables above are replicated to your team's Bilanc workspace as-is — sessions, events (including verbatim tool-call payloads), commits, attribution, and the prompts you type to your agents, which power the session viewer in the team dashboard. Solo mode sends nothing.
+### What team sync sends
+
+Solo mode sends nothing. With a team key, what leaves the machine depends on `cloud.sync_mode` in `~/.posthook/config.json` (`posthook sync --set-sync-mode …`, or `POSTHOOK_CLOUD_SYNC_MODE`). Your org picks the mode in the Bilanc admin and the install link bakes it in; `posthook status` shows which one is active. If the org's policy is metadata-only, the server says so in its reply to every flush and a machine still on `full` switches itself over on that reply. The server can only ever tighten a machine, never widen it, so moving an org back to `full` means running `posthook sync --set-sync-mode full` on each machine.
+
+| | `full` (default) | `metadata_only` |
+|---|---|---|
+| Sessions, repositories, commits, attribution, line ranges | ids, timestamps, agent + model, tokens, engineer email, repo/file paths, line counts | same |
+| `events.payload` (hook stdin) | verbatim — includes `tool_input` (edit text, shell commands) and `tool_response` (shell output, file contents) and the agent's `last_assistant_message` | rebuilt from an allowlist: event/session/tool ids, tool name, model, timing, `cwd`, file paths, Cursor markers. No prompt, no code, no command, no output. Newline count of the dropped edit text is kept as `lines_added`. |
+| `session_prompts.prompt_text` | the prompts you type | empty; `prompt_chars` keeps the length so turns still count |
+| `commits.message` | subject line | null |
+
+Metadata-only is an **allowlist**, not a denylist — anything not named in `internal/sync/redact.go` is dropped, and the test in `redact_test.go` feeds every known content field through it and asserts nothing survives. To see the exact bytes your machine would send next, run:
+
+```bash
+posthook sync --preview | jq .
+```
+
+The local database is untouched by either mode, so `posthook dash`, `posthook blame` and the local session timeline keep their full detail. Paths still leave the machine in both modes (they include your home-directory username). The team server applies the same allowlist again on arrival for orgs set to metadata-only, so an out-of-date binary cannot widen what lands.
 
 Onboarding is one shared link. A manager mints an install link for the team, then each engineer runs it once:
 
@@ -195,7 +212,7 @@ Onboarding is one shared link. A manager mints an install link for the team, the
 curl -fsSL "https://api.bilanc.co/posthook/install.sh?apiKey=<team-key>" | sh
 ```
 
-That installs posthook exactly as in the [Quickstart](#quickstart), and additionally: writes the team key into `~/.posthook/config.json`, runs `posthook init`, sets up the engineer identity (`posthook identity --setup` — detects your git email and asks you to confirm your work email on the terminal, so the dashboard can attribute sessions to you), and installs the background sync daemon (`posthook service`). From then on the same OSS binary in this repo flushes rows upstream via `posthook sync` — reading rows changed since the last flush and POSTing them to your team's ingest endpoint with a Bearer token (inspect state with `posthook sync --status`). The local SQLite store stays authoritative; sync is a faithful, append-only replica with no redaction or schema rewrites. Until you install with a key, posthook never sends anything anywhere.
+That installs posthook exactly as in the [Quickstart](#quickstart), and additionally: writes the team key into `~/.posthook/config.json`, runs `posthook init`, sets up the engineer identity (`posthook identity --setup` — detects your git email and asks you to confirm your work email on the terminal, so the dashboard can attribute sessions to you), and installs the background sync daemon (`posthook service`). From then on the same OSS binary in this repo flushes rows upstream via `posthook sync` — reading rows changed since the last flush and POSTing them to your team's ingest endpoint with a Bearer token (inspect state with `posthook sync --status`). The local SQLite store stays authoritative; sync is an append-only replica with no schema rewrites, and in `full` mode no redaction either (see the table above for `metadata_only`). Until you install with a key, posthook never sends anything anywhere.
 
 Access is invite-based — **[talk to the team](https://bilanc.co)** to get set up.
 
