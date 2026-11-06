@@ -1,38 +1,20 @@
-import { KpiCard } from "@/components/kpi-card";
 import { FilterBar } from "@/components/filter-bar";
-import { SankeyFunnel } from "@/components/sankey-funnel";
-import { BreakdownBar } from "@/components/breakdown-bar";
-import { DailyUsageChart } from "@/components/daily-usage-chart";
-import { parseFilters, resolveFilters, type SearchParams } from "@/lib/filters";
-import { overviewSummary } from "@/lib/queries/overview";
-import { dailyUsage } from "@/lib/queries/daily";
-import {
-  breakdownByAgent,
-  breakdownByModel,
-  breakdownByRepo,
-  breakdownByEngineer,
-  filterOptions,
-} from "@/lib/queries/breakdowns";
+import { Panel } from "@/components/ui/panel";
+import { Hero } from "@/components/overview/hero";
+import { KpiTiles } from "@/components/overview/kpi-tiles";
+import { ActivityChart } from "@/components/overview/activity-chart";
+import { RhythmHeatmap } from "@/components/overview/rhythm-heatmap";
+import { Outcomes } from "@/components/overview/outcomes";
+import { TimeSplitPanel } from "@/components/overview/time-split";
+import { parseMeasure, windowDayKeys } from "@/components/overview/series";
+import { parseFilters, priorWindow, resolveFilters, type SearchParams } from "@/lib/filters";
+import { activityTotals, dailyActivity } from "@/lib/queries/activity";
+import { funnel, leadTime } from "@/lib/queries/outcomes";
+import { editHeatmap } from "@/lib/queries/heat";
+import { timeSplit } from "@/lib/queries/timesplit";
+import { filterOptions } from "@/lib/queries/breakdowns";
 
 export const dynamic = "force-dynamic";
-
-function fmtNum(n: number): string {
-  return new Intl.NumberFormat("en-US").format(Math.round(n));
-}
-
-function fmtPct(n: number): string {
-  return `${n.toFixed(1)}%`;
-}
-
-function fmtHours(n: number): string {
-  if (n < 1) return `${(n * 60).toFixed(0)}m`;
-  return `${n.toFixed(1)}h`;
-}
-
-const compact = new Intl.NumberFormat("en-US", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
 
 export default async function OverviewPage({
   searchParams,
@@ -41,88 +23,66 @@ export default async function OverviewPage({
 }) {
   const sp = await searchParams;
   const filters = resolveFilters(parseFilters(sp));
+  const measure = parseMeasure(sp.measure);
   const options = filterOptions();
-  const summary = overviewSummary(filters);
-  const fn = {
-    generated: summary.lines_generated,
-    committed: summary.lines_committed,
-  };
-  const daily = dailyUsage(filters);
-  const byAgent = breakdownByAgent(filters);
-  const byModel = breakdownByModel(filters);
-  const byRepo = breakdownByRepo(filters);
-  const byEngineer = breakdownByEngineer(filters);
+
+  const rows = dailyActivity(filters);
+  const prior = priorWindow(filters);
+  const priorRows = prior ? dailyActivity(prior) : null;
+  const totals = activityTotals(rows);
+  const priorTotals = priorRows ? activityTotals(priorRows) : null;
+  const fn = funnel(filters);
+  const priorFn = prior ? funnel(prior) : null;
+  const lt = leadTime(filters);
+  const heat = editHeatmap(filters);
+  const ts = timeSplit(filters);
+  const days = windowDayKeys(filters, rows);
+
+  // Empty only when nothing at all happened in the window: a session that
+  // started before it can still contribute edits, commits and active time.
+  const empty = rows.length === 0 && fn.sessions === 0;
 
   return (
     <div>
       <h1 className="text-2xl font-semibold mb-1">Overview</h1>
       <p className="text-sm text-[var(--color-fg-muted)] mb-6">
-        AI usage across all tracked agents, models, repos, and engineers.
+        What your agents shipped, when they worked, and where their time went.
       </p>
 
       <FilterBar filters={filters} options={options} />
 
-      <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-8">
-        <KpiCard
-          label="AI code %"
-          value={fmtPct(summary.ai_code_pct)}
-          sublabel={`of ${fmtNum(summary.commit_lines_added)} committed lines`}
-          accent
-        />
-        <KpiCard
-          label="AI lines generated"
-          value={fmtNum(summary.lines_generated)}
-          sublabel={`${fmtNum(summary.edits)} edit${summary.edits === 1 ? "" : "s"} captured`}
-        />
-        <KpiCard
-          label="AI lines committed"
-          value={fmtNum(summary.lines_committed)}
-          sublabel="attributed to captured commits"
-        />
-        <KpiCard
-          label="Top model"
-          value={summary.top_model ?? "—"}
-          sublabel={summary.top_model ? `${fmtNum(summary.top_model_edits)} edits` : null}
-        />
-        <KpiCard
-          label="Working hours"
-          value={fmtHours(summary.working_hours)}
-          sublabel={`${summary.sessions} session${summary.sessions === 1 ? "" : "s"}`}
-        />
-        <KpiCard
-          label="Max parallel agents"
-          value={String(summary.max_concurrent)}
-          sublabel="peak concurrent sessions"
-        />
-        <KpiCard
-          label="Tokens in / out"
-          value={
-            summary.input_tokens == null && summary.output_tokens == null
-              ? "—"
-              : `${compact.format(summary.input_tokens ?? 0)} / ${compact.format(summary.output_tokens ?? 0)}`
-          }
-          sublabel={
-            summary.cache_read_tokens == null
-              ? "Claude Code & Codex only"
-              : `${compact.format(summary.cache_read_tokens)} cache reads`
-          }
-        />
-      </section>
+      {empty ? (
+        <Panel>
+          <div className="text-sm">No sessions in this range.</div>
+          <div className="mt-1 text-xs text-[var(--color-fg-muted)]">
+            Widen the date range or clear the filters.
+          </div>
+        </Panel>
+      ) : (
+        <div className="grid gap-3.5">
+          {/* The daily rows count a commit once per agent it is attributed to; the
+              funnel counts each commit once, which is what the hero should say. */}
+          <Hero
+            filters={filters}
+            totals={{ ...totals, commits: fn.commits }}
+            prior={priorTotals && priorFn ? { ...priorTotals, commits: priorFn.commits } : priorTotals}
+          />
 
-      <section className="mb-8">
-        <DailyUsageChart from={filters.from} to={filters.to} data={daily} />
-      </section>
+          <KpiTiles rows={rows} days={days} totals={totals} prior={priorTotals} funnel={fn} />
 
-      <section className="mb-8">
-        <SankeyFunnel generated={fn.generated} committed={fn.committed} />
-      </section>
+          <div className="grid gap-3.5 lg:grid-cols-3">
+            <div className="lg:col-span-2 min-w-0">
+              <ActivityChart rows={rows} days={days} measure={measure} sp={sp} />
+            </div>
+            <RhythmHeatmap cells={heat} />
+          </div>
 
-      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <BreakdownBar title="By agent" rows={byAgent} />
-        <BreakdownBar title="By model" rows={byModel} />
-        <BreakdownBar title="By repo" rows={byRepo} />
-        <BreakdownBar title="By engineer" rows={byEngineer} />
-      </section>
+          <div className="grid gap-3.5 md:grid-cols-2">
+            <Outcomes funnel={fn} leadTime={lt} />
+            <TimeSplitPanel ts={ts} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

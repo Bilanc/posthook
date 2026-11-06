@@ -237,6 +237,12 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		sessIDArg = sql.NullString{String: sessionID, Valid: true}
 	}
 
+	// Store the trimmed payload: tool output (file contents, command output,
+	// images) is dropped and oversized strings are capped. Everything the
+	// line-range, prompt and transcript extraction below needs is read from
+	// the full in-memory `payload`, not from the stored row.
+	stored, droppedBytes := store.TrimPayload(raw)
+
 	_, err = db.Exec(`
 		INSERT INTO events (
 			id, org_id, session_id, ts, event_type, agent_slug, cwd,
@@ -244,11 +250,11 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, store.LocalOrgID, sessIDArg, ts, eventType, agentSlug, cwd,
 		nullableString(finalFilePath), repoID, relFilePath,
-		patchLinesAdded, patchLinesRemoved, string(raw))
+		patchLinesAdded, patchLinesRemoved, string(stored))
 	if err != nil {
 		return err
 	}
-	logx.Debugf("ingested %s event %s (session=%s)", agentSlug, eventType, sessionID)
+	logx.Debugf("ingested %s event %s (session=%s, payload %d bytes, dropped %d)", agentSlug, eventType, sessionID, len(stored), droppedBytes)
 
 	// Line-range capture. Fail-soft: never block ingest on these.
 	if eventType == "PostToolUse" && len(applyPatchFiles) > 0 {

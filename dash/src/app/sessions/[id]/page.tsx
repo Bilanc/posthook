@@ -1,233 +1,103 @@
-import Link from "next/link";
+import { existsSync } from "node:fs";
 import { notFound } from "next/navigation";
-import { format, parseISO } from "date-fns";
-import { PromptsList } from "@/components/prompts-list";
-import {
-  filesTouchedInSession,
-  getSessionDetail,
-  storedPromptsForSession,
-  transcriptPathForSession,
-} from "@/lib/queries/sessions";
-import { commitsForSession } from "@/lib/queries/commits";
-import { readPrompts } from "@/lib/transcript";
+import { Conversation } from "@/components/session/conversation";
+import { FilesPanel } from "@/components/session/files-panel";
+import { SessionHeader } from "@/components/session/header";
+import { fileRows, resendDelays, sessionStats } from "@/components/session/model";
+import { SessionTimeline } from "@/components/session/timeline";
+import { TurnRail } from "@/components/session/turn-rail";
+import { TurnTokens } from "@/components/session/turn-tokens";
+import { Panel } from "@/components/ui/panel";
+import { getSessionDetail } from "@/lib/queries/sessions";
+import { sessionTimelineData } from "@/lib/queries/turns";
+import { readUsage } from "@/lib/transcript";
+import { buildTurns } from "@/lib/turns";
 
 export const dynamic = "force-dynamic";
 
-function fmtNum(n: number): string {
-  return new Intl.NumberFormat("en-US").format(Math.round(n));
-}
-
-const compact = new Intl.NumberFormat("en-US", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
-
-function fmtDateTime(iso: string | null): string {
-  if (!iso) return "—";
-  try {
-    return format(parseISO(iso), "MMM d, yyyy HH:mm:ss");
-  } catch {
-    return iso;
-  }
-}
-
-function fmtDuration(startedAt: string, endedAt: string | null): string {
-  if (!endedAt) return "—";
-  try {
-    const ms = parseISO(endedAt).getTime() - parseISO(startedAt).getTime();
-    if (ms <= 0) return "0m";
-    const minutes = ms / 60000;
-    if (minutes < 60) return `${minutes.toFixed(0)}m`;
-    return `${(minutes / 60).toFixed(1)}h`;
-  } catch {
-    return "—";
-  }
-}
-
-function commitGithubUrl(remoteUrl: string | null, sha: string): string | null {
-  if (!remoteUrl) return null;
-  // Match git@github.com:owner/repo.git or https://github.com/owner/repo(.git).
-  const ssh = remoteUrl.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
-  const https = remoteUrl.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
-  const m = ssh ?? https;
-  if (!m) return null;
-  return `https://github.com/${m[1]}/${m[2]}/commit/${sha}`;
-}
-
-export default async function SessionDetailPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const { id } = await params;
+// A session as it happened: the conversation is the spine, tool calls fold
+// under the prompt that caused them, and commits sit in the turn they landed
+// in. Everything is read straight from SQLite in this server component.
+export default async function SessionDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  // Cursor ids carry a colon ("cursor:<uuid>"), which reaches params
+  // percent-encoded; decode before looking the session up.
+  const id = safeDecode((await params).id);
   const session = getSessionDetail(id);
   if (!session) notFound();
 
-  const commits = commitsForSession(id);
-  const files = filesTouchedInSession(id);
-  const transcriptPath = transcriptPathForSession(id);
-  const transcriptPrompts = transcriptPath ? readPrompts(transcriptPath) : [];
-  const prompts =
-    transcriptPrompts.length > 0
-      ? transcriptPrompts
-      : storedPromptsForSession(id);
+  const data = sessionTimelineData(id);
+  const usage = data.transcript_path ? readUsage(data.transcript_path) : null;
+  const noUsage =
+    usage != null
+      ? null
+      : data.transcript_path == null
+        ? "No transcript was recorded, so token usage is unknown."
+        : !existsSync(data.transcript_path)
+          ? "The transcript is no longer on disk, so token usage is unknown."
+          : `${session.agent_slug} reports no token usage.`;
+  const turns = buildTurns({
+    started_at: session.started_at,
+    ended_at: session.ended_at,
+    stops: data.stops,
+    prompts: data.prompts,
+    tools: data.tools,
+    commits: data.commits,
+    usage,
+  });
+  const files = fileRows(data.files, data.commit_files, data.commits);
+  const stats = sessionStats(session, turns, files, data.commits, data.active_minutes, usage);
+  const placed = new Set(turns.flatMap((t) => t.commits.map((c) => c.id)));
+  const orphanCommits = data.commits.filter((c) => !placed.has(c.id));
+  const running = session.ended_at == null;
 
   return (
-    <div>
-      <Link
-        href="/sessions"
-        className="text-xs text-[var(--color-fg-muted)] hover:text-[var(--color-accent)]"
-      >
-        ← Back to sessions
-      </Link>
-      <h1 className="text-2xl font-semibold mt-2 mb-1">Session</h1>
-      <div className="text-xs font-mono text-[var(--color-fg-muted)] mb-6 break-all">
-        {session.id}
-      </div>
+    <div className="grid gap-3.5">
+      <SessionHeader session={session} turns={turns} stats={stats} />
 
-      {/* Header KPIs */}
-      <section className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 mb-8">
-        <Kpi label="Agent" value={session.agent_slug} />
-        <Kpi label="Model" value={session.model_slug ?? "—"} />
-        <Kpi
-          label="Engineer"
-          value={session.engineer_name || session.engineer_email || "—"}
+      <Panel title="Timeline" sub="idle gaps over 8 minutes are compressed">
+        <SessionTimeline
+          startedAt={session.started_at}
+          endedAt={session.ended_at}
+          turns={turns}
+          stops={data.stops}
+          commits={data.commits}
         />
-        <Kpi label="Repo" value={session.repo_name ?? "—"} />
-        <Kpi label="Lines generated" value={fmtNum(session.lines_generated)} />
-        <Kpi
-          label="Tokens in / out"
-          value={
-            session.input_tokens == null && session.output_tokens == null
-              ? "—"
-              : `${compact.format(session.input_tokens ?? 0)} / ${compact.format(session.output_tokens ?? 0)}`
-          }
-        />
-        <Kpi
-          label="Duration"
-          value={fmtDuration(session.started_at, session.ended_at)}
-        />
-      </section>
+      </Panel>
 
-      <section className="mb-8 text-sm text-[var(--color-fg-muted)] grid grid-cols-1 md:grid-cols-2 gap-2">
-        <div>
-          <span className="uppercase text-xs tracking-wider mr-2">Started</span>
-          <span className="text-[var(--color-fg)] tabular-nums">
-            {fmtDateTime(session.started_at)}
-          </span>
-        </div>
-        <div>
-          <span className="uppercase text-xs tracking-wider mr-2">Ended</span>
-          <span className="text-[var(--color-fg)] tabular-nums">
-            {fmtDateTime(session.ended_at)}
-          </span>
-        </div>
-      </section>
+      <div className="grid grid-cols-1 items-start gap-3.5 min-[980px]:grid-cols-[210px_minmax(0,1fr)_250px]">
+        <Panel title="Turns" className="min-[980px]:sticky min-[980px]:top-4 min-[980px]:max-h-[calc(100vh-2rem)] min-[980px]:overflow-y-auto">
+          <TurnRail turns={turns} running={running} />
+        </Panel>
 
-      {/* Three-panel grid */}
-      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Panel title={`Prompts ${prompts.length > 0 ? `(${prompts.length})` : ""}`}>
-          <PromptsList
-            prompts={prompts}
-            transcriptAvailable={transcriptPath !== null || prompts.length > 0}
+        <Panel title="Conversation" sub="tool calls fold under each prompt">
+          <Conversation
+            turns={turns}
+            agent={session.agent_slug}
+            running={running}
+            committedFiles={data.commit_files.map((f) => f.file_path)}
+            remoteUrl={session.repo_remote_url}
+            hasUsage={usage != null}
+            resendDelays={resendDelays(data.prompts)}
+            orphanCommits={orphanCommits}
           />
         </Panel>
 
-        <Panel
-          title={`Attributed commits${commits.length > 0 ? ` (${commits.length})` : ""}`}
-        >
-          {commits.length === 0 ? (
-            <div className="text-sm text-[var(--color-fg-muted)]">
-              No commits attributed to this session.
-            </div>
-          ) : (
-            <ul className="space-y-3">
-              {commits.map((c) => {
-                const url = commitGithubUrl(session.repo_remote_url, c.sha);
-                const shortSha = c.sha.slice(0, 7);
-                const firstLine = (c.message ?? "").split("\n")[0] ?? "";
-                return (
-                  <li
-                    key={c.id}
-                    className="rounded border border-[var(--color-border)] bg-[var(--color-bg)] p-3"
-                  >
-                    <div className="flex items-center gap-2 text-xs font-mono">
-                      {url ? (
-                        <a
-                          href={url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-[var(--color-accent)] hover:underline"
-                        >
-                          {shortSha}
-                        </a>
-                      ) : (
-                        <span className="text-[var(--color-fg-muted)]">{shortSha}</span>
-                      )}
-                      <span className="text-[var(--color-fg-muted)] tabular-nums">
-                        {fmtDateTime(c.committed_at)}
-                      </span>
-                    </div>
-                    <div className="mt-1 text-sm">{firstLine || "(no message)"}</div>
-                    <div className="mt-1 text-xs text-[var(--color-fg-muted)] tabular-nums">
-                      +{c.lines_added} / -{c.lines_removed} · {c.files_changed} file
-                      {c.files_changed === 1 ? "" : "s"}
-                    </div>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
+        <Panel title="Files" sub="generated vs committed">
+          <FilesPanel files={files} />
+          <div className="mb-3 mt-5 text-[11px] font-medium uppercase tracking-wider text-[var(--color-fg-muted)]">
+            Output tokens per turn
+          </div>
+          <TurnTokens turns={turns} noUsage={noUsage} />
         </Panel>
-
-        <Panel
-          title={`Files touched${files.length > 0 ? ` (${files.length})` : ""}`}
-        >
-          {files.length === 0 ? (
-            <div className="text-sm text-[var(--color-fg-muted)]">
-              No file edits captured.
-            </div>
-          ) : (
-            <ul className="space-y-2 text-sm font-mono">
-              {files.map((f) => (
-                <li
-                  key={f.rel_file_path}
-                  className="flex items-baseline justify-between gap-3 border-b border-[var(--color-border)] pb-2 last:border-0"
-                >
-                  <span className="break-all">{f.rel_file_path}</span>
-                  <span className="text-xs text-[var(--color-fg-muted)] tabular-nums whitespace-nowrap">
-                    +{fmtNum(f.lines_generated)} · {f.edits} edit{f.edits === 1 ? "" : "s"}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Panel>
-      </section>
-    </div>
-  );
-}
-
-function Kpi({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-3">
-      <div className="text-[10px] uppercase tracking-wider text-[var(--color-fg-muted)]">
-        {label}
-      </div>
-      <div className="mt-1 text-sm font-medium truncate" title={value}>
-        {value}
       </div>
     </div>
   );
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-5">
-      <div className="text-xs uppercase tracking-wider text-[var(--color-fg-muted)] mb-3">
-        {title}
-      </div>
-      {children}
-    </div>
-  );
+function safeDecode(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }

@@ -12,10 +12,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bilanc/posthook/internal/config"
 	"github.com/bilanc/posthook/internal/ingest"
 	"github.com/bilanc/posthook/internal/logx"
 	"github.com/bilanc/posthook/internal/paths"
 	"github.com/bilanc/posthook/internal/spool"
+	"github.com/bilanc/posthook/internal/store"
 
 	"github.com/spf13/cobra"
 )
@@ -30,6 +32,11 @@ const (
 	// an empty spool before exiting. The next hook fire re-spawns it. A managed
 	// worker (--managed, run by the OS service) ignores this and stays up.
 	workerIdleTimeout = 2 * time.Minute
+
+	// workerRetentionInterval is how often a managed worker re-checks whether
+	// the daily retention prune is due. The store gates the prune itself to
+	// once per 24h, so the check is a single small SELECT.
+	workerRetentionInterval = 1 * time.Hour
 )
 
 func workerLockPath() string { return filepath.Join(paths.PosthookDir(), "worker.lock") }
@@ -83,8 +90,20 @@ func runWorker(managed bool) error {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	logx.Debugf("worker: started (managed=%v)", managed)
+	// The worker is the one long-lived process that holds the store open, so
+	// it owns age-based retention. A lazily-spawned worker checks once at
+	// start; a managed one re-checks hourly. Never fatal: a failed prune just
+	// means the database stays a little larger until the next pass.
+	pruneIfDue()
+	lastPruneCheck := time.Now()
+
 	lastWork := time.Now()
 	for {
+		if managed && time.Since(lastPruneCheck) >= workerRetentionInterval {
+			pruneIfDue()
+			lastPruneCheck = time.Now()
+		}
+
 		n, err := spool.Drain(ingest.ProcessAgentEnvelope)
 		if err != nil {
 			// A failed drain (e.g. DB momentarily locked) leaves the record for
@@ -114,6 +133,38 @@ func runWorker(managed bool) error {
 			return nil
 		case <-time.After(workerPollInterval):
 		}
+	}
+}
+
+// pruneIfDue runs the daily retention prune when it is due, logging the
+// outcome. Errors are logged and swallowed — the worker's job is draining
+// the spool, and retention must never take that down.
+func pruneIfDue() {
+	cfg, err := config.Load()
+	if err != nil {
+		logx.Debugf("worker: retention skipped: %v", err)
+		return
+	}
+	days := cfg.RetentionDays()
+	if days == 0 {
+		return
+	}
+	db, err := store.Open()
+	if err != nil {
+		logx.Debugf("worker: retention skipped: %v", err)
+		return
+	}
+	res, ran, err := db.PruneIfDue(store.PruneOptions{
+		OlderThan:     time.Duration(days) * 24 * time.Hour,
+		RequireSynced: cfg.Cloud.Enabled,
+	})
+	if err != nil {
+		logx.Warnf("worker: retention prune failed: %v", err)
+		return
+	}
+	if ran {
+		logx.Infof("worker: retention pruned %d event(s) and %d prompt(s) older than %s (%d days)",
+			res.Events, res.Prompts, res.Cutoff.Format("2006-01-02"), days)
 	}
 }
 

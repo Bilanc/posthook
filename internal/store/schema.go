@@ -26,7 +26,11 @@ const LocalOrgID = "local"
 //
 // v13 adds event lookup indexes used by the local dashboard's edit aggregation
 // and Cursor duplicate suppression queries.
-const schemaVersion = 13
+//
+// v14 carries no column changes: it rewrites every stored event payload
+// through TrimPayload (dropping tool output that was 82% of a six-month
+// database) and VACUUMs the file once so the space is actually returned.
+const schemaVersion = 14
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns

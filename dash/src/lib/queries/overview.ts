@@ -1,5 +1,5 @@
-import { db } from "../db";
-import { filterSql, localDayStartIso, localDayEndIso, type Filters } from "../filters";
+import { db } from "../db.ts";
+import { filterSql, localDayStartIso, localDayEndIso, type Filters } from "../filters.ts";
 import type { OverviewSummary } from "@/types/posthook";
 
 // SQLite expression: count newlines in a TEXT column.

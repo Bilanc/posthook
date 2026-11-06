@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { FilterBar } from "@/components/filter-bar";
-import { SessionsTable } from "@/components/sessions-table";
+import { SessionsList } from "@/components/sessions/sessions-list";
 import {
   parseFilters,
   resolveFilters,
@@ -23,7 +23,10 @@ export default async function SessionsPage({
   const filters = resolveFilters(parseFilters(sp));
   const options = filterOptions();
   const page = Math.max(1, parseInt(String(sp.page ?? "1"), 10) || 1);
-  const perPage = Math.min(200, parseInt(String(sp.per_page ?? DEFAULT_PER_PAGE), 10) || DEFAULT_PER_PAGE);
+  const perPage = Math.min(
+    200,
+    Math.max(1, parseInt(String(sp.per_page ?? DEFAULT_PER_PAGE), 10) || DEFAULT_PER_PAGE),
+  );
 
   const { rows, total } = listSessions(filters, page, perPage);
   const totalPages = Math.max(1, Math.ceil(total / perPage));
@@ -31,6 +34,7 @@ export default async function SessionsPage({
   const qsJoin = qs ? `${qs}&` : "?";
   const hasNarrowingFilters =
     !!filters.q ||
+    !!filters.outcome ||
     filters.agents.length > 0 ||
     filters.models.length > 0 ||
     filters.repos.length > 0 ||
@@ -48,9 +52,9 @@ export default async function SessionsPage({
           : `${total} session${total === 1 ? "" : "s"} — showing page ${page} of ${totalPages}.`}
       </p>
 
-      <FilterBar filters={filters} options={options} searchable />
+      <FilterBar filters={filters} options={options} searchable outcomes />
 
-      <SessionsTable rows={rows} />
+      <SessionsList rows={rows} emptyMessage={emptyMessage} />
 
       {totalPages > 1 ? (
         <div className="mt-6 flex items-center justify-between text-sm">

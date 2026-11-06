@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 // Regression: `next build` with output:"standalone" does NOT copy .next/static
 // into .next/standalone — the standalone server serves /_next/static/* only
 // from inside its own folder. If the copy is missing, every chunk 404s, React
-// never hydrates, and the client-only charts (ECharts Sankey, Recharts bars)
+// never hydrates, and the client components (filter bar)
 // render blank while server-rendered KPIs/tables still show. The build script
 // must perform the copy. Skipped on a fresh checkout with no build output.
 const root = resolve(import.meta.dirname, "../..");

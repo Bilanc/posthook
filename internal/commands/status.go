@@ -47,6 +47,7 @@ func runStatus() error {
 	fmt.Printf("  sessions:     %d\n", totals.sessions)
 	fmt.Printf("  commits:      %d\n", totals.commits)
 	fmt.Printf("  repositories: %d\n", totals.repos)
+	printStorageLines(db)
 	printIdentityLine()
 	printCloudSyncLine()
 	fmt.Println()
@@ -170,6 +171,28 @@ func runStatus() error {
 		}
 	}
 	return nil
+}
+
+// printStorageLines shows how big the database is, how much a VACUUM would
+// give back, and the retention window the worker prunes to.
+func printStorageLines(db *store.DB) {
+	if size, reclaimable, err := db.FileSize(); err == nil {
+		fmt.Printf("  db size:      %s (%s reclaimable)\n", fmtBytes(size), fmtBytes(reclaimable))
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return
+	}
+	days := cfg.RetentionDays()
+	if days == 0 {
+		fmt.Println("  retention:    off")
+		return
+	}
+	last := "never"
+	if t, ok := db.LastPruneAt(); ok {
+		last = t.Local().Format("2006-01-02")
+	}
+	fmt.Printf("  retention:    %d days · last prune %s\n", days, last)
 }
 
 // printIdentityLine shows who sessions are attributed to. When cloud sync is

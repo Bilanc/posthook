@@ -25,6 +25,7 @@ func NewRootCmd() *cobra.Command {
 		newNotesCmd(),
 		newDashCmd(),
 		newSyncCmd(),
+		newPruneCmd(),
 		newWorkerCmd(),
 		newIdentityCmd(),
 		newServiceCmd(),
@@ -45,4 +46,5 @@ Environment:
   POSTHOOK_BIN     Override the binary path written into hook configs
   POSTHOOK_DEBUG   Set to 1 for verbose stderr logging
   POSTHOOK_BYPASS  Internal: set to 1 to bypass the git shadow proxy
-  POSTHOOK_NOTES_SYNC  Set to 0 to stop the shadow pushing/fetching attribution notes`
+  POSTHOOK_NOTES_SYNC  Set to 0 to stop the shadow pushing/fetching attribution notes
+  POSTHOOK_RETENTION_DAYS  Days of events/prompts to keep locally (default 365, 0 = forever)`

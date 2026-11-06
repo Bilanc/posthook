@@ -1,11 +1,18 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import "./globals.css";
+import { ChartTooltip } from "@/components/ui/chart-tooltip";
 
 export const metadata: Metadata = {
   title: "posthook-dash",
   description: "Local dashboard for posthook AI usage metrics.",
 };
+
+const NAV = [
+  { href: "/", label: "Overview" },
+  { href: "/agents", label: "Agents" },
+  { href: "/sessions", label: "Sessions" },
+];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -17,15 +24,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               posthook<span className="text-[var(--color-fg-muted)]">/dash</span>
             </Link>
             <nav className="flex gap-4 text-sm">
-              <Link href="/" className="hover:text-[var(--color-accent)]">Overview</Link>
-              <Link href="/sessions" className="hover:text-[var(--color-accent)]">Sessions</Link>
+              {NAV.map((n) => (
+                <Link key={n.href} href={n.href} className="hover:text-[var(--color-accent)]">
+                  {n.label}
+                </Link>
+              ))}
             </nav>
             <span className="ml-auto text-xs text-[var(--color-fg-muted)] font-mono">
-              v0.1.0
+              v0.2.0
             </span>
           </div>
         </header>
         <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>
+        <ChartTooltip />
       </body>
     </html>
   );
