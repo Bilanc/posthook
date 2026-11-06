@@ -130,11 +130,10 @@ func flushOnce() error {
 	synced := map[string]int{}
 	var durationMS int64
 	for {
-		res, err := pksync.Flush(ctx, db, cfg.Cloud)
+		res, _, err := flushAndAdopt(ctx, db, &cfg.Cloud)
 		if err != nil {
 			return err
 		}
-		adoptServerPolicy(&cfg.Cloud, res)
 		if res.Skipped {
 			fmt.Printf("sync skipped: %s\n", res.Reason)
 			return nil
@@ -199,35 +198,8 @@ func runSyncLoop() error {
 	// (Restart=on-failure) both relaunch us on the new version.
 	binaryChanged := watchBinary()
 
-	// Re-load config every tick so flag-flips via `posthook sync --set-*` take
-	// effect without restarting the loop.
-	flushOnce := func() {
-		cfg, err := config.Load()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sync: config load failed: %v\n", err)
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		res, err := pksync.Flush(ctx, db, cfg.Cloud)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sync: %v\n", err)
-			return
-		}
-		adoptServerPolicy(&cfg.Cloud, res)
-		if res.Skipped {
-			return
-		}
-		total := 0
-		for _, n := range res.Synced {
-			total += n
-		}
-		if total > 0 {
-			fmt.Printf("[%s] sync: %d row(s) in %dms\n", time.Now().Format("15:04:05"), total, res.DurationMS)
-		}
-	}
-
-	flushOnce()
+	loop := &syncLoopState{db: db}
+	loop.tick()
 	for {
 		select {
 		case <-sigCh:
@@ -238,8 +210,72 @@ func runSyncLoop() error {
 				fmt.Println("sync loop: posthook binary was upgraded — exiting so the service supervisor restarts on the new version")
 				os.Exit(1)
 			}
-			flushOnce()
+			loop.tick()
 		}
+	}
+}
+
+// syncLoopState is what the daemon carries from one tick to the next. Config
+// is re-read from disk on every tick so `posthook sync --set-*` takes effect
+// without a restart — which means a server-reported metadata-only policy has
+// to be remembered here as well: if writing it to config.json failed, or an
+// env override keeps asserting full, a fresh Load would otherwise widen the
+// very next tick back to full.
+type syncLoopState struct {
+	db              *store.DB
+	orgMetadataOnly bool
+}
+
+// tick re-loads config, re-applies a remembered org policy, flushes once and
+// adopts whatever policy the server reported this time.
+func (s *syncLoopState) tick() {
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sync: config load failed: %v\n", err)
+		return
+	}
+	if s.orgMetadataOnly {
+		pinMetadataOnly(&cfg.Cloud)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	res, orgMetadataOnly, err := flushAndAdopt(ctx, s.db, &cfg.Cloud)
+	if orgMetadataOnly {
+		s.orgMetadataOnly = true
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sync: %v\n", err)
+		return
+	}
+	if res.Skipped {
+		return
+	}
+	total := 0
+	for _, n := range res.Synced {
+		total += n
+	}
+	if total > 0 {
+		fmt.Printf("[%s] sync: %d row(s) in %dms\n", time.Now().Format("15:04:05"), total, res.DurationMS)
+	}
+}
+
+// flushAndAdopt runs one Flush and adopts the org policy from its reply
+// whether or not the flush as a whole succeeded. Flush reads the reply on
+// 2xx, before it marks the rows synced; if that marking then fails the policy
+// is still in res, and dropping it would send the same rows out again in
+// full on the next attempt. Reports whether the server said metadata-only.
+func flushAndAdopt(ctx context.Context, db *store.DB, c *config.CloudConfig) (res pksync.Result, orgMetadataOnly bool, err error) {
+	res, err = pksync.Flush(ctx, db, *c)
+	orgMetadataOnly = adoptServerPolicy(c, res)
+	return res, orgMetadataOnly, err
+}
+
+// pinMetadataOnly re-asserts a remembered metadata-only org policy on a
+// freshly loaded config. An unrecognised sync_mode is left alone: that pauses
+// sync altogether, which is tighter still.
+func pinMetadataOnly(c *config.CloudConfig) {
+	if !c.MetadataOnly() {
+		c.SyncMode = config.SyncModeMetadataOnly
 	}
 }
 
@@ -348,9 +384,14 @@ func describeSyncMode(c config.CloudConfig) string {
 // persisted so the daemon's next tick starts there. A reply can only ever
 // tighten a client — "full" never widens a machine set to metadata_only — so
 // a misconfigured or compromised server cannot pull content off a laptop.
-func adoptServerPolicy(c *config.CloudConfig, res pksync.Result) {
-	if res.ServerSyncMode != config.SyncModeMetadataOnly || c.MetadataOnly() {
-		return
+// Reports whether the server said metadata-only at all, so a resident loop
+// can keep the mode pinned across config reloads even if the write failed.
+func adoptServerPolicy(c *config.CloudConfig, res pksync.Result) bool {
+	if res.ServerSyncMode != config.SyncModeMetadataOnly {
+		return false
+	}
+	if c.MetadataOnly() {
+		return true
 	}
 	c.SyncMode = config.SyncModeMetadataOnly
 	changed, err := config.SetSyncMode(config.SyncModeMetadataOnly)
@@ -360,6 +401,7 @@ func adoptServerPolicy(c *config.CloudConfig, res pksync.Result) {
 	case changed:
 		fmt.Printf("sync: org policy is metadata_only — this machine now syncs metadata only (%s)\n", config.Path())
 	}
+	return true
 }
 
 func runSyncConfigure(endpoint, token, enabled, syncMode string) error {
