@@ -36,8 +36,10 @@ const defaultFlushSeconds = 5
 //     and line counts only. Prompt text, code and tool output never leave the
 //     machine; see internal/sync/redact.go for the exact allowlist.
 //
-// An unrecognised value is a load error, not a silent fallback to full: a
-// typo in a privacy setting must stop the flush rather than widen it.
+// An unrecognised value is never a silent fallback to full: Load keeps it
+// verbatim, MetadataOnly reads it as not-full, and the flush path refuses to
+// run on it (ResolveSyncMode) — a typo in a privacy setting must stop the
+// flush rather than widen it.
 const (
 	SyncModeFull         = "full"
 	SyncModeMetadataOnly = "metadata_only"
@@ -103,8 +105,8 @@ type EngineerConfig struct {
 // CloudConfig holds everything the sync command needs to flush data upstream.
 // Endpoint is the FastAPI base URL (e.g. https://api.bilanc.co); the sync
 // command appends /posthook/ingest. Token is the team install token. SyncMode
-// is one of the SyncMode* constants (Load always fills it in and rejects
-// anything else).
+// is one of the SyncMode* constants (Load canonicalises known spellings and
+// keeps anything else verbatim so the flush can refuse it).
 type CloudConfig struct {
 	Endpoint          string `json:"endpoint,omitempty"`
 	Token             string `json:"token,omitempty"`
