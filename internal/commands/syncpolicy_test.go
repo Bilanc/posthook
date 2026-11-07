@@ -196,26 +196,53 @@ func TestFlushAndAdopt_AdoptsPolicyWhenMarkSyncedFails(t *testing.T) {
 	}
 }
 
+// readOnlyConfigDir makes config.json unwritable until undo is called (or
+// the test ends), so adopting a policy cannot persist it.
+func readOnlyConfigDir(t *testing.T) (undo func()) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := filepath.Dir(config.Path())
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	undo = func() { _ = os.Chmod(dir, 0o755) }
+	t.Cleanup(undo)
+	return undo
+}
+
+// editIdentity rewrites config.json the way `posthook identity --set-email`
+// does: every field preserved, cloud.sync_mode included.
+func editIdentity(t *testing.T) {
+	t.Helper()
+	disk, err := config.ReadDisk()
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk.Engineer.Email = "someone@example.com"
+	if err := config.Save(disk); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertHeaders(t *testing.T, srv *policyServer, want ...string) {
+	t.Helper()
+	if got := srv.headers(); strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("sync-mode headers = %v, want %v", got, want)
+	}
+}
+
 // The daemon re-reads config.json every tick. A metadata-only org policy must
-// survive that reload even when it could not be written to disk, or when an
-// env override keeps asserting full: otherwise every tick after the first
-// would ship content again.
+// survive that reload when it could not be written to disk, and an env
+// override must not widen a policy that was written.
 func TestSyncLoopTick_PinsOrgPolicyAcrossConfigReloads(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		setup func(t *testing.T)
 	}{
-		{"config.json cannot be written", func(t *testing.T) {
-			if os.Geteuid() == 0 {
-				t.Skip("root ignores directory permissions")
-			}
-			dir := filepath.Dir(config.Path())
-			if err := os.Chmod(dir, 0o555); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
-		}},
-		{"POSTHOOK_CLOUD_SYNC_MODE=full overrides the file", func(t *testing.T) {
+		{"config.json cannot be written", func(t *testing.T) { readOnlyConfigDir(t) }},
+		{"POSTHOOK_CLOUD_SYNC_MODE=full cannot widen the written policy", func(t *testing.T) {
 			t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "full")
 		}},
 	} {
@@ -233,10 +260,7 @@ func TestSyncLoopTick_PinsOrgPolicyAcrossConfigReloads(t *testing.T) {
 			seedPending(t, db, "e2")
 			loop.tick()
 
-			got := srv.headers()
-			if len(got) != 2 || got[0] != config.SyncModeFull || got[1] != config.SyncModeMetadataOnly {
-				t.Fatalf("sync-mode headers = %v, want [full metadata_only]", got)
-			}
+			assertHeaders(t, srv, "full", "metadata_only")
 			if !loop.orgMetadataOnly {
 				t.Fatal("loop forgot the org policy")
 			}
@@ -244,40 +268,63 @@ func TestSyncLoopTick_PinsOrgPolicyAcrossConfigReloads(t *testing.T) {
 	}
 }
 
-// A remembered org policy yields to a local change of config.json: after an
+// A remembered policy yields to a change of cloud.sync_mode on disk: after an
 // org goes back to full, `posthook sync --set-sync-mode full` on the machine
 // is the documented way to widen it, and it must take effect on the running
 // daemon's next flush. If the org is in fact still metadata-only, the server
 // says so again on that flush and the machine is re-tightened.
-func TestSyncLoopTick_LocalConfigChangeLiftsPin(t *testing.T) {
-	readOnlyConfigDir := func(t *testing.T) (undo func()) {
-		if os.Geteuid() == 0 {
-			t.Skip("root ignores directory permissions")
-		}
-		dir := filepath.Dir(config.Path())
-		if err := os.Chmod(dir, 0o555); err != nil {
-			t.Fatal(err)
-		}
-		undo = func() { _ = os.Chmod(dir, 0o755) }
-		t.Cleanup(undo)
-		return undo
-	}
-	envFull := func(t *testing.T) (undo func()) {
-		t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "full")
-		return func() {}
-	}
+func TestSyncLoopTick_ExplicitSetFullLiftsPin(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
-		setup    func(t *testing.T) (undo func())
-		orgReply string   // what the server says once the machine is widened
-		want     []string // sync-mode header of each of the four batches
+		orgReply string // what the server says once the machine is widened
+		want     []string
 	}{
-		{"org back to full after a failed write", readOnlyConfigDir, config.SyncModeFull,
-			[]string{"full", "metadata_only", "full", "full"}},
-		{"org back to full under an env override", envFull, config.SyncModeFull,
-			[]string{"full", "metadata_only", "full", "full"}},
-		{"org still metadata-only is re-applied on the next flush", envFull, config.SyncModeMetadataOnly,
-			[]string{"full", "metadata_only", "full", "metadata_only"}},
+		{"org back to full", config.SyncModeFull, []string{"full", "metadata_only", "full", "full"}},
+		{"org still metadata-only", config.SyncModeMetadataOnly, []string{"full", "metadata_only", "full", "metadata_only"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestStore(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "")
+			srv := newPolicyServer(t)
+			saveFullModeConfig(t, srv.URL)
+
+			loop := &syncLoopState{db: db}
+			seedPending(t, db, "e1")
+			loop.tick()
+			seedPending(t, db, "e2")
+			loop.tick()
+
+			srv.setReply(tc.orgReply)
+			if err := runSyncConfigure("", "", "", config.SyncModeFull); err != nil {
+				t.Fatal(err)
+			}
+			seedPending(t, db, "e3")
+			loop.tick()
+			seedPending(t, db, "e4")
+			loop.tick()
+
+			assertHeaders(t, srv, tc.want...)
+			if loop.orgMetadataOnly != (tc.orgReply == config.SyncModeMetadataOnly) {
+				t.Fatalf("orgMetadataOnly = %v after org reply %q", loop.orgMetadataOnly, tc.orgReply)
+			}
+		})
+	}
+}
+
+// An edit that leaves cloud.sync_mode alone — identity, token, retention —
+// must not lift the remembered policy, whether the policy was written to
+// disk (and an env override says full) or could not be written.
+func TestSyncLoopTick_UnrelatedConfigEditKeepsPin(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T) (undo func())
+	}{
+		{"policy written, env override says full", func(t *testing.T) func() {
+			t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "full")
+			return func() {}
+		}},
+		{"policy could not be written", readOnlyConfigDir},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := openTestStore(t)
@@ -293,24 +340,56 @@ func TestSyncLoopTick_LocalConfigChangeLiftsPin(t *testing.T) {
 			seedPending(t, db, "e2")
 			loop.tick()
 
-			// The org moves back to full and someone widens this machine.
 			undo()
-			srv.setReply(tc.orgReply)
-			if err := runSyncConfigure("", "", "", config.SyncModeFull); err != nil {
-				t.Fatal(err)
-			}
+			editIdentity(t)
 			seedPending(t, db, "e3")
 			loop.tick()
-			seedPending(t, db, "e4")
-			loop.tick()
 
-			got := srv.headers()
-			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
-				t.Fatalf("sync-mode headers = %v, want %v", got, tc.want)
-			}
-			if loop.orgMetadataOnly != (tc.orgReply == config.SyncModeMetadataOnly) {
-				t.Fatalf("orgMetadataOnly = %v after org reply %q", loop.orgMetadataOnly, tc.orgReply)
+			assertHeaders(t, srv, "full", "metadata_only", "metadata_only")
+			if !loop.orgMetadataOnly {
+				t.Fatal("an unrelated edit lifted the org policy")
 			}
 		})
+	}
+}
+
+// When the policy could not be written when it arrived, the daemon keeps
+// trying; once the file is writable again the disk converges to
+// metadata_only, and an explicit `--set-sync-mode full` after that is seen
+// as the change it is.
+func TestSyncLoopTick_RetriesWritingPolicyThenHonoursExplicitFull(t *testing.T) {
+	db := openTestStore(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "")
+	srv := newPolicyServer(t)
+	saveFullModeConfig(t, srv.URL)
+	undo := readOnlyConfigDir(t)
+
+	loop := &syncLoopState{db: db}
+	seedPending(t, db, "e1")
+	loop.tick()
+	if disk, _ := config.ReadDisk(); disk.Cloud.SyncMode != config.SyncModeFull {
+		t.Fatalf("precondition: the write should have failed, disk = %q", disk.Cloud.SyncMode)
+	}
+	seedPending(t, db, "e2")
+	loop.tick()
+
+	undo()
+	seedPending(t, db, "e3")
+	loop.tick()
+	if disk, _ := config.ReadDisk(); disk.Cloud.SyncMode != config.SyncModeMetadataOnly {
+		t.Fatalf("disk did not converge once writable, sync_mode = %q", disk.Cloud.SyncMode)
+	}
+
+	srv.setReply(config.SyncModeFull)
+	if err := runSyncConfigure("", "", "", config.SyncModeFull); err != nil {
+		t.Fatal(err)
+	}
+	seedPending(t, db, "e4")
+	loop.tick()
+
+	assertHeaders(t, srv, "full", "metadata_only", "metadata_only", "full")
+	if loop.orgMetadataOnly {
+		t.Fatal("explicit --set-sync-mode full did not lift the policy")
 	}
 }

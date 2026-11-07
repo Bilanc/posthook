@@ -218,25 +218,25 @@ func runSyncLoop() error {
 // syncLoopState is what the daemon carries from one tick to the next. Config
 // is re-read from disk on every tick so `posthook sync --set-*` takes effect
 // without a restart — which means a server-reported metadata-only policy has
-// to be remembered here as well: if writing it to config.json failed, or an
-// env override keeps asserting full, a fresh Load would otherwise widen the
-// very next tick back to full.
+// to be remembered here as well, for the case where writing it to config.json
+// failed: a fresh Load would otherwise widen the very next tick back to full.
 //
-// The remembered policy yields to any rewrite of config.json on this machine
-// (configAtLatch is the file as it was when the policy was taken): after an
-// org goes back to full, `posthook sync --set-sync-mode full` is the
-// documented way to widen a machine, and it must work on a running daemon.
-// If the org is in fact still metadata-only, the server says so again on the
-// next flush and the policy is re-adopted then.
+// The remembered policy is keyed to cloud.sync_mode as it stood on disk when
+// the policy was taken (diskMode). It yields when that value changes — which
+// is what `posthook sync --set-sync-mode full`, the documented way to widen a
+// machine after an org goes back to full, does — and to nothing else, so an
+// identity, token or retention edit never lifts it. If the org is in fact
+// still metadata-only, the server says so again on the next flush and the
+// policy is re-adopted then.
 type syncLoopState struct {
 	db              *store.DB
 	orgMetadataOnly bool
-	configAtLatch   os.FileInfo
+	diskMode        string
 }
 
-// tick re-loads config, re-applies a remembered org policy unless config.json
-// was changed since, flushes once and adopts whatever policy the server
-// reported this time.
+// tick re-loads config, re-applies a remembered org policy unless
+// cloud.sync_mode was changed on disk since, flushes once and adopts whatever
+// policy the server reported this time.
 func (s *syncLoopState) tick() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -244,21 +244,15 @@ func (s *syncLoopState) tick() {
 		return
 	}
 	if s.orgMetadataOnly {
-		if configRewritten(s.configAtLatch) {
-			s.orgMetadataOnly, s.configAtLatch = false, nil
-			fmt.Printf("sync: %s changed — following it (a metadata-only org policy is re-applied on the next flush)\n", config.Path())
-		} else {
-			pinMetadataOnly(&cfg.Cloud)
-		}
+		s.reassertPolicy(&cfg.Cloud)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, orgMetadataOnly, err := flushAndAdopt(ctx, s.db, &cfg.Cloud)
 	if orgMetadataOnly && !s.orgMetadataOnly {
-		// Snapshot only on the transition, after adoptServerPolicy's own
-		// write, so neither that write nor a later re-confirmation of the
-		// same policy is mistaken for a local edit.
-		s.orgMetadataOnly, s.configAtLatch = true, statConfig()
+		// Record the on-disk mode after adoptServerPolicy's own write, so
+		// that write is not mistaken for a local change.
+		s.orgMetadataOnly, s.diskMode = true, diskSyncMode()
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sync: %v\n", err)
@@ -276,6 +270,40 @@ func (s *syncLoopState) tick() {
 	}
 }
 
+// reassertPolicy applies the remembered metadata-only policy to a freshly
+// loaded config, or drops it when cloud.sync_mode was changed on disk since
+// the policy was taken. While the file still resolves to full (the write
+// failed when the policy arrived) the write is retried, quietly, so the disk
+// converges and both `posthook status` and a later widen see the truth. An
+// unrecognised on-disk value is left for a person to fix: it pauses sync,
+// which is tighter still.
+func (s *syncLoopState) reassertPolicy(c *config.CloudConfig) {
+	disk := diskSyncMode()
+	if disk != s.diskMode {
+		s.orgMetadataOnly, s.diskMode = false, ""
+		fmt.Printf("sync: cloud.sync_mode changed in %s — following it (a metadata-only org policy is re-applied on the next flush)\n", config.Path())
+		return
+	}
+	pinMetadataOnly(c)
+	if mode, err := config.NormalizeSyncMode(disk); err != nil || mode == config.SyncModeMetadataOnly {
+		return
+	}
+	if changed, err := config.SetSyncMode(config.SyncModeMetadataOnly); err == nil && changed {
+		s.diskMode = diskSyncMode()
+		fmt.Printf("sync: org policy is metadata_only — now written to %s\n", config.Path())
+	}
+}
+
+// diskSyncMode is cloud.sync_mode exactly as config.json holds it: "" when
+// unset or unreadable.
+func diskSyncMode() string {
+	disk, err := config.ReadDisk()
+	if err != nil {
+		return ""
+	}
+	return disk.Cloud.SyncMode
+}
+
 // flushAndAdopt runs one Flush and adopts the org policy from its reply
 // whether or not the flush as a whole succeeded. Flush reads the reply on
 // 2xx, before it marks the rows synced; if that marking then fails the policy
@@ -285,27 +313,6 @@ func flushAndAdopt(ctx context.Context, db *store.DB, c *config.CloudConfig) (re
 	res, err = pksync.Flush(ctx, db, *c)
 	orgMetadataOnly = adoptServerPolicy(c, res)
 	return res, orgMetadataOnly, err
-}
-
-// statConfig snapshots config.json's identity on disk, nil when it is
-// missing. Save writes a fresh file and renames it into place, so every
-// `posthook sync --set-*` (and any hand edit) yields a different snapshot.
-func statConfig() os.FileInfo {
-	st, err := os.Stat(config.Path())
-	if err != nil {
-		return nil
-	}
-	return st
-}
-
-// configRewritten reports whether config.json on disk is no longer the file
-// captured by since.
-func configRewritten(since os.FileInfo) bool {
-	now := statConfig()
-	if since == nil || now == nil {
-		return (since == nil) != (now == nil)
-	}
-	return !os.SameFile(since, now) || !now.ModTime().Equal(since.ModTime()) || now.Size() != since.Size()
 }
 
 // pinMetadataOnly re-asserts a remembered metadata-only org policy on a

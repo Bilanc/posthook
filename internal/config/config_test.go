@@ -78,3 +78,30 @@ func TestSetSyncMode_PreservesEverythingElse(t *testing.T) {
 		t.Errorf("rejected write altered the file: %+v", disk)
 	}
 }
+
+// The env override may tighten or pause a machine, never widen one.
+func TestLoad_EnvCannotWidenSyncMode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, tc := range []struct{ disk, env, want string }{
+		{"metadata_only", "full", "metadata_only"},
+		{"metadata_only", "metadata-only", "metadata_only"},
+		{"full", "full", "full"},
+		{"", "full", "full"},
+		{"full", "metadata_only", "metadata_only"},
+		{"", "metadata_only", "metadata_only"},
+		{"metdata_only", "full", "metdata_only"}, // a paused machine stays paused
+		{"full", "bogus", "bogus"},               // an unrecognised override pauses sync
+	} {
+		if err := Save(Config{Cloud: CloudConfig{SyncMode: tc.disk}}); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", tc.env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Cloud.SyncMode != tc.want {
+			t.Errorf("disk %q + env %q: Load sync_mode = %q, want %q", tc.disk, tc.env, cfg.Cloud.SyncMode, tc.want)
+		}
+	}
+}

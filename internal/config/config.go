@@ -7,7 +7,8 @@
 // staging endpoint without rewriting their config: POSTHOOK_CLOUD_ENDPOINT,
 // POSTHOOK_CLOUD_TOKEN, POSTHOOK_CLOUD_ENABLED, POSTHOOK_CLOUD_FLUSH_SECS,
 // POSTHOOK_CLOUD_SYNC_MODE, POSTHOOK_ENGINEER_EMAIL, POSTHOOK_ENGINEER_NAME,
-// POSTHOOK_RETENTION_DAYS.
+// POSTHOOK_RETENTION_DAYS. The one exception is POSTHOOK_CLOUD_SYNC_MODE,
+// which can tighten or pause a machine but never widen one (see Load).
 package config
 
 import (
@@ -195,8 +196,14 @@ func Load() (Config, error) {
 			c.Cloud.FlushIntervalSecs = n
 		}
 	}
+	// POSTHOOK_CLOUD_SYNC_MODE may tighten a machine (metadata_only) or pause
+	// it (an unrecognised value), never widen one: a config.json that says
+	// metadata_only — written by a person, the installer or an org policy the
+	// server reported — stays metadata_only whatever the environment says.
 	if v := os.Getenv("POSTHOOK_CLOUD_SYNC_MODE"); v != "" {
-		c.Cloud.SyncMode = v
+		if mode, err := NormalizeSyncMode(v); err != nil || mode == SyncModeMetadataOnly || !c.Cloud.MetadataOnly() {
+			c.Cloud.SyncMode = v
+		}
 	}
 	// An unknown sync_mode is kept verbatim rather than failing the load: the
 	// flush path refuses to run on it (fail closed, see ResolveSyncMode) while
