@@ -288,6 +288,13 @@ func (s *syncLoopState) reassertPolicy(c *config.CloudConfig) {
 	if mode, err := config.NormalizeSyncMode(disk); err != nil || mode == config.SyncModeMetadataOnly {
 		return
 	}
+	// Accepted race: an explicit `--set-sync-mode full` run in the one tick
+	// between the directory becoming writable and this write converging the
+	// file writes full over full, which is not a change, and is overwritten
+	// here; the command has to be run again. The alternatives are worse —
+	// lifting on any rewrite while the file still says full ships a batch in
+	// full on an unrelated edit, and not retrying leaves the file saying
+	// full while the daemon sends metadata-only until a restart.
 	if changed, err := config.SetSyncMode(config.SyncModeMetadataOnly); err == nil && changed {
 		s.diskMode = diskSyncMode()
 		fmt.Printf("sync: org policy is metadata_only — now written to %s\n", config.Path())
