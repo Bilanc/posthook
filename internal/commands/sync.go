@@ -221,13 +221,22 @@ func runSyncLoop() error {
 // to be remembered here as well: if writing it to config.json failed, or an
 // env override keeps asserting full, a fresh Load would otherwise widen the
 // very next tick back to full.
+//
+// The remembered policy yields to any rewrite of config.json on this machine
+// (configAtLatch is the file as it was when the policy was taken): after an
+// org goes back to full, `posthook sync --set-sync-mode full` is the
+// documented way to widen a machine, and it must work on a running daemon.
+// If the org is in fact still metadata-only, the server says so again on the
+// next flush and the policy is re-adopted then.
 type syncLoopState struct {
 	db              *store.DB
 	orgMetadataOnly bool
+	configAtLatch   os.FileInfo
 }
 
-// tick re-loads config, re-applies a remembered org policy, flushes once and
-// adopts whatever policy the server reported this time.
+// tick re-loads config, re-applies a remembered org policy unless config.json
+// was changed since, flushes once and adopts whatever policy the server
+// reported this time.
 func (s *syncLoopState) tick() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -235,13 +244,21 @@ func (s *syncLoopState) tick() {
 		return
 	}
 	if s.orgMetadataOnly {
-		pinMetadataOnly(&cfg.Cloud)
+		if configRewritten(s.configAtLatch) {
+			s.orgMetadataOnly, s.configAtLatch = false, nil
+			fmt.Printf("sync: %s changed — following it (a metadata-only org policy is re-applied on the next flush)\n", config.Path())
+		} else {
+			pinMetadataOnly(&cfg.Cloud)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	res, orgMetadataOnly, err := flushAndAdopt(ctx, s.db, &cfg.Cloud)
-	if orgMetadataOnly {
-		s.orgMetadataOnly = true
+	if orgMetadataOnly && !s.orgMetadataOnly {
+		// Snapshot only on the transition, after adoptServerPolicy's own
+		// write, so neither that write nor a later re-confirmation of the
+		// same policy is mistaken for a local edit.
+		s.orgMetadataOnly, s.configAtLatch = true, statConfig()
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sync: %v\n", err)
@@ -268,6 +285,27 @@ func flushAndAdopt(ctx context.Context, db *store.DB, c *config.CloudConfig) (re
 	res, err = pksync.Flush(ctx, db, *c)
 	orgMetadataOnly = adoptServerPolicy(c, res)
 	return res, orgMetadataOnly, err
+}
+
+// statConfig snapshots config.json's identity on disk, nil when it is
+// missing. Save writes a fresh file and renames it into place, so every
+// `posthook sync --set-*` (and any hand edit) yields a different snapshot.
+func statConfig() os.FileInfo {
+	st, err := os.Stat(config.Path())
+	if err != nil {
+		return nil
+	}
+	return st
+}
+
+// configRewritten reports whether config.json on disk is no longer the file
+// captured by since.
+func configRewritten(since os.FileInfo) bool {
+	now := statConfig()
+	if since == nil || now == nil {
+		return (since == nil) != (now == nil)
+	}
+	return !os.SameFile(since, now) || !now.ModTime().Equal(since.ModTime()) || now.Size() != since.Size()
 }
 
 // pinMetadataOnly re-asserts a remembered metadata-only org policy on a

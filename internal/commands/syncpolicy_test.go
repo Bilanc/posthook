@@ -72,13 +72,14 @@ func seedPending(t *testing.T, db *store.DB, eventID string) {
 	              '{"hook_event_name":"PostToolUse","session_id":"s1","tool_name":"Bash","tool_input":{"command":"SECRET"}}')`, eventID)
 }
 
-// policyServer is an ingest endpoint whose org policy is metadata-only. It
-// records the sync-mode header of every batch and can run a hook once a batch
-// has arrived, before it replies.
+// policyServer is an ingest endpoint whose org policy is metadata-only unless
+// replyMode says otherwise. It records the sync-mode header of every batch
+// and can run a hook once a batch has arrived, before it replies.
 type policyServer struct {
 	*httptest.Server
 	mu        sync.Mutex
 	modes     []string
+	replyMode string
 	onRequest func()
 }
 
@@ -89,16 +90,31 @@ func newPolicyServer(t *testing.T) *policyServer {
 		_, _ = io.ReadAll(r.Body)
 		ps.mu.Lock()
 		ps.modes = append(ps.modes, r.Header.Get("X-Posthook-Sync-Mode"))
-		hook := ps.onRequest
+		hook, reply := ps.onRequest, ps.replyMode
 		ps.mu.Unlock()
 		if hook != nil {
 			hook()
 		}
+		if reply == "" {
+			reply = config.SyncModeMetadataOnly
+		}
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"received":{},"sync_mode":"metadata_only"}`))
+		_, _ = w.Write([]byte(`{"received":{},"sync_mode":"` + reply + `"}`))
 	}))
 	t.Cleanup(ps.Close)
 	return ps
+}
+
+func (ps *policyServer) headers() []string {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return append([]string(nil), ps.modes...)
+}
+
+func (ps *policyServer) setReply(mode string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.replyMode = mode
 }
 
 func saveFullModeConfig(t *testing.T, endpoint string) {
@@ -217,14 +233,83 @@ func TestSyncLoopTick_PinsOrgPolicyAcrossConfigReloads(t *testing.T) {
 			seedPending(t, db, "e2")
 			loop.tick()
 
-			srv.mu.Lock()
-			got := append([]string(nil), srv.modes...)
-			srv.mu.Unlock()
+			got := srv.headers()
 			if len(got) != 2 || got[0] != config.SyncModeFull || got[1] != config.SyncModeMetadataOnly {
 				t.Fatalf("sync-mode headers = %v, want [full metadata_only]", got)
 			}
 			if !loop.orgMetadataOnly {
 				t.Fatal("loop forgot the org policy")
+			}
+		})
+	}
+}
+
+// A remembered org policy yields to a local change of config.json: after an
+// org goes back to full, `posthook sync --set-sync-mode full` on the machine
+// is the documented way to widen it, and it must take effect on the running
+// daemon's next flush. If the org is in fact still metadata-only, the server
+// says so again on that flush and the machine is re-tightened.
+func TestSyncLoopTick_LocalConfigChangeLiftsPin(t *testing.T) {
+	readOnlyConfigDir := func(t *testing.T) (undo func()) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		dir := filepath.Dir(config.Path())
+		if err := os.Chmod(dir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		undo = func() { _ = os.Chmod(dir, 0o755) }
+		t.Cleanup(undo)
+		return undo
+	}
+	envFull := func(t *testing.T) (undo func()) {
+		t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "full")
+		return func() {}
+	}
+	for _, tc := range []struct {
+		name     string
+		setup    func(t *testing.T) (undo func())
+		orgReply string   // what the server says once the machine is widened
+		want     []string // sync-mode header of each of the four batches
+	}{
+		{"org back to full after a failed write", readOnlyConfigDir, config.SyncModeFull,
+			[]string{"full", "metadata_only", "full", "full"}},
+		{"org back to full under an env override", envFull, config.SyncModeFull,
+			[]string{"full", "metadata_only", "full", "full"}},
+		{"org still metadata-only is re-applied on the next flush", envFull, config.SyncModeMetadataOnly,
+			[]string{"full", "metadata_only", "full", "metadata_only"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestStore(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("POSTHOOK_CLOUD_SYNC_MODE", "")
+			srv := newPolicyServer(t)
+			saveFullModeConfig(t, srv.URL)
+			undo := tc.setup(t)
+
+			loop := &syncLoopState{db: db}
+			seedPending(t, db, "e1")
+			loop.tick()
+			seedPending(t, db, "e2")
+			loop.tick()
+
+			// The org moves back to full and someone widens this machine.
+			undo()
+			srv.setReply(tc.orgReply)
+			if err := runSyncConfigure("", "", "", config.SyncModeFull); err != nil {
+				t.Fatal(err)
+			}
+			seedPending(t, db, "e3")
+			loop.tick()
+			seedPending(t, db, "e4")
+			loop.tick()
+
+			got := srv.headers()
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Fatalf("sync-mode headers = %v, want %v", got, tc.want)
+			}
+			if loop.orgMetadataOnly != (tc.orgReply == config.SyncModeMetadataOnly) {
+				t.Fatalf("orgMetadataOnly = %v after org reply %q", loop.orgMetadataOnly, tc.orgReply)
 			}
 		})
 	}
