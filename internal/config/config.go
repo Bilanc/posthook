@@ -6,7 +6,9 @@
 // Env vars override the on-disk file so devs can point a single binary at a
 // staging endpoint without rewriting their config: POSTHOOK_CLOUD_ENDPOINT,
 // POSTHOOK_CLOUD_TOKEN, POSTHOOK_CLOUD_ENABLED, POSTHOOK_CLOUD_FLUSH_SECS,
-// POSTHOOK_ENGINEER_EMAIL, POSTHOOK_ENGINEER_NAME, POSTHOOK_RETENTION_DAYS.
+// POSTHOOK_CLOUD_SYNC_MODE, POSTHOOK_ENGINEER_EMAIL, POSTHOOK_ENGINEER_NAME,
+// POSTHOOK_RETENTION_DAYS. The one exception is POSTHOOK_CLOUD_SYNC_MODE,
+// which can tighten or pause a machine but never widen one (see Load).
 package config
 
 import (
@@ -16,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/bilanc/posthook/internal/paths"
 )
@@ -25,6 +28,35 @@ import (
 // appends one blob per non-empty flush, so a short interval just means
 // near-real-time landing, not more load when idle.
 const defaultFlushSeconds = 5
+
+// Sync modes for CloudConfig.SyncMode — what a cloud flush is allowed to carry.
+//
+//   - SyncModeFull replicates the local tables as-is, including prompt text and
+//     verbatim tool-call payloads (code, shell output, assistant replies).
+//   - SyncModeMetadataOnly ships requests, sessions, tokens, turns, file paths
+//     and line counts only. Prompt text, code and tool output never leave the
+//     machine; see internal/sync/redact.go for the exact allowlist.
+//
+// An unrecognised value is never a silent fallback to full: Load keeps it
+// verbatim, MetadataOnly reads it as not-full, and the flush path refuses to
+// run on it (ResolveSyncMode) — a typo in a privacy setting must stop the
+// flush rather than widen it.
+const (
+	SyncModeFull         = "full"
+	SyncModeMetadataOnly = "metadata_only"
+)
+
+// NormalizeSyncMode maps user spellings onto the canonical constants. Empty
+// means "unset" and resolves to full, the pre-sync_mode behaviour.
+func NormalizeSyncMode(s string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", SyncModeFull:
+		return SyncModeFull, nil
+	case SyncModeMetadataOnly, "metadata-only", "metadata":
+		return SyncModeMetadataOnly, nil
+	}
+	return "", fmt.Errorf("unknown sync mode %q (want %s or %s)", s, SyncModeFull, SyncModeMetadataOnly)
+}
 
 // DefaultRetentionDays is how long events and prompts are kept in the local
 // store when storage.retention_days is unset. A year covers every dashboard
@@ -73,12 +105,65 @@ type EngineerConfig struct {
 
 // CloudConfig holds everything the sync command needs to flush data upstream.
 // Endpoint is the FastAPI base URL (e.g. https://api.bilanc.co); the sync
-// command appends /posthook/ingest. Token is the team install token.
+// command appends /posthook/ingest. Token is the team install token. SyncMode
+// is one of the SyncMode* constants (Load canonicalises known spellings and
+// keeps anything else verbatim so the flush can refuse it).
 type CloudConfig struct {
 	Endpoint          string `json:"endpoint,omitempty"`
 	Token             string `json:"token,omitempty"`
 	Enabled           bool   `json:"enabled"`
 	FlushIntervalSecs int    `json:"flush_interval_seconds,omitempty"`
+	SyncMode          string `json:"sync_mode,omitempty"`
+}
+
+// MetadataOnly reports whether flushes must strip prompt text and tool-call
+// content before leaving the machine. An unrecognised sync_mode reads as
+// metadata-only too — never as the wider mode — and the flush path refuses
+// to run on it at all (ResolveSyncMode).
+func (c CloudConfig) MetadataOnly() bool {
+	mode, err := NormalizeSyncMode(c.SyncMode)
+	return err != nil || mode == SyncModeMetadataOnly
+}
+
+// ResolveSyncMode returns the canonical sync mode, or an error naming the
+// unrecognised value so the caller can fail closed and say how to fix it.
+func (c CloudConfig) ResolveSyncMode() (string, error) { return NormalizeSyncMode(c.SyncMode) }
+
+// ReadDisk reads ~/.posthook/config.json exactly as written — no env
+// overrides, no normalisation — so a caller can change one field and save it
+// back without baking an env-only setting into the file. A missing file is
+// an empty Config.
+func ReadDisk() (Config, error) {
+	var c Config
+	b, err := os.ReadFile(Path())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return c, nil
+		}
+		return c, err
+	}
+	return c, json.Unmarshal(b, &c)
+}
+
+// SetSyncMode writes cloud.sync_mode to disk and leaves every other setting
+// as it is. Returns false when the file already held that mode. The sync
+// command calls it when the team server reports a metadata-only org policy,
+// so an already-installed machine tightens itself on its next flush instead
+// of waiting for someone to re-run the installer.
+func SetSyncMode(mode string) (changed bool, err error) {
+	mode, err = NormalizeSyncMode(mode)
+	if err != nil {
+		return false, err
+	}
+	disk, err := ReadDisk()
+	if err != nil {
+		return false, err
+	}
+	if current, cerr := NormalizeSyncMode(disk.Cloud.SyncMode); cerr == nil && current == mode {
+		return false, nil
+	}
+	disk.Cloud.SyncMode = mode
+	return true, Save(disk)
 }
 
 // Path returns the absolute path to the on-disk config file.
@@ -110,6 +195,23 @@ func Load() (Config, error) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.Cloud.FlushIntervalSecs = n
 		}
+	}
+	// POSTHOOK_CLOUD_SYNC_MODE may tighten a machine (metadata_only) or pause
+	// it (an unrecognised value), never widen one: a config.json that says
+	// metadata_only — written by a person, the installer or an org policy the
+	// server reported — stays metadata_only whatever the environment says.
+	if v := os.Getenv("POSTHOOK_CLOUD_SYNC_MODE"); v != "" {
+		if mode, err := NormalizeSyncMode(v); err != nil || mode == SyncModeMetadataOnly || !c.Cloud.MetadataOnly() {
+			c.Cloud.SyncMode = v
+		}
+	}
+	// An unknown sync_mode is kept verbatim rather than failing the load: the
+	// flush path refuses to run on it (fail closed, see ResolveSyncMode) while
+	// `posthook sync --set-sync-mode` can still repair the typo and `posthook
+	// uninstall` still sees cloud sync as configured, so its final flush is
+	// attempted (and, refused, preserves the local data) instead of skipped.
+	if mode, err := NormalizeSyncMode(c.Cloud.SyncMode); err == nil {
+		c.Cloud.SyncMode = mode
 	}
 	if v := os.Getenv("POSTHOOK_ENGINEER_EMAIL"); v != "" {
 		c.Engineer.Email = v
