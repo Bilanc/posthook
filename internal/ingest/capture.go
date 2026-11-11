@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bilanc/posthook/internal/gitx"
@@ -261,9 +262,8 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 			logx.Debugf("line-range: file gone, skipping (%s)", path)
 			continue
 		}
-		located := lineranges.Extract("ShellWrite", lineranges.ToolInput{Content: w.Content}, string(fc.post))
-
 		if w.Append {
+			located := lineranges.Extract("ShellWrite", lineranges.ToolInput{Content: w.Content}, string(fc.post))
 			// Appended: every line of it is new, where it now sits. If the
 			// text is no longer in the file it still counts, without a
 			// position.
@@ -287,7 +287,13 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 		// second look like it changed nothing.
 		fc.change = overwriteChange(db, &fc, w.Content, firedAt)
 		fc.snapshotOf(w.Content, firedAt)
-		if len(located.Ranges) == 0 && !mostlyPresent(w.Content, string(fc.post)) {
+		switch at := firstLineOf(w.Content, string(fc.post)); {
+		case at > 1:
+			// The text is in the file verbatim but no longer starts it:
+			// something was put above it since. Its lines sit lower by that
+			// much, and that is where a commit will find them.
+			fc.change = fc.change.Shift(at - 1)
+		case at == 0 && !mostlyPresent(w.Content, string(fc.post)):
 			// Hardly any of it is in the file now: the command may not have
 			// run the redirect, or the file has been rewritten since. Count
 			// it and claim no position.
@@ -300,6 +306,21 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 		return nil
 	}
 	return c
+}
+
+// firstLineOf returns the 1-based line of file where written first appears
+// verbatim, or 0 when it does not. A file with CRLF line endings is matched
+// against the LF text a command spells out.
+func firstLineOf(written, file string) int {
+	at := strings.Index(file, written)
+	if at < 0 && strings.Contains(file, "\r\n") {
+		file = strings.ReplaceAll(file, "\r\n", "\n")
+		at = strings.Index(file, strings.ReplaceAll(written, "\r\n", "\n"))
+	}
+	if at < 0 {
+		return 0
+	}
+	return 1 + strings.Count(file[:at], "\n")
 }
 
 // mostlyPresent reports whether at least half the lines of written are still
@@ -513,14 +534,20 @@ type fileLines struct {
 	LinesReworked  int     `json:"lines_reworked"`
 }
 
-// fileLinesArg is events.file_lines: NULL unless the event wrote more than
-// one file, otherwise a JSON array with one element per file, in the order
-// the event wrote them. lines_generated and lines_reworked on the event are
-// one number each, and its row names a single path, so without this a
-// reader cannot say which file an edit's lines or its rework belong to. A
-// file that counts for nothing (outside the repo, ignored) is listed with
-// zeros; the elements add up to the event's two counts.
-func (c *editCapture) fileLinesArg() sql.NullString {
+// fileLinesArg is events.file_lines: a JSON array with one element per file
+// the event's counts belong to, in the order it wrote them, or NULL when
+// that is exactly the one file the event row names (eventPath).
+//
+// lines_generated and lines_reworked on the event are one number each, and
+// its row names a single path. That is enough for an Edit or a Write. It is
+// not for a patch across files, where a reader could not say which file was
+// reworked, nor for a shell command whose row names its first target while
+// the lines posthook could measure went to another
+// (`sed -i s/a/b/ a.go; echo x > b.go`). A file that counts for nothing
+// (outside the repo, ignored) is listed with zeros; the elements add up to
+// the event's two counts. A reader can therefore rely on this: no split
+// means the event's own file has all of it.
+func (c *editCapture) fileLinesArg(eventPath string) sql.NullString {
 	if c == nil {
 		return sql.NullString{}
 	}
@@ -542,7 +569,7 @@ func (c *editCapture) fileLinesArg() sql.NullString {
 		files[at].LinesGenerated += fc.generated
 		files[at].LinesReworked += fc.reworked
 	}
-	if len(files) < 2 {
+	if len(files) == 0 || (len(files) == 1 && files[0].FilePath == eventPath) {
 		return sql.NullString{}
 	}
 	encoded, err := json.Marshal(files)

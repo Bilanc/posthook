@@ -279,7 +279,7 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		id, store.LocalOrgID, sessIDArg, ts, eventType, agentSlug, cwd,
 		nullableString(finalFilePath), repoID, relFilePath,
 		patchLinesAdded, patchLinesRemoved, string(stored),
-		capture.generatedArg(), capture.reworkedArg(), capture.fileLinesArg())
+		capture.generatedArg(), capture.reworkedArg(), capture.fileLinesArg(finalFilePath))
 	if err != nil {
 		return err
 	}

@@ -22,8 +22,11 @@ const dbPath = installFixture();
 // Session H: a shell write of 5 lines, then a shell rewrite that only removes
 // 2 of them: 0 generated, 2 reworked, no ranges, not an edit tool by name.
 // Session K: an older client's patch across two files (no measured counts).
+// Session L: a shell command whose row names a.go (edited in place, content
+// unknown) while the one line posthook measured went to b.go.
 //
-// An event that wrote several files carries the split in events.file_lines.
+// An event whose counts are not all its own row's file carries the split in
+// events.file_lines.
 {
   const J = (o: unknown) => JSON.stringify(o).replaceAll("'", "''");
   const post = (tool: string, input: Record<string, unknown>) =>
@@ -59,7 +62,8 @@ const dbPath = installFixture();
     INSERT INTO sessions (id, agent_slug, model_slug, repo_id, branch, started_at, ended_at) VALUES
       ('J', 'codex', 'gpt-6', 'r1', 'main', '2026-10-17T10:00:00Z', '2026-10-17T10:10:00Z'),
       ('H', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-10-18T10:00:00Z', '2026-10-18T10:10:00Z'),
-      ('K', 'codex', 'gpt-6', 'r1', 'main', '2026-10-19T10:00:00Z', '2026-10-19T10:10:00Z');
+      ('K', 'codex', 'gpt-6', 'r1', 'main', '2026-10-19T10:00:00Z', '2026-10-19T10:10:00Z'),
+      ('L', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-10-20T10:00:00Z', '2026-10-20T10:10:00Z');
     INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, file_path, lines_added, lines_generated, lines_reworked, payload) VALUES
       ('j1', 'J', '2026-10-17T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 2, 2, 1,
         '${post("apply_patch", { command: "*** Begin Patch" })}'),
@@ -68,13 +72,16 @@ const dbPath = installFixture();
       ('h2', 'H', '2026-10-18T10:00:20Z', 'PostToolUse', 'claude-code', 'r1', 'src/s.sh', '/tmp/demo/src/s.sh', NULL, 0, 2,
         '${post("Bash", { command: "cat > src/s.sh" })}'),
       ('k1', 'K', '2026-10-19T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'src/p.ts', '/tmp/demo/src/p.ts', 7, NULL, NULL,
-        '${post("apply_patch", { command: "*** Begin Patch" })}');
+        '${post("apply_patch", { command: "*** Begin Patch" })}'),
+      ('l1', 'L', '2026-10-20T10:00:10Z', 'PostToolUse', 'claude-code', 'r1', 'a.go', '/tmp/demo/a.go', NULL, 1, 0,
+        '${post("Bash", { command: "sed -i s/old/new/ a.go; echo hello > b.go" })}');
     INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, start_line, end_line, new_text_lines) VALUES
       ('r-j1a', 'j1', '/tmp/demo/a.go', 'a.go', 9, 9, 1),
       ('r-j1b', 'j1', '/tmp/demo/b.go', 'b.go', 3, 3, 1),
       ('r-h1', 'h1', '/tmp/demo/src/s.sh', 'src/s.sh', 1, 5, 5),
       ('r-k1a', 'k1', '/tmp/demo/src/p.ts', 'src/p.ts', 1, 4, 4),
-      ('r-k1b', 'k1', '/tmp/demo/src/q.ts', 'src/q.ts', 1, 3, 3);
+      ('r-k1b', 'k1', '/tmp/demo/src/q.ts', 'src/q.ts', 1, 3, 3),
+      ('r-l1', 'l1', '/tmp/demo/b.go', 'b.go', 1, 1, 1);
 
     UPDATE events SET file_lines = '${J([
       { rel_file_path: "src/g.ts", file_path: "/tmp/demo/src/g.ts", lines_generated: 4, lines_reworked: 0 },
@@ -89,6 +96,9 @@ const dbPath = installFixture();
       { rel_file_path: "b.go", file_path: "/tmp/demo/b.go", lines_generated: 1, lines_reworked: 1 },
       { rel_file_path: null, file_path: "/home/dev/scratch.md", lines_generated: 0, lines_reworked: 0 },
     ])}' WHERE id = 'j1';
+    UPDATE events SET file_lines = '${J([
+      { rel_file_path: "b.go", file_path: "/tmp/demo/b.go", lines_generated: 1, lines_reworked: 0 },
+    ])}' WHERE id = 'l1';
   `);
   w.close();
 }
@@ -161,6 +171,12 @@ test("a shell rewrite that only removes the session's lines is an edit and is su
   assert.deepEqual(files, [["src/s.sh", 2, 3]]);
 });
 
+test("a split of one file moves the count off the file the event row names", () => {
+  const files = sessionTimelineData("L").files.map((r) => [r.file, r.edits, r.lines_generated]);
+  // The row names a.go; the measured line is b.go's.
+  assert.deepEqual(files, [["b.go", 1, 1]]);
+});
+
 test("an older client's multi-file patch is still split by its ranges", () => {
   const files = Object.fromEntries(
     sessionTimelineData("K").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
@@ -169,7 +185,7 @@ test("an older client's multi-file patch is still split by its ranges", () => {
 });
 
 test("the files of a session add up to its total", () => {
-  for (const id of ["A", "C", "F", "G", "H", "J", "K"]) {
+  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L"]) {
     const sum = sessionTimelineData(id).files.reduce((n, r) => n + r.lines_generated, 0);
     assert.equal(sum, getSessionDetail(id)?.lines_generated, `session ${id}`);
   }

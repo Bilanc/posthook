@@ -184,6 +184,8 @@ func TestExactCapture(t *testing.T) {
 	t.Run("queued shell rewrites each keep their own lines", func(t *testing.T) { testQueuedShellRewrites(t, home) })
 	t.Run("queued edit then write: the write is not diffed against a later disk", func(t *testing.T) { testQueuedEditThenWrite(t, home) })
 	t.Run("a file too large to snapshot keeps none", func(t *testing.T) { testOversizeFileKeepsNoSnapshot(t, home) })
+	t.Run("a shell rewrite found lower in the file points there", func(t *testing.T) { testShellRewriteFoundLowerInTheFile(t, home) })
+	t.Run("a shell event whose row names another file records the split", func(t *testing.T) { testShellSplitWhenRowNamesAnotherFile(t, home) })
 	t.Run("write without a patch diffs against HEAD, then the last copy", func(t *testing.T) { testWriteWithoutPatch(t, home) })
 	t.Run("files outside a repo or ignored count for nothing", func(t *testing.T) { testUncountableFiles(t, home) })
 	t.Run("shell heredoc rewrite counts only the changed line", func(t *testing.T) { testShellRewrite(t, home) })
@@ -488,6 +490,59 @@ func testQueuedEditThenWrite(t *testing.T, home string) {
 	// line 2 a second time: over, never under, and only in this race.
 	wantCounts(t, db, "queued-2", [2]int64{1, 0}, [2]int64{3, 0})
 	wantRanges(t, db, "queued-2", rangeRow{2, 2}, rangeRow{2, 2}, rangeRow{6, 7})
+}
+
+func testShellRewriteFoundLowerInTheFile(t *testing.T, home string) {
+	// A heredoc wrote the whole file; by the time the event is handled a
+	// later command has put a line above it. The text is still there
+	// verbatim, one line lower, and that is where its ranges must point.
+	repo := filepath.Join(home, "repo-shell-shifted")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "list.txt")
+	writeFile(t, path, "# header\nalpha\nbeta\n")
+	deliver(t, "claude-code", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "shifted-1", "cwd": repo,
+		"tool_name": "Bash", "tool_input": map[string]any{"command": "cat > " + path + " <<'EOF'\nalpha\nbeta\nEOF"},
+	})
+	db := openDB(t)
+	wantCounts(t, db, "shifted-1", [2]int64{2, 0})
+	wantRanges(t, db, "shifted-1", rangeRow{2, 3})
+}
+
+func testShellSplitWhenRowNamesAnotherFile(t *testing.T, home string) {
+	// The command edits a.go in place (content unknown to posthook) and then
+	// writes b.go. The event row names its first target, a.go; the line
+	// posthook could measure went to b.go. One file was measured, but it is
+	// not the row's, so the split is recorded and says so.
+	repo := filepath.Join(home, "repo-shell-split")
+	initRepo(t, repo)
+	writeFile(t, filepath.Join(repo, "a.go"), "old\n")
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+	writeFile(t, filepath.Join(repo, "a.go"), "new\n")
+	writeFile(t, filepath.Join(repo, "b.go"), "hello\n")
+	deliver(t, "claude-code", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "rowfile-1", "cwd": repo,
+		"tool_name": "Bash", "tool_input": map[string]any{"command": "sed -i 's/old/new/' a.go; echo hello > b.go"},
+	})
+
+	db := openDB(t)
+	var rowFile sql.NullString
+	if err := db.QueryRow(`SELECT rel_file_path FROM events WHERE session_id = 'rowfile-1'`).Scan(&rowFile); err != nil {
+		t.Fatal(err)
+	}
+	if rowFile.String != "a.go" {
+		t.Fatalf("test setup: the event row names %q, expected its first target a.go", rowFile.String)
+	}
+	wantCounts(t, db, "rowfile-1", [2]int64{1, 0})
+	split := fileLinesForSession(t, db, "rowfile-1")
+	if len(split) != 1 || len(split[0]) != 1 {
+		t.Fatalf("file_lines = %+v, want one event with one file", split)
+	}
+	only := split[0][0]
+	if only.RelFilePath == nil || *only.RelFilePath != "b.go" || only.LinesGenerated != 1 || only.LinesReworked != 0 {
+		t.Errorf("split: %+v, want b.go with the one line", only)
+	}
 }
 
 func testOversizeFileKeepsNoSnapshot(t *testing.T, home string) {

@@ -39,8 +39,8 @@ const LocalOrgID = "local"
 // before-content an exact diff needs was never stored for them.
 //
 // v16 finishes that work, for two things that changed while v15 was still
-// unreleased. It adds events.file_lines, the per-file split of an edit that
-// wrote several files. And it rebuilds file_snapshots where a pre-release
+// unreleased. It adds events.file_lines, the per-file split of an edit
+// whose lines are not all in the file its row names. And it rebuilds file_snapshots where a pre-release
 // v15 build created it holding a gzip copy of each file: the table now keeps
 // a fingerprint per line, and a database already at 15 would never have been
 // migrated again. The old rows are discarded, not converted: they are

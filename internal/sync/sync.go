@@ -89,7 +89,7 @@ type ingestPayload struct {
 // lines_generated and lines_reworked, the per-event counts ingest computes
 // from an exact diff (NULL on events recorded by an older client), and
 // file_lines, a JSON array splitting those two counts by file for an event
-// that wrote several (NULL otherwise). Metadata-only mode leaves all three
+// whose lines are not all in the file its row names (NULL otherwise). Metadata-only mode leaves all three
 // as they are: they are counts and file paths, like the columns beside them.
 const schemaVersion = 11
 
