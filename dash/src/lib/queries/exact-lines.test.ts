@@ -28,18 +28,14 @@ const dbPath = installFixture();
 // Session R: the session writes 30 lines to b.go; one patch then names a.go
 // first, adds a line there and replaces the 30 lines in b.go with five.
 // Session S: the same, after the session had already written 3 lines to a.go.
-// Session M: a measured patch with no split (as a pre-release build recorded
-// it) whose ranges are 4 lines in a.go and 2 in b.go.
-// Session N: the shell command of session L as a build without the split
-// recorded it: the row names a.go, the one range is in b.go.
+// Sessions M, N, U, V: measured edits with no split whose ranges are not all
+// in the file the row names, as only a build from before the split existed
+// could record them. M: 4 lines in a.go, 2 in b.go. N: the shell command of
+// session L, one range in b.go. U and V: like M with 2 lines reworked.
 //
 // Session T: writes README.md in two repositories, first with one Write
 // each, then with one patch that touches both; and a note outside any
 // repository, whose event row still carries the session folder's repository.
-// Session U: a measured patch with no split, ranges of 4 lines in a.go and 2
-// in b.go, that also reworked 2 of the session's lines.
-// Session V: the same shape with 1 line in a.go (the file its row names) and
-// 5 in b.go.
 //
 // An event whose counts are not all its own row's file carries the split in
 // events.file_lines.
@@ -278,15 +274,21 @@ test("rework in one file of a patch leaves the other file's earlier edits alone"
   assert.equal(getSessionDetail("S")?.lines_generated, 9);
 });
 
-test("a measured edit without a split follows its ranges", () => {
-  // Ranges in two files: split by range path, as an older client's patch is.
-  const multi = Object.fromEntries(
-    sessionTimelineData("M").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
-  );
-  assert.deepEqual(multi, { "a.go": [1, 4], "b.go": [1, 2] });
-  // One range, in a file the row does not name: the count goes to that file.
-  const single = sessionTimelineData("N").files.map((r) => [r.file, r.edits, r.lines_generated]);
-  assert.deepEqual(single, [["b.go", 1, 1]]);
+test("a measured edit without a split is one row on its event's own file", () => {
+  const rows = (id: string) => sessionTimelineData(id).files.map((r) => [r.file, r.edits, r.lines_generated]);
+  // The client writes a split whenever the event's own file does not have
+  // all of it, so no split means it does. These four rows have ranges in
+  // other files and no split, which only a build from before the split
+  // existed could record: each is one row with its whole net count. Ranges
+  // are where lines sit, not what the edit counted, and rework has no file,
+  // so no split of them would be right.
+  assert.deepEqual(rows("M"), [["a.go", 1, 6]]); // ranges: 4 in a.go, 2 in b.go
+  assert.deepEqual(rows("N"), [["a.go", 1, 1]]); // its one range is in b.go
+  assert.deepEqual(rows("U"), [["a.go", 1, 4]]); // 6 written, 2 reworked
+  assert.deepEqual(rows("V"), [["a.go", 1, 4]]); // 1 line in a.go, 5 in b.go, 2 reworked
+  for (const id of ["M", "N", "U", "V"]) {
+    assert.equal(getSessionDetail(id)?.lines_generated, rows(id)[0][2]);
+  }
 });
 
 test("the same path in two repositories is two files", () => {
@@ -309,27 +311,6 @@ test("only files with a repo-relative path are in the event's repository", () =>
   assert.ok(inRepo.length > 0 && inRepo.every((r) => r.repo_name === "demo" && r.repo_root === "/tmp/demo"));
   const outside = rows.find((r) => r.file === "/home/dev/plan.md");
   assert.equal(outside?.repo_id, null);
-});
-
-test("a measured edit with no split keeps its count when its ranges span files", () => {
-  const files = Object.fromEntries(
-    sessionTimelineData("U").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
-  );
-  // 6 written and 2 reworked: the located lines go to their files, and the
-  // rework comes off the file with the most located lines. Summing the
-  // ranges alone would say 6 for a session that nets 4.
-  assert.deepEqual(files, { "a.go": [1, 2], "b.go": [1, 2] });
-  assert.equal(getSessionDetail("U")?.lines_generated, 4);
-});
-
-test("an unsplit edit's rework does not erase the lines of the file its row names", () => {
-  const files = Object.fromEntries(
-    sessionTimelineData("V").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
-  );
-  // One line in a.go, five in b.go, two reworked. Taking the rework off a.go,
-  // the file the row names, left 0 and 5 once floored; it comes off b.go.
-  assert.deepEqual(files, { "a.go": [1, 1], "b.go": [1, 3] });
-  assert.equal(getSessionDetail("V")?.lines_generated, 4);
 });
 
 test("an older client's multi-file patch is still split by its ranges", () => {

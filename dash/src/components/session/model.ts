@@ -61,23 +61,19 @@ export function fileRows(
       repos.set(f.repo_id, { name: f.repo_name || f.repo_id, root: f.repo_root || "" });
     }
   }
-  // What to call each repository: its name, unless another of the session's
-  // repositories has the same one (a worktree beside the main clone shares
-  // the remote's name). Then the folder it lives in, then the whole path.
+  // What to call each repository: the folder it lives in. Worktrees and
+  // second clones of one repository share its name (it comes from the
+  // remote) but not their folder. When two of the session's repositories
+  // have folders of the same name, the whole path. The label is for
+  // reading; rows are keyed by repository id, never by it.
   const base = (root: string) => root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || root;
-  const shared = (pick: (r: { name: string; root: string }) => string) => {
-    const seen = new Map<string, number>();
-    for (const r of repos.values()) seen.set(pick(r), (seen.get(pick(r)) ?? 0) + 1);
-    return (v: string) => (seen.get(v) ?? 0) > 1;
-  };
-  const nameShared = shared((r) => r.name);
-  const folderShared = shared((r) => base(r.root));
+  const folder = (r: { name: string; root: string }) => (r.root ? base(r.root) : r.name);
+  const folders = new Map<string, number>();
+  for (const r of repos.values()) folders.set(folder(r), (folders.get(folder(r)) ?? 0) + 1);
   const repoLabel = (repoId: string) => {
     const r = repos.get(repoId);
     if (!r) return repoId;
-    if (!nameShared(r.name)) return r.name;
-    if (r.root && !folderShared(base(r.root))) return base(r.root);
-    return r.root || repoId;
+    return (folders.get(folder(r)) ?? 0) > 1 && r.root ? r.root : folder(r);
   };
   const label = (path: string, repoId?: string | null) =>
     repos.size > 1 && repoId ? `${repoLabel(repoId)}/${path}` : path;
