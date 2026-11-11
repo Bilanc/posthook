@@ -241,15 +241,23 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	// counts go in with it (see capture.go). Read from the full in-memory
 	// `payload`: the patch Claude Code reports lives in tool_response, which
 	// TrimPayload drops below.
+	//
+	// firedAt is when the hook fired, as the hook itself recorded it. The
+	// worker gets to the event later, so this is the only clock that says
+	// which of the file's states the event could have seen (capture.go).
+	firedAt, err := time.Parse(time.RFC3339Nano, env.ReceivedAt)
+	if err != nil {
+		firedAt = time.Now()
+	}
 	var capture *editCapture
 	switch {
 	case eventType == "PostToolUse" && len(applyPatchFiles) > 0:
 		capture = captureApplyPatch(applyPatchFiles, cwd, workspaceRoots)
 	case len(shellWrites) > 0:
-		capture = captureShellWrites(db, shellWrites, cwd, workspaceRoots)
+		capture = captureShellWrites(db, shellWrites, cwd, workspaceRoots, firedAt)
 	default:
 		if toolName := lineRangeToolForEvent(agentSlug, eventType, payload); toolName != "" && canonicalFilePath != "" {
-			capture = captureToolEdit(db, canonicalFilePath, toolName, payload)
+			capture = captureToolEdit(db, canonicalFilePath, toolName, payload, firedAt)
 		}
 	}
 	if capture != nil {

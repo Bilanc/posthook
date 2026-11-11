@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/lineranges"
@@ -34,14 +36,24 @@ import (
 //     the place the new string sits in the file, so the unchanged lines the
 //     agent repeated around its change are not counted.
 //  3. A tool that hands over a whole file (Write from other agents, a shell
-//     heredoc) is diffed against posthook's last copy of that file, or the
-//     version at HEAD, whichever is closer. With neither, the file is new
-//     and every line counts.
+//     heredoc) is diffed against posthook's last snapshot of that file, or
+//     the version at HEAD, whichever is closer. With neither, the file is
+//     new and every line counts.
 //  4. apply_patch hunks are found by their context lines.
 //
 // A file outside any git repository, or one git ignores, can never reach a
 // commit. It gets no ranges and counts for nothing; the event still records
 // lines_generated = 0 so readers know it was measured.
+//
+// Events are handled by a background worker, after the fact and in order,
+// so the file on disk may already hold later edits than the event in hand.
+// Two rules follow. What an event itself carries (a patch, a whole file's
+// content) is trusted over the disk. And a snapshot read from disk is dated
+// with the time of the read: an event that fired before that read cannot use
+// it as its "before", because the read may have seen that event's own write.
+//
+// Snapshots and the per-session ledger are line fingerprints
+// (store.LineHash), never file content.
 
 // fileCapture is what one event did to one file.
 type fileCapture struct {
@@ -56,17 +68,32 @@ type fileCapture struct {
 	change    lineranges.Change
 	unlocated int
 
-	// post is the file as read from disk while handling the event, and
-	// hasPost whether that read worked (the file may already be gone).
+	// removed is the fingerprint of every line the edit removed. score
+	// matches these against the session's ledger.
+	removed []uint64
+
+	// before is the file before the edit, one fingerprint per line, when
+	// that is known exactly: Claude Code's originalFile, or the baseline a
+	// whole-file write was diffed against.
+	before    []uint64
+	hasBefore bool
+
+	// post is the file as read from disk while handling the event, readAt
+	// when, and hasPost whether the read worked (the file may be gone).
 	post    []byte
 	hasPost bool
+	readAt  time.Time
 
 	// snapshot is the file as this event left it, kept as the baseline for
-	// the next whole-file write. nil leaves the stored snapshot alone.
-	snapshot []byte
+	// the next whole-file write, and snapshotAsOf the instant it was true.
+	// snapshotBytes is the size of the content it was taken from.
+	snapshot      []uint64
+	hasSnapshot   bool
+	snapshotAsOf  time.Time
+	snapshotBytes int
 
-	// lines is the session's remembered lines for this file after this
-	// event; set by score.
+	// lines is the session's ledger for this file after this event; set by
+	// score.
 	lines     []uint64
 	saveLines bool
 }
@@ -97,13 +124,35 @@ func newFileCapture(path, tool string) fileCapture {
 
 func (fc *fileCapture) readPost() {
 	if content, err := os.ReadFile(fc.path); err == nil {
-		fc.post, fc.hasPost = content, true
+		fc.post, fc.hasPost, fc.readAt = content, true, time.Now()
+	}
+}
+
+// setChange records a change whose removed lines are text.
+func (fc *fileCapture) setChange(c lineranges.Change, unlocated int) {
+	fc.change, fc.unlocated = c, unlocated
+	fc.removed = hashAll(c.Removed)
+}
+
+// snapshotOf records content as the state this event left the file in, true
+// from asOf.
+func (fc *fileCapture) snapshotOf(content string, asOf time.Time) {
+	fc.snapshot, fc.hasSnapshot = hashLines(content), true
+	fc.snapshotAsOf, fc.snapshotBytes = asOf, len(content)
+}
+
+// snapshotFromDisk records the file as read while handling the event. It is
+// only known to be true from the moment of the read: by then the file may
+// hold edits later than this event.
+func (fc *fileCapture) snapshotFromDisk() {
+	if fc.hasPost {
+		fc.snapshotOf(string(fc.post), fc.readAt)
 	}
 }
 
 // captureToolEdit handles Edit, MultiEdit and Write shaped events, including
-// Cursor's afterFileEdit.
-func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any) *editCapture {
+// Cursor's afterFileEdit. firedAt is when the hook fired.
+func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any, firedAt time.Time) *editCapture {
 	input := lineRangeToolInput(payload)
 	if input == nil {
 		return nil
@@ -113,20 +162,27 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 		return &editCapture{files: []fileCapture{fc}}
 	}
 	fc.readPost()
-	fc.snapshot = fc.post
 
-	if hunks, ok := structuredPatch(toolResponse(payload)); ok && (len(hunks) > 0 || toolName == "Write") {
+	resp := toolResponse(payload)
+	if hunks, ok := structuredPatch(resp); ok && (len(hunks) > 0 || toolName == "Write") {
 		switch {
 		case len(hunks) > 0:
-			fc.change = lineranges.ChangeFromHunks(hunks)
-		case createdFile(toolResponse(payload)):
-			fc.change = lineranges.DiffChange("", writtenContent(*input, fc.post))
+			fc.setChange(lineranges.ChangeFromHunks(hunks), 0)
+		case createdFile(resp):
+			fc.setChange(lineranges.DiffChange("", writtenContent(*input, fc.post)), 0)
 		default:
 			// A Write that left the file as it was: an empty patch against
 			// an existing file.
 		}
+		if original, ok := resp["originalFile"].(string); ok {
+			fc.before, fc.hasBefore = hashLines(original), true
+		} else if createdFile(resp) {
+			fc.before, fc.hasBefore = nil, true
+		}
 		if toolName == "Write" && input.Content != "" {
-			fc.snapshot = []byte(input.Content)
+			fc.snapshotOf(input.Content, firedAt)
+		} else {
+			fc.snapshotFromDisk()
 		}
 		return &editCapture{files: []fileCapture{fc}}
 	}
@@ -138,13 +194,19 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 			logx.Debugf("line-range: file gone, skipping (%s)", path)
 			return nil
 		}
-		fc.change = overwriteChange(db, &fc, after)
-		fc.snapshot = []byte(after)
+		fc.change = overwriteChange(db, &fc, after, firedAt)
+		if input.Content != "" {
+			fc.snapshotOf(after, firedAt)
+		} else {
+			fc.snapshotFromDisk()
+		}
 	case "Edit":
-		fc.change, fc.unlocated = lineranges.EditsChange(
-			[]lineranges.Edit{{OldString: input.OldString, NewString: input.NewString}}, string(fc.post))
+		fc.setChange(lineranges.EditsChange(
+			[]lineranges.Edit{{OldString: input.OldString, NewString: input.NewString}}, string(fc.post)))
+		fc.snapshotFromDisk()
 	case "MultiEdit":
-		fc.change, fc.unlocated = lineranges.EditsChange(input.Edits, string(fc.post))
+		fc.setChange(lineranges.EditsChange(input.Edits, string(fc.post)))
+		fc.snapshotFromDisk()
 	default:
 		return nil
 	}
@@ -162,10 +224,10 @@ func captureApplyPatch(files []lineranges.ApplyPatchFile, cwd string, workspaceR
 		fc := newFileCapture(path, "apply_patch")
 		if fc.countable {
 			fc.readPost()
-			fc.snapshot = fc.post
 			// With the file gone every hunk is unlocated: the lines still
 			// count, they just have no position.
-			fc.change, fc.unlocated = lineranges.LocateApplyPatch(file, string(fc.post))
+			fc.setChange(lineranges.LocateApplyPatch(file, string(fc.post)))
+			fc.snapshotFromDisk()
 		}
 		c.files = append(c.files, fc)
 	}
@@ -178,7 +240,7 @@ func captureApplyPatch(files []lineranges.ApplyPatchFile, cwd string, workspaceR
 // captureShellWrites handles shell commands whose written text is in the
 // command itself (heredoc, echo, printf). A write whose content comes from a
 // program is recorded as a touched file by the caller and attributes nothing.
-func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string, workspaceRoots []string) *editCapture {
+func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string, workspaceRoots []string, firedAt time.Time) *editCapture {
 	c := &editCapture{}
 	for _, w := range writes {
 		if !w.Known || w.Content == "" {
@@ -196,27 +258,38 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 			logx.Debugf("line-range: file gone, skipping (%s)", path)
 			continue
 		}
-		fc.snapshot = fc.post
 		located := lineranges.Extract("ShellWrite", lineranges.ToolInput{Content: w.Content}, string(fc.post))
-		switch {
-		case len(located.Ranges) == 0:
-			// The text is not in the file as the command spelled it (a
-			// variable expanded, or the file changed since). Count it and
-			// claim no position.
-			fc.unlocated = 1
-			if w.Append {
-				fc.change = lineranges.Change{Added: lineranges.Lines(w.Content)}
-			} else {
-				fc.change = overwriteChange(db, &fc, w.Content)
-				fc.change.Ranges = nil
+
+		if w.Append {
+			// Appended: every line of it is new, where it now sits. If the
+			// text is no longer in the file it still counts, without a
+			// position.
+			added := lineranges.Change{Ranges: located.Ranges, Added: lineranges.Lines(w.Content)}
+			unlocated := 0
+			if len(located.Ranges) == 0 {
+				unlocated = 1
 			}
-		case !w.Append && located.Ranges[0].StartLine == 1:
-			// The command replaced the file: only what differs from the
-			// file's previous content is new.
-			fc.change = overwriteChange(db, &fc, w.Content)
-		default:
-			// Appended: every line of it is new, where it now sits.
-			fc.change = lineranges.Change{Ranges: located.Ranges, Added: lineranges.Lines(w.Content)}
+			fc.setChange(added, unlocated)
+			fc.snapshotFromDisk()
+			c.files = append(c.files, fc)
+			continue
+		}
+
+		// The command replaced the file with text it spelled out. Like a
+		// Write, the event says what the file became, so that text is the
+		// state it left behind and only what differs from the file's
+		// previous state is new. The snapshot is the command's text, never
+		// the disk: with two rewrites queued, the disk already holds the
+		// second while the first is handled, and saving it would make the
+		// second look like it changed nothing.
+		fc.change = overwriteChange(db, &fc, w.Content, firedAt)
+		fc.snapshotOf(w.Content, firedAt)
+		if len(located.Ranges) == 0 && !mostlyPresent(w.Content, string(fc.post)) {
+			// Hardly any of it is in the file now: the command may not have
+			// run the redirect, or the file has been rewritten since. Count
+			// it and claim no position.
+			fc.change.Ranges = nil
+			fc.unlocated = 1
 		}
 		c.files = append(c.files, fc)
 	}
@@ -226,41 +299,105 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 	return c
 }
 
+// mostlyPresent reports whether at least half the lines of written are still
+// in file, in order. That is the evidence that a whole-file write happened
+// when the file has since been edited and no longer holds the text verbatim.
+func mostlyPresent(written, file string) bool {
+	total := len(lineranges.Lines(written))
+	if total == 0 {
+		return false
+	}
+	gone := len(lineranges.DiffChange(written, file).Removed)
+	return (total-gone)*2 >= total
+}
+
 // overwriteChange is the change a whole-file write made, for tools that do
-// not report the previous content. The baseline is posthook's last copy of
-// the file or the version at HEAD, whichever leaves the smaller change: both
-// are states the file was in before this write, and the nearer one is the
-// better guess at what the tool actually replaced. A stale snapshot (the
+// not report the previous content. The baseline is posthook's last snapshot
+// of the file or the version at HEAD, whichever leaves the smaller change:
+// both are states the file was in before this write, and the nearer one is
+// the better guess at what the tool actually replaced. A stale snapshot (the
 // file was committed and reworked by hand since) loses to HEAD; a file
 // rewritten twice before its first commit has only the snapshot. With
 // neither, the file is new.
-func overwriteChange(db *store.DB, fc *fileCapture, after string) lineranges.Change {
-	var bases []string
-	if snap, ok := db.FileSnapshot(fc.path); ok {
+//
+// A snapshot dated after the event fired is not a "before" at all (see the
+// note at the top of this file) and is skipped.
+//
+// The snapshot is line fingerprints, so the diff runs on fingerprints. The
+// ranges come out the same; the added lines' text is read back from after,
+// and the removed lines stay fingerprints, which is all score needs. It
+// sets fc.removed and fc.before.
+func overwriteChange(db *store.DB, fc *fileCapture, after string, firedAt time.Time) lineranges.Change {
+	afterLines := lineranges.Lines(after)
+	afterTokens := tokens(hashAll(afterLines))
+
+	var bases [][]uint64
+	if snap, asOf, ok := db.FileSnapshot(fc.path); ok && !asOf.After(firedAt) {
 		bases = append(bases, snap)
 	}
 	if fc.root != "" && fc.rel.Valid {
 		if head, err := gitx.Output(fc.root, "show", "HEAD:"+filepath.ToSlash(fc.rel.String)); err == nil {
-			bases = append(bases, string(head))
+			bases = append(bases, hashLines(string(head)))
 		}
 	}
 	if len(bases) == 0 {
-		return lineranges.DiffChange("", after)
+		bases = append(bases, nil) // a new file: everything is added
 	}
-	best := lineranges.DiffChange(bases[0], after)
-	for _, base := range bases[1:] {
-		if c := lineranges.DiffChange(base, after); c.LinesAdded() < best.LinesAdded() {
-			best = c
+
+	var best lineranges.Change
+	var bestBase []uint64
+	for i, base := range bases {
+		if c := lineranges.DiffLineSlices(tokens(base), afterTokens); i == 0 || c.LinesAdded() < best.LinesAdded() {
+			best, bestBase = c, base
 		}
+	}
+
+	fc.removed = fromTokens(best.Removed)
+	fc.before, fc.hasBefore = bestBase, true
+	best.Removed = nil
+	best.Added = best.Added[:0:0]
+	for _, r := range best.Ranges {
+		best.Added = append(best.Added, afterLines[r.StartLine-1:r.EndLine]...)
 	}
 	return best
 }
 
+// copiesBefore counts, per fingerprint, the lines the file held before the
+// edit. Exact when the event carried the previous content or was diffed
+// against a baseline; otherwise worked back from the file as read (what it
+// holds now, less what the edit added, plus what it removed). known is false
+// when the file could not be read either.
+func (fc *fileCapture) copiesBefore() (pre map[uint64]int, known bool) {
+	if fc.hasBefore {
+		return counts(fc.before), true
+	}
+	if !fc.hasPost {
+		return nil, false
+	}
+	pre = counts(hashLines(string(fc.post)))
+	for _, added := range fc.change.Added {
+		pre[store.LineHash(added)]--
+	}
+	for _, h := range fc.removed {
+		pre[h]++
+	}
+	return pre, true
+}
+
 // score totals the lines the event generated and works out how many of the
 // lines it removed were the session's own earlier work, per file.
+//
+// The ledger knows which lines a session wrote, not where they are, so a
+// removed line that reads the same as one of the session's (a blank line, a
+// closing brace) may be somebody else's copy. A removal is counted as rework
+// only when the file's other copies of that line cannot explain it: with k
+// copies removed, of which the file held `before` and the session wrote
+// `own`, rework is what is left of k after the before-own copies that were
+// not the session's. When ownership is ambiguous nothing is subtracted, so
+// generated-minus-reworked never falls below what the session has standing.
 func (c *editCapture) score(db *store.DB, sessionID string) {
 	// One event can write the same file twice (two redirects in one shell
-	// command); carry the remembered lines between them.
+	// command); carry the ledger between them.
 	remembered := map[string][]uint64{}
 	for i := range c.files {
 		fc := &c.files[i]
@@ -275,17 +412,20 @@ func (c *editCapture) score(db *store.DB, sessionID string) {
 		if !seen {
 			lines = db.SessionFileLines(sessionID, fc.path)
 		}
-		if len(fc.change.Removed) > 0 && len(lines) > 0 {
+		if len(fc.removed) > 0 && len(lines) > 0 {
+			own := counts(lines)
+			before, known := fc.copiesBefore()
 			drop := map[uint64]int{}
-			have := map[uint64]int{}
-			for _, h := range lines {
-				have[h]++
-			}
-			for _, removed := range fc.change.Removed {
-				h := store.LineHash(removed)
-				if have[h] > drop[h] {
-					drop[h]++
-					c.reworked++
+			for h, k := range counts(fc.removed) {
+				rework := min(own[h], k)
+				if known {
+					// At least the copies this edit removed were there.
+					others := max(max(before[h], k)-own[h], 0)
+					rework = min(own[h], max(k-others, 0))
+				}
+				if rework > 0 {
+					drop[h] = rework
+					c.reworked += rework
 				}
 			}
 			kept := lines[:0:0]
@@ -323,8 +463,16 @@ func (c *editCapture) store(db *store.DB, eventID, sessionID string) error {
 		if err := insertLineRanges(db, eventID, fc.path, fc.rel, content, fc.tool, out); err != nil {
 			return err
 		}
-		if fc.snapshot != nil {
-			if err := db.SaveFileSnapshot(fc.path, fc.snapshot); err != nil {
+		if fc.hasSnapshot {
+			var err error
+			if fc.snapshotBytes > store.MaxSnapshotBytes {
+				// Too large to keep; forget any older snapshot too, so a
+				// later write is not diffed against a stale one.
+				err = db.DropFileSnapshot(fc.path)
+			} else {
+				err = db.SaveFileSnapshot(fc.path, fc.snapshot, fc.snapshotAsOf)
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -349,6 +497,50 @@ func (c *editCapture) reworkedArg() sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: int64(c.reworked), Valid: true}
+}
+
+// hashLines fingerprints each line of text.
+func hashLines(text string) []uint64 { return hashAll(lineranges.Lines(text)) }
+
+func hashAll(lines []string) []uint64 {
+	if len(lines) == 0 {
+		return nil
+	}
+	out := make([]uint64, len(lines))
+	for i, l := range lines {
+		out[i] = store.LineHash(l)
+	}
+	return out
+}
+
+func counts(hashes []uint64) map[uint64]int {
+	out := make(map[uint64]int, len(hashes))
+	for _, h := range hashes {
+		out[h]++
+	}
+	return out
+}
+
+// tokens spells fingerprints as text so the line diff can compare them.
+func tokens(hashes []uint64) []string {
+	out := make([]string, len(hashes))
+	for i, h := range hashes {
+		out[i] = strconv.FormatUint(h, 16)
+	}
+	return out
+}
+
+func fromTokens(toks []string) []uint64 {
+	if len(toks) == 0 {
+		return nil
+	}
+	out := make([]uint64, 0, len(toks))
+	for _, t := range toks {
+		if h, err := strconv.ParseUint(t, 16, 64); err == nil {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // writtenContent is the file content a Write-shaped event wrote: the content

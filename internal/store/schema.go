@@ -43,8 +43,8 @@ const schemaVersion = 15
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
 // declared in schemaSQL and the v7 migration in applyMigrations.
 //
-// file_snapshots and session_file_lines are deliberately absent: they hold
-// file content and stay on the machine.
+// file_snapshots and session_file_lines are deliberately absent: they are
+// fingerprints of file content and stay on the machine.
 var SyncableTables = []string{
 	"repositories",
 	"sessions",
@@ -216,9 +216,12 @@ CREATE INDEX IF NOT EXISTS idx_session_prompts_session ON session_prompts(sessio
 CREATE INDEX IF NOT EXISTS idx_session_prompts_synced ON session_prompts(synced_at);
 
 -- Local working state for exact edit capture (editstate.go). Never synced.
+-- Both hold 8-byte line fingerprints, no file content. file_snapshots:
+-- updated_at is the instant the snapshot's content was true; a NULL or
+-- empty line_hashes is an empty file.
 CREATE TABLE IF NOT EXISTS file_snapshots (
   file_path TEXT PRIMARY KEY,
-  content BLOB NOT NULL,
+  line_hashes BLOB,
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS session_file_lines (

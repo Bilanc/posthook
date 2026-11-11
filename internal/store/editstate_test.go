@@ -9,34 +9,69 @@ import (
 	"time"
 )
 
-func TestFileSnapshotRoundTripAndSizeLimit(t *testing.T) {
+func TestFileSnapshotRoundTrip(t *testing.T) {
 	db := newTestDB(t)
-	if _, ok := db.FileSnapshot("/repo/a.go"); ok {
+	if _, _, ok := db.FileSnapshot("/repo/a.go"); ok {
 		t.Fatal("snapshot of a file never saved")
 	}
-	content := "package a\n\nfunc a() {}\n"
-	if err := db.SaveFileSnapshot("/repo/a.go", []byte(content)); err != nil {
+	want := []uint64{LineHash("package a"), LineHash(""), LineHash("func a() {}")}
+	at := time.Date(2026, 11, 10, 9, 30, 0, 123456789, time.UTC)
+	if err := db.SaveFileSnapshot("/repo/a.go", want, at); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := db.FileSnapshot("/repo/a.go"); !ok || got != content {
-		t.Fatalf("got %q ok=%v", got, ok)
+	got, asOf, ok := db.FileSnapshot("/repo/a.go")
+	if !ok || !reflect.DeepEqual(got, want) || !asOf.Equal(at) {
+		t.Fatalf("got %v as of %v ok=%v", got, asOf, ok)
 	}
 	// Saving again replaces, it does not add a row.
-	if err := db.SaveFileSnapshot("/repo/a.go", []byte("package b\n")); err != nil {
+	later := at.Add(time.Minute)
+	if err := db.SaveFileSnapshot("/repo/a.go", want[:1], later); err != nil {
 		t.Fatal(err)
 	}
 	var rows int
 	mustQueryRow(t, db, `SELECT COUNT(*) FROM file_snapshots`, nil, &rows)
-	if got, _ := db.FileSnapshot("/repo/a.go"); rows != 1 || got != "package b\n" {
-		t.Fatalf("rows=%d content=%q", rows, got)
+	if got, asOf, _ := db.FileSnapshot("/repo/a.go"); rows != 1 || len(got) != 1 || !asOf.Equal(later) {
+		t.Fatalf("rows=%d hashes=%v asOf=%v", rows, got, asOf)
 	}
-	// A file over the limit is not kept, and its older snapshot goes too,
-	// so the next write is not diffed against a stale copy.
-	if err := db.SaveFileSnapshot("/repo/a.go", []byte(strings.Repeat("x", maxSnapshotBytes+1))); err != nil {
+	// An empty file is a snapshot too, not the absence of one.
+	if err := db.SaveFileSnapshot("/repo/empty.txt", nil, at); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := db.FileSnapshot("/repo/a.go"); ok {
-		t.Fatal("oversized file left a snapshot behind")
+	if got, _, ok := db.FileSnapshot("/repo/empty.txt"); !ok || len(got) != 0 {
+		t.Fatalf("empty file: hashes=%v ok=%v", got, ok)
+	}
+	if err := db.DropFileSnapshot("/repo/a.go"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := db.FileSnapshot("/repo/a.go"); ok {
+		t.Fatal("dropped snapshot is still there")
+	}
+}
+
+func TestFileSnapshotHoldsNoFileContent(t *testing.T) {
+	// The table keeps a fingerprint per line and nothing else: a secret that
+	// sits in an edited file must not be readable from the database.
+	db := newTestDB(t)
+	secret := "API_TOKEN=sk-live-0123456789abcdef"
+	lines := []string{"# config", secret, "debug = false"}
+	hashes := make([]uint64, len(lines))
+	for i, l := range lines {
+		hashes[i] = LineHash(l)
+	}
+	if err := db.SaveFileSnapshot("/repo/config.ini", hashes, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	var blob []byte
+	mustQueryRow(t, db, `SELECT line_hashes FROM file_snapshots WHERE file_path = '/repo/config.ini'`, nil, &blob)
+	if len(blob) != 8*len(lines) {
+		t.Fatalf("stored %d bytes for %d lines, want 8 per line", len(blob), len(lines))
+	}
+	if strings.Contains(string(blob), "sk-live") || strings.Contains(string(blob), "API_TOKEN") {
+		t.Fatal("snapshot holds file text")
+	}
+	cols, err := db.columnSet("file_snapshots")
+	if err != nil || cols["content"] {
+		t.Fatalf("file_snapshots must not have a content column (cols=%v err=%v)", cols, err)
 	}
 }
 
@@ -90,10 +125,10 @@ func TestLineHashIgnoresTrailingCR(t *testing.T) {
 func TestPruneEditStateIfDueDropsOnlyStaleRows(t *testing.T) {
 	db := newTestDB(t)
 	old := time.Now().UTC().Add(-editStateMaxAge - time.Hour).Format(time.RFC3339)
-	if err := db.SaveFileSnapshot("/repo/fresh.go", []byte("x\n")); err != nil {
+	if err := db.SaveFileSnapshot("/repo/fresh.go", []uint64{1}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SaveFileSnapshot("/repo/stale.go", []byte("x\n")); err != nil {
+	if err := db.SaveFileSnapshot("/repo/stale.go", []uint64{1}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SaveSessionFileLines("s-fresh", "/repo/fresh.go", []uint64{1}); err != nil {
@@ -109,7 +144,7 @@ func TestPruneEditStateIfDueDropsOnlyStaleRows(t *testing.T) {
 	if err != nil || !ran || removed != 2 {
 		t.Fatalf("removed=%d ran=%v err=%v, want 2 rows on the first pass", removed, ran, err)
 	}
-	if _, ok := db.FileSnapshot("/repo/fresh.go"); !ok {
+	if _, _, ok := db.FileSnapshot("/repo/fresh.go"); !ok {
 		t.Error("fresh snapshot pruned")
 	}
 	if len(db.SessionFileLines("s-fresh", "/repo/fresh.go")) != 1 {

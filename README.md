@@ -100,11 +100,11 @@ This is what powers the "AI lines committed" and "AI code %" figures in `posthoo
 
 - Claude Code reports each edit as a patch against the file it read, and posthook uses that patch as is.
 - An old/new string pair from any other agent is diffed line by line, so the unchanged lines the agent repeated around its change are not counted.
-- A tool that hands over a whole file (a `Write`, a shell heredoc) is diffed against posthook's last copy of that file, or the version at `HEAD`. Rewriting a 300-line file to change four lines counts four.
+- A tool that hands over a whole file (a `Write`, a shell heredoc) is diffed against posthook's last snapshot of that file, or the version at `HEAD`. Rewriting a 300-line file to change four lines counts four. The snapshot is a fingerprint per line, not the file's content.
 - `apply_patch` hunks are placed by their context lines, so a one-line hunk lands where the patch put it, not on the first line of the file with the same text.
 - A file outside any git repository, or one git ignores, counts for nothing: it can never reach a commit.
 
-The count is stored on the event (`events.lines_generated`), along with how many of the lines that edit removed were the same session's earlier work (`events.lines_reworked`). "Lines generated" everywhere is the first minus the second, so a session's total is the lines it has standing, not the churn it took to get there. Events recorded before this was measured keep the older estimate.
+The count is stored on the event (`events.lines_generated`), along with how many of the lines that edit removed were the same session's earlier work (`events.lines_reworked`). A removed line counts as rework only when it cannot have been someone else's: deleting a blank line the file had before the session wrote one of its own subtracts nothing. "Lines generated" everywhere is the first minus the second, so a session's total is the lines it has standing, not the churn it took to get there. Events recorded before this was measured keep the older estimate.
 
 ### How the git shadow works
 
@@ -144,7 +144,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 
 | Path | What |
 |---|---|
-| `~/.posthook/posthook.db` | SQLite — all your data (`repositories`, `sessions`, `events`, `event_line_ranges`, `commits`, `commit_files`, `commit_sessions`, `commit_session_files`), plus two working tables that never leave the machine: `file_snapshots` (the last copy of each file an agent edited, to diff the next whole-file write against) and `session_file_lines` (hashes of the lines each session wrote, to recognise rework). Rows in both are dropped after 30 days without a touch. |
+| `~/.posthook/posthook.db` | SQLite — all your data (`repositories`, `sessions`, `events`, `event_line_ranges`, `commits`, `commit_files`, `commit_sessions`, `commit_session_files`), plus two working tables that never leave the machine: `file_snapshots` (each file an agent edited as it was left, to diff the next whole-file write against) and `session_file_lines` (the lines each session wrote, to recognise rework). Both hold an 8-byte fingerprint per line and no file content. Rows in both are dropped after 30 days without a touch. |
 | `~/.posthook/config.json` | Cloud-sync settings (endpoint, install token, enabled flag, flush interval, sync mode), the engineer identity (work email + name) and the storage retention window (`storage.retention_days`). Absent until you configure one of them. |
 | `~/.posthook/git-path` | Absolute path to the real git binary. Written at install time, read on every shadow invocation. |
 | `~/.posthook/dash/` | Staged dashboard build, spawned by `posthook dash`. |

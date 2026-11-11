@@ -430,3 +430,8 @@ func sameLine(a, b string) bool {
 // Lines splits text into lines the way the diff counts them: a trailing
 // newline ends the last line and does not start an empty one.
 func Lines(text string) []string { return splitLines(text) }
+
+// DiffLineSlices is DiffChange for content already split into lines. The
+// lines need not be text: a caller that only has a fingerprint per line can
+// diff the fingerprints and read the ranges off the result.
+func DiffLineSlices(before, after []string) Change { return diffLines(before, after, 1) }

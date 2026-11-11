@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -9,9 +10,27 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 )
+
+// deliverAt ingests a payload whose hook fired at firedAt. The worker handles
+// events after the fact, so a test that needs two events to have queued
+// (both fired before either is handled) dates them in the past.
+func deliverAt(t *testing.T, agent, cwd string, payload map[string]any, firedAt time.Time) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ProcessAgentEnvelope(spool.Envelope{
+		Agent: agent, Cwd: cwd, ReceivedAt: firedAt.UTC().Format(time.RFC3339Nano), Payload: raw,
+	}); err != nil {
+		t.Fatalf("ProcessAgentEnvelope: %v", err)
+	}
+}
 
 // End-to-end checks of exact edit capture: a hook payload goes through
 // ProcessAgentEnvelope against a real git repository, and the test reads back
@@ -132,6 +151,11 @@ func TestExactCapture(t *testing.T) {
 	t.Run("claude edit counts the patch, not the repeated context", func(t *testing.T) { testClaudeEditPatch(t, home) })
 	t.Run("claude write: new file whole, rewrite only what changed", func(t *testing.T) { testClaudeWrite(t, home) })
 	t.Run("rework is the session's own removed lines", func(t *testing.T) { testRework(t, home) })
+	t.Run("rework: removing someone else's copy of a line is not rework", func(t *testing.T) { testReworkLeavesSomeoneElsesCopyAlone(t, home) })
+	t.Run("rework without the previous content in the payload", func(t *testing.T) { testReworkWithoutPreviousContent(t, home) })
+	t.Run("queued shell rewrites each keep their own lines", func(t *testing.T) { testQueuedShellRewrites(t, home) })
+	t.Run("queued edit then write: the write is not diffed against a later disk", func(t *testing.T) { testQueuedEditThenWrite(t, home) })
+	t.Run("a file too large to snapshot keeps none", func(t *testing.T) { testOversizeFileKeepsNoSnapshot(t, home) })
 	t.Run("write without a patch diffs against HEAD, then the last copy", func(t *testing.T) { testWriteWithoutPatch(t, home) })
 	t.Run("files outside a repo or ignored count for nothing", func(t *testing.T) { testUncountableFiles(t, home) })
 	t.Run("shell heredoc rewrite counts only the changed line", func(t *testing.T) { testShellRewrite(t, home) })
@@ -293,34 +317,172 @@ func testRework(t *testing.T, home string) {
 	path := filepath.Join(repo, "svc.py")
 	human := "import os\n"
 	v1 := human + "def a():\n    return 1\n\ndef b():\n    return 2\n"
+	v2 := strings.Replace(v1, "def a():\n    return 1\n", "def a(n):\n    return n\n", 1)
+	v3 := strings.Replace(v2, "import os\n", "import sys\n", 1)
+	v4 := strings.Replace(v3, "def b():\n    return 2\n", "def b(): return 2\n", 1)
 	writeFile(t, path, human)
 	gitIn(t, repo, "add", ".")
 	gitIn(t, repo, "commit", "-q", "-m", "human start")
 
+	// edit applies one Claude Code Edit: the file on disk becomes after, and
+	// the payload carries the file as the tool read it.
+	edit := func(session, before, after string, hunks ...map[string]any) {
+		writeFile(t, path, after)
+		deliver(t, "claude-code", repo, claudeEdit(session, "Edit", path,
+			map[string]any{"old_string": "x", "new_string": "y"}, hunks,
+			map[string]any{"originalFile": before}))
+	}
+
 	// The session appends five lines to a file a human started.
-	writeFile(t, path, v1)
-	deliver(t, "claude-code", repo, claudeEdit("rework-1", "Edit", path,
-		map[string]any{"old_string": human, "new_string": v1},
-		[]map[string]any{hunk(1, " import os", "+def a():", "+    return 1", "+", "+def b():", "+    return 2")}, nil))
-
+	edit("rework-1", human, v1, hunk(1, " import os", "+def a():", "+    return 1", "+", "+def b():", "+    return 2"))
 	// It then rewrites two of its own lines: two generated, two reworked.
-	deliver(t, "claude-code", repo, claudeEdit("rework-1", "Edit", path,
-		map[string]any{"old_string": "x", "new_string": "y"},
-		[]map[string]any{hunk(2, "-def a():", "-    return 1", "+def a(n):", "+    return n")}, nil))
-
+	edit("rework-1", v1, v2, hunk(2, "-def a():", "-    return 1", "+def a(n):", "+    return n"))
 	// And changes the human's line: one generated, nothing reworked.
-	deliver(t, "claude-code", repo, claudeEdit("rework-1", "Edit", path,
-		map[string]any{"old_string": "x", "new_string": "y"},
-		[]map[string]any{hunk(1, "-import os", "+import sys")}, nil))
-
+	edit("rework-1", v2, v3, hunk(1, "-import os", "+import sys"))
 	// Another session removing the first session's lines is not rework.
-	deliver(t, "claude-code", repo, claudeEdit("rework-2", "Edit", path,
-		map[string]any{"old_string": "x", "new_string": "y"},
-		[]map[string]any{hunk(5, "-def b():", "-    return 2", "+def b(): return 2")}, nil))
+	edit("rework-2", v3, v4, hunk(5, "-def b():", "-    return 2", "+def b(): return 2"))
 
 	db := openDB(t)
 	wantCounts(t, db, "rework-1", [2]int64{5, 0}, [2]int64{2, 2}, [2]int64{1, 0})
 	wantCounts(t, db, "rework-2", [2]int64{1, 0})
+}
+
+func testReworkLeavesSomeoneElsesCopyAlone(t *testing.T, home string) {
+	repo := filepath.Join(home, "repo-duplicate")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "notes.txt")
+	// A human file with a blank line at line 2.
+	v0 := "a\n\nb\nc\nd\ne\nf\ng\nh\n"
+	writeFile(t, path, v0)
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-q", "-m", "human")
+
+	edit := func(before, after string, hunks ...map[string]any) {
+		writeFile(t, path, after)
+		deliver(t, "claude-code", repo, claudeEdit("dup-1", "Edit", path,
+			map[string]any{"old_string": "x", "new_string": "y"}, hunks,
+			map[string]any{"originalFile": before}))
+	}
+
+	// The session adds a blank line of its own at line 10, and a line after.
+	v1 := v0 + "\ntail\n"
+	edit(v0, v1, hunk(9, " h", "+", "+tail"))
+	// It deletes the human's blank line at line 2. Its own blank line is
+	// still in the file, so nothing of its work was removed: the ledger
+	// cannot tell the two blank lines apart, and must not guess.
+	v2 := strings.Replace(v1, "a\n\nb", "a\nb", 1)
+	edit(v1, v2, hunk(1, " a", "-", " b"))
+	// Now it deletes its own blank line, the only one left. That is rework.
+	v3 := strings.Replace(v2, "h\n\ntail", "h\ntail", 1)
+	edit(v2, v3, hunk(8, " h", "-", " tail"))
+
+	db := openDB(t)
+	wantCounts(t, db, "dup-1", [2]int64{2, 0}, [2]int64{0, 0}, [2]int64{0, 1})
+}
+
+func testReworkWithoutPreviousContent(t *testing.T, home string) {
+	// An agent whose payload carries neither a patch nor the file it read:
+	// what the file held before an Edit is worked back from the file now.
+	repo := filepath.Join(home, "repo-rework-plain")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "vars.py")
+	devin := func(tool string, input map[string]any, after string) {
+		writeFile(t, path, after)
+		input["file_path"] = path
+		deliver(t, "devin", repo, map[string]any{
+			"hook_event_name": "PostToolUse", "session_id": "plain-1", "cwd": repo,
+			"tool_name": tool, "tool_input": input,
+		})
+	}
+	devin("write", map[string]any{"content": "x = 1\ny = 2\n"}, "x = 1\ny = 2\n")
+	devin("edit", map[string]any{"old_string": "y = 2", "new_string": "y = 3"}, "x = 1\ny = 3\n")
+
+	db := openDB(t)
+	wantCounts(t, db, "plain-1", [2]int64{2, 0}, [2]int64{1, 1})
+}
+
+func testQueuedShellRewrites(t *testing.T, home string) {
+	// Two heredocs write "one" then "two" to an untracked file, and both
+	// hooks fire before the worker handles either: the disk already holds
+	// "two" while the first is ingested.
+	repo := filepath.Join(home, "repo-queued-shell")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "state.txt")
+	writeFile(t, path, "two\n")
+	fired := time.Now().Add(-2 * time.Second)
+	bash := func(content string, at time.Time) {
+		deliverAt(t, "claude-code", repo, map[string]any{
+			"hook_event_name": "PostToolUse", "session_id": "queued-1", "cwd": repo,
+			"tool_name": "Bash", "tool_input": map[string]any{"command": "cat > " + path + " <<'EOF'\n" + content + "EOF"},
+		}, at)
+	}
+	bash("one\n", fired)
+	bash("two\n", fired.Add(time.Second))
+
+	db := openDB(t)
+	// The first wrote one line that is gone again: counted, no position.
+	// The second replaced it: one line written, the session's own line
+	// reworked. Saving the disk as the first event's snapshot made the
+	// second score zero.
+	wantCounts(t, db, "queued-1", [2]int64{1, 0}, [2]int64{1, 1})
+	wantRanges(t, db, "queued-1", rangeRow{1, 1})
+}
+
+func testQueuedEditThenWrite(t *testing.T, home string) {
+	// An Edit and then a whole-file Write from an agent that reports no
+	// patch, both fired before either is handled. The snapshot the Edit
+	// leaves is read from a disk that already holds the Write.
+	repo := filepath.Join(home, "repo-queued-write")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "cfg.ini")
+	committed := numbered(5, "k%d = old")
+	writeFile(t, path, committed)
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+
+	edited := strings.Replace(committed, "k2 = old", "k2 = new", 1)
+	written := edited + "k6 = new\nk7 = new\n"
+	writeFile(t, path, written)
+	fired := time.Now().Add(-2 * time.Second)
+	deliverAt(t, "devin", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "queued-2", "cwd": repo,
+		"tool_name": "edit", "tool_input": map[string]any{"file_path": path, "old_string": "k2 = old", "new_string": "k2 = new"},
+	}, fired)
+	deliverAt(t, "devin", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "queued-2", "cwd": repo,
+		"tool_name": "write", "tool_input": map[string]any{"file_path": path, "content": written},
+	}, fired.Add(time.Second))
+
+	db := openDB(t)
+	// The Write must not be diffed against that snapshot (it would score
+	// zero). It falls back to HEAD, so its two new lines count, and so does
+	// line 2 a second time: over, never under, and only in this race.
+	wantCounts(t, db, "queued-2", [2]int64{1, 0}, [2]int64{3, 0})
+	wantRanges(t, db, "queued-2", rangeRow{2, 2}, rangeRow{2, 2}, rangeRow{6, 7})
+}
+
+func testOversizeFileKeepsNoSnapshot(t *testing.T, home string) {
+	repo := filepath.Join(home, "repo-big")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "big.txt")
+	content := numbered(40000, "line %d of a file that is larger than a snapshot is kept for")
+	if len(content) <= store.MaxSnapshotBytes {
+		t.Fatalf("test file is only %d bytes", len(content))
+	}
+	writeFile(t, path, content)
+	deliver(t, "devin", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "big-1", "cwd": repo,
+		"tool_name": "write", "tool_input": map[string]any{"file_path": path, "content": content},
+	})
+	db := openDB(t)
+	wantCounts(t, db, "big-1", [2]int64{40000, 0})
+	var rows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM file_snapshots WHERE file_path LIKE '%big.txt'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Errorf("kept a snapshot of a %d-byte file", len(content))
+	}
 }
 
 func testWriteWithoutPatch(t *testing.T, home string) {

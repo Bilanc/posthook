@@ -1,8 +1,6 @@
 package store
 
 import (
-	"bytes"
-	"compress/gzip"
 	"encoding/binary"
 	"hash/fnv"
 	"io"
@@ -15,23 +13,26 @@ import (
 // Two things have to be remembered between agent events to say exactly what
 // an edit changed, and neither is in a hook payload:
 //
-//   - file_snapshots: the content of each file as the last agent edit left
-//     it. A tool that overwrites a whole file reports only the new content;
-//     diffing it against the snapshot is what turns "the file is 300 lines"
-//     into "this write changed 4".
+//   - file_snapshots: each file as the last agent edit left it, as one
+//     fingerprint per line. A tool that overwrites a whole file reports only
+//     the new content; diffing it against the snapshot is what turns "the
+//     file is 300 lines" into "this write changed 4".
 //   - session_file_lines: for each session and file, the lines that session
 //     has written and not since removed. When a later edit of the same
 //     session removes one of them, that line is rework, not new output.
 //
-// Both tables hold file content (snapshots verbatim, lines as hashes), so
+// Neither table holds file content. Both hold LineHash fingerprints, which
+// is all a line diff and a rework match need: the text of an added line is
+// always in the event being handled, and a removed line only has to be
+// recognised, never read. They are still derived from file content, so
 // neither is in SyncableTables and nothing here ever leaves the machine.
 // Rows are dropped once they have not been touched for editStateMaxAge:
 // after that long the file has moved on and the snapshot is no better a
 // baseline than HEAD.
 
-// maxSnapshotBytes is the largest file a snapshot is kept for. A larger file
+// MaxSnapshotBytes is the largest file a snapshot is kept for. A larger file
 // is diffed against HEAD instead.
-const maxSnapshotBytes = 1 << 20
+const MaxSnapshotBytes = 1 << 20
 
 // maxSessionFileLines bounds how many written lines are remembered for one
 // session and file. Past it the oldest are forgotten.
@@ -42,45 +43,57 @@ const editStateMaxAge = 30 * 24 * time.Hour
 // lastEditStatePruneKey is the maintenance row gating PruneEditStateIfDue.
 const lastEditStatePruneKey = "edit_state_last_prune_at"
 
-// FileSnapshot returns the content of path as the last agent edit left it.
-func (db *DB) FileSnapshot(path string) (string, bool) {
+// FileSnapshot returns path as the last agent edit left it, one fingerprint
+// per line, and the instant that content was true: when the event that
+// wrote it fired, if the content came from the event itself, or when the
+// file was read from disk otherwise. A caller that needs the state before
+// some event must not use a snapshot dated after that event fired; the read
+// may already have seen the event's own write.
+func (db *DB) FileSnapshot(path string) (hashes []uint64, asOf time.Time, ok bool) {
 	var blob []byte
-	if err := db.QueryRow(`SELECT content FROM file_snapshots WHERE file_path = ?`, path).Scan(&blob); err != nil {
-		return "", false
+	var at string
+	if err := db.QueryRow(`SELECT line_hashes, updated_at FROM file_snapshots WHERE file_path = ?`, path).Scan(&blob, &at); err != nil {
+		return nil, time.Time{}, false
 	}
-	zr, err := gzip.NewReader(bytes.NewReader(blob))
-	if err != nil {
-		return "", false
-	}
-	defer zr.Close()
-	content, err := io.ReadAll(io.LimitReader(zr, maxSnapshotBytes+1))
-	if err != nil || len(content) > maxSnapshotBytes {
-		return "", false
-	}
-	return string(content), true
+	// An unparseable instant reads as the zero time, which is before every
+	// event: the snapshot is then always usable, as it was before instants
+	// were recorded.
+	asOf, _ = time.Parse(time.RFC3339Nano, at)
+	return decodeHashes(blob), asOf, true
 }
 
-// SaveFileSnapshot records content as the state an agent edit left path in.
-// A file over maxSnapshotBytes is not kept, and any older snapshot of it is
-// dropped so a later write is not diffed against a stale copy.
-func (db *DB) SaveFileSnapshot(path string, content []byte) error {
-	if len(content) > maxSnapshotBytes {
-		_, err := db.Exec(`DELETE FROM file_snapshots WHERE file_path = ?`, path)
-		return err
-	}
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	if _, err := zw.Write(content); err != nil {
-		return err
-	}
-	if err := zw.Close(); err != nil {
-		return err
-	}
+// SaveFileSnapshot records hashes as the state of path at asOf. An empty
+// list is a valid snapshot of an empty file.
+func (db *DB) SaveFileSnapshot(path string, hashes []uint64, asOf time.Time) error {
 	_, err := db.Exec(`
-		INSERT INTO file_snapshots (file_path, content, updated_at) VALUES (?, ?, ?)
-		ON CONFLICT(file_path) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at`,
-		path, buf.Bytes(), time.Now().UTC().Format(time.RFC3339))
+		INSERT INTO file_snapshots (file_path, line_hashes, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(file_path) DO UPDATE SET line_hashes = excluded.line_hashes, updated_at = excluded.updated_at`,
+		path, encodeHashes(hashes), asOf.UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+// DropFileSnapshot forgets the snapshot of path. Used when the file has
+// grown past MaxSnapshotBytes, so a later write is not diffed against a
+// stale copy.
+func (db *DB) DropFileSnapshot(path string) error {
+	_, err := db.Exec(`DELETE FROM file_snapshots WHERE file_path = ?`, path)
+	return err
+}
+
+func encodeHashes(hashes []uint64) []byte {
+	blob := make([]byte, 8*len(hashes))
+	for i, h := range hashes {
+		binary.BigEndian.PutUint64(blob[8*i:], h)
+	}
+	return blob
+}
+
+func decodeHashes(blob []byte) []uint64 {
+	out := make([]uint64, 0, len(blob)/8)
+	for i := 0; i+8 <= len(blob); i += 8 {
+		out = append(out, binary.BigEndian.Uint64(blob[i:]))
+	}
+	return out
 }
 
 // LineHash identifies a line of text for rework matching. A trailing CR is
@@ -99,11 +112,7 @@ func (db *DB) SessionFileLines(sessionID, path string) []uint64 {
 		sessionID, path).Scan(&blob); err != nil {
 		return nil
 	}
-	out := make([]uint64, 0, len(blob)/8)
-	for i := 0; i+8 <= len(blob); i += 8 {
-		out = append(out, binary.BigEndian.Uint64(blob[i:]))
-	}
-	return out
+	return decodeHashes(blob)
 }
 
 // SaveSessionFileLines replaces the remembered lines for sessionID and path.
@@ -115,14 +124,10 @@ func (db *DB) SaveSessionFileLines(sessionID, path string, hashes []uint64) erro
 	if len(hashes) > maxSessionFileLines {
 		hashes = hashes[len(hashes)-maxSessionFileLines:]
 	}
-	blob := make([]byte, 8*len(hashes))
-	for i, h := range hashes {
-		binary.BigEndian.PutUint64(blob[8*i:], h)
-	}
 	_, err := db.Exec(`
 		INSERT INTO session_file_lines (session_id, file_path, line_hashes, updated_at) VALUES (?, ?, ?, ?)
 		ON CONFLICT(session_id, file_path) DO UPDATE SET line_hashes = excluded.line_hashes, updated_at = excluded.updated_at`,
-		sessionID, path, blob, time.Now().UTC().Format(time.RFC3339))
+		sessionID, path, encodeHashes(hashes), time.Now().UTC().Format(time.RFC3339))
 	return err
 }
 

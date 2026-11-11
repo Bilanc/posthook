@@ -364,3 +364,18 @@ func TestParseApplyPatchKeepsLegacyEditsAndCounts(t *testing.T) {
 		t.Fatalf("hunks: got %#v\nwant %#v", f.Hunks, want)
 	}
 }
+
+func TestDiffLineSlicesMatchesDiffChange(t *testing.T) {
+	// The same diff on lines already split, which is how a caller that holds
+	// only a fingerprint per line uses it.
+	before := []string{"a", "b", "c"}
+	after := []string{"a", "B", "c", "d"}
+	got := DiffLineSlices(before, after)
+	want := DiffChange("a\nb\nc\n", "a\nB\nc\nd\n")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v\nwant %#v", got, want)
+	}
+	if len(before) != 3 || before[1] != "b" || after[3] != "d" {
+		t.Fatal("the inputs were modified")
+	}
+}
