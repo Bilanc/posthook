@@ -33,6 +33,9 @@ const dbPath = installFixture();
 // Session N: the shell command of session L as a build without the split
 // recorded it: the row names a.go, the one range is in b.go.
 //
+// Session T: writes README.md in two repositories, first with one Write
+// each, then with one patch that touches both.
+//
 // An event whose counts are not all its own row's file carries the split in
 // events.file_lines.
 {
@@ -139,6 +142,26 @@ const dbPath = installFixture();
       { rel_file_path: "a.go", file_path: "/tmp/demo/a.go", lines_generated: 1, lines_reworked: 0 },
       { rel_file_path: "b.go", file_path: "/tmp/demo/b.go", lines_generated: 5, lines_reworked: 30 },
     ])}' WHERE id IN ('r2', 's3');
+
+    INSERT INTO repositories (id, name, root_path) VALUES ('r2', 'other', '/tmp/other');
+    INSERT INTO sessions (id, agent_slug, model_slug, repo_id, branch, started_at, ended_at)
+    VALUES ('T', 'codex', 'gpt-6', 'r1', 'main', '2026-10-25T10:00:00Z', '2026-10-25T10:10:00Z');
+    INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, file_path, lines_added, lines_generated, lines_reworked, payload) VALUES
+      ('t1', 'T', '2026-10-25T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'README.md', '/tmp/demo/README.md', NULL, 3, 0,
+        '${post("Write", { content: "x" })}'),
+      ('t2', 'T', '2026-10-25T10:00:20Z', 'PostToolUse', 'codex', 'r2', 'README.md', '/tmp/other/README.md', NULL, 2, 0,
+        '${post("Write", { content: "x" })}'),
+      ('t3', 'T', '2026-10-25T10:00:30Z', 'PostToolUse', 'codex', 'r1', 'README.md', '/tmp/demo/README.md', 5, 5, 0,
+        '${post("apply_patch", { command: "*** Begin Patch" })}');
+    INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, start_line, end_line, new_text_lines) VALUES
+      ('r-t1', 't1', '/tmp/demo/README.md', 'README.md', 1, 3, 3),
+      ('r-t2', 't2', '/tmp/other/README.md', 'README.md', 1, 2, 2),
+      ('r-t3a', 't3', '/tmp/demo/README.md', 'README.md', 4, 4, 1),
+      ('r-t3b', 't3', '/tmp/other/README.md', 'README.md', 3, 6, 4);
+    UPDATE events SET file_lines = '${J([
+      { repo_id: "r1", rel_file_path: "README.md", file_path: "/tmp/demo/README.md", lines_generated: 1, lines_reworked: 0 },
+      { repo_id: "r2", rel_file_path: "README.md", file_path: "/tmp/other/README.md", lines_generated: 4, lines_reworked: 0 },
+    ])}' WHERE id = 't3';
   `);
   w.close();
 }
@@ -247,6 +270,22 @@ test("a measured edit without a split follows its ranges", () => {
   assert.deepEqual(single, [["b.go", 1, 1]]);
 });
 
+test("the same path in two repositories is two files", () => {
+  const files = sessionTimelineData("T").files.map((r) => [r.repo_name, r.file, r.edits, r.lines_generated]);
+  // Each README has a Write of its own and a share of the patch: 3 + 1 and
+  // 2 + 4. Keyed by path alone they were one row of 10.
+  assert.deepEqual(files, [
+    ["other", "README.md", 2, 6],
+    ["demo", "README.md", 2, 4],
+  ]);
+  assert.equal(getSessionDetail("T")?.lines_generated, 10);
+});
+
+test("a single-repository session carries its one repository on every row", () => {
+  const repos = new Set(sessionTimelineData("F").files.map((r) => r.repo_name));
+  assert.deepEqual([...repos], ["demo"]);
+});
+
 test("an older client's multi-file patch is still split by its ranges", () => {
   const files = Object.fromEntries(
     sessionTimelineData("K").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
@@ -255,7 +294,7 @@ test("an older client's multi-file patch is still split by its ranges", () => {
 });
 
 test("the files of a session add up to its total", () => {
-  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S"]) {
+  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S", "T"]) {
     const sum = sessionTimelineData(id).files.reduce((n, r) => n + r.lines_generated, 0);
     assert.equal(sum, getSessionDetail(id)?.lines_generated, `session ${id}`);
   }

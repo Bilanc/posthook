@@ -50,14 +50,31 @@ export function fileRows(
   commitFiles: CommitFile[],
   commits: SessionCommit[],
 ): FileSummary {
+  // A file is a path in a repository: one session can write README.md in two
+  // repositories, and those are two files. The repository name is shown in
+  // front of the path only when the session's files span more than one, so a
+  // single-repository session reads exactly as it always has.
+  const repos = new Set<string>();
+  for (const f of files) if (f.repo_id) repos.add(f.repo_id);
+  for (const c of commitFiles) if (c.repo_id) repos.add(c.repo_id);
+  const label = (path: string, repoId?: string | null, repoName?: string | null) =>
+    repos.size > 1 && repoId ? `${repoName || repoId}/${path}` : path;
+  const key = (path: string, repoId?: string | null) => `${repoId ?? ""}\u0000${path}`;
+
   const by = new Map<string, FileRow>();
   for (const f of files) {
-    by.set(f.file, { path: f.file, generated: f.lines_generated, committed: 0, edits: f.edits });
+    by.set(key(f.file, f.repo_id), {
+      path: label(f.file, f.repo_id, f.repo_name),
+      generated: f.lines_generated,
+      committed: 0,
+      edits: f.edits,
+    });
   }
   for (const c of commitFiles) {
-    const row = by.get(c.file_path) ?? { path: c.file_path, generated: 0, committed: 0, edits: 0 };
+    const k = key(c.file_path, c.repo_id);
+    const row = by.get(k) ?? { path: label(c.file_path, c.repo_id, c.repo_name), generated: 0, committed: 0, edits: 0 };
     row.committed += c.lines_attributed;
-    by.set(c.file_path, row);
+    by.set(k, row);
   }
   for (const r of by.values()) if (r.committed > r.generated) r.generated = r.committed;
   const rows = [...by.values()].sort(
