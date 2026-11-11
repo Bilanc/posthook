@@ -50,8 +50,17 @@ type Extracted struct {
 type ApplyPatchFile struct {
 	FilePath     string
 	Edits        []Edit
+	Hunks        []ApplyPatchHunk
 	LinesAdded   int
 	LinesRemoved int
+}
+
+// ApplyPatchHunk is one hunk of a patched file as the patch wrote it: each
+// line keeps its marker (' ' context, '+' added, '-' removed). An empty
+// string is an empty context line whose marker the agent dropped.
+// LocateApplyPatch uses the context to find where the added lines landed.
+type ApplyPatchHunk struct {
+	Lines []string
 }
 
 // linesIn counts how many lines `text` occupies. A trailing newline doesn't
@@ -241,12 +250,14 @@ func normalizeNewlines(s string) string {
 }
 
 // ParseApplyPatch parses Codex CLI's apply_patch command text into a slice of
-// per-file edits. We extract only added blocks (lines prefixed with `+`) since
-// only insertions produce blame-relevant ranges.
+// per-file edits. Edits holds only the added blocks (lines prefixed with `+`),
+// since only insertions produce blame-relevant ranges; Hunks keeps every hunk
+// whole, context and removed lines included, for LocateApplyPatch.
 func ParseApplyPatch(command string) []ApplyPatchFile {
 	var files []ApplyPatchFile
 	var current *ApplyPatchFile
 	var addedBlock []string
+	var hunk []string
 
 	flush := func() {
 		if current == nil || len(addedBlock) == 0 {
@@ -258,22 +269,36 @@ func ParseApplyPatch(command string) []ApplyPatchFile {
 		}
 		addedBlock = nil
 	}
+	closeHunk := func() {
+		// Blank lines after the last marked line are the patch text's own
+		// trailing newlines, not context.
+		for len(hunk) > 0 && hunk[len(hunk)-1] == "" {
+			hunk = hunk[:len(hunk)-1]
+		}
+		if current != nil && len(hunk) > 0 {
+			current.Hunks = append(current.Hunks, ApplyPatchHunk{Lines: hunk})
+		}
+		hunk = nil
+	}
 
 	normalized := strings.ReplaceAll(command, "\r\n", "\n")
 	for _, line := range strings.Split(normalized, "\n") {
 		switch {
 		case strings.HasPrefix(line, "*** Add File: "):
 			flush()
+			closeHunk()
 			path := strings.TrimPrefix(line, "*** Add File: ")
 			files = append(files, ApplyPatchFile{FilePath: path})
 			current = &files[len(files)-1]
 		case strings.HasPrefix(line, "*** Update File: "):
 			flush()
+			closeHunk()
 			path := strings.TrimPrefix(line, "*** Update File: ")
 			files = append(files, ApplyPatchFile{FilePath: path})
 			current = &files[len(files)-1]
 		case strings.HasPrefix(line, "*** Delete File: "):
 			flush()
+			closeHunk()
 			current = nil
 		case strings.HasPrefix(line, "*** Move to: "):
 			if current != nil {
@@ -281,10 +306,19 @@ func ParseApplyPatch(command string) []ApplyPatchFile {
 			}
 		case strings.HasPrefix(line, "*** "):
 			flush()
+			closeHunk()
+			if strings.HasPrefix(line, "*** End Patch") {
+				current = nil
+			}
+		case strings.HasPrefix(line, "@@"):
+			// Hunk header: the next hunk of the same file starts here.
+			flush()
+			closeHunk()
 		default:
 			if current == nil {
 				continue
 			}
+			hunk = append(hunk, line)
 			if strings.HasPrefix(line, "+") {
 				current.LinesAdded++
 				addedBlock = append(addedBlock, line[1:])
@@ -297,6 +331,7 @@ func ParseApplyPatch(command string) []ApplyPatchFile {
 		}
 	}
 	flush()
+	closeHunk()
 
 	// Drop empty entries.
 	out := files[:0]
