@@ -30,11 +30,21 @@ const LocalOrgID = "local"
 // v14 carries no column changes: it rewrites every stored event payload
 // through TrimPayload (dropping tool output that was 82% of a six-month
 // database) and VACUUMs the file once so the space is actually returned.
-const schemaVersion = 14
+//
+// v15 adds events.lines_generated and events.lines_reworked, the per-event
+// line counts ingest now computes from an exact diff (see ingest/capture.go),
+// and two local tables that capture needs: file_snapshots and
+// session_file_lines. Events recorded before v15 keep NULL in both columns
+// and are scored the old way wherever lines are summed. No backfill: the
+// before-content an exact diff needs was never stored for them.
+const schemaVersion = 15
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
 // declared in schemaSQL and the v7 migration in applyMigrations.
+//
+// file_snapshots and session_file_lines are deliberately absent: they hold
+// file content and stay on the machine.
 var SyncableTables = []string{
 	"repositories",
 	"sessions",
@@ -100,7 +110,9 @@ CREATE TABLE IF NOT EXISTS events (
   lines_added INTEGER,
   lines_removed INTEGER,
   payload TEXT,
-  synced_at TEXT
+  synced_at TEXT,
+  lines_generated INTEGER,
+  lines_reworked INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_events_org_ts ON events(org_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
@@ -202,6 +214,20 @@ CREATE TABLE IF NOT EXISTS session_prompts (
 );
 CREATE INDEX IF NOT EXISTS idx_session_prompts_session ON session_prompts(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_prompts_synced ON session_prompts(synced_at);
+
+-- Local working state for exact edit capture (editstate.go). Never synced.
+CREATE TABLE IF NOT EXISTS file_snapshots (
+  file_path TEXT PRIMARY KEY,
+  content BLOB NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_file_lines (
+  session_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  line_hashes BLOB NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, file_path)
+);
 
 CREATE TABLE IF NOT EXISTS sync_state (
   table_name      TEXT PRIMARY KEY,

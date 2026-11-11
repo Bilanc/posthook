@@ -120,6 +120,20 @@ func (db *DB) applyMigrations() error {
 		ON events(session_id, event_type)`); err != nil {
 		return err
 	}
+
+	// v15: per-event line counts from an exact diff. NULL on every event
+	// recorded before the upgrade.
+	eventColsV15, err := db.columnSet("events")
+	if err != nil {
+		return err
+	}
+	for _, col := range []string{"lines_generated", "lines_reworked"} {
+		if !eventColsV15[col] {
+			if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE events ADD COLUMN %s INTEGER`, col)); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

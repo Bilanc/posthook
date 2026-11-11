@@ -145,13 +145,20 @@ func pruneIfDue() {
 		logx.Debugf("worker: retention skipped: %v", err)
 		return
 	}
-	days := cfg.RetentionDays()
-	if days == 0 {
-		return
-	}
 	db, err := store.Open()
 	if err != nil {
 		logx.Debugf("worker: retention skipped: %v", err)
+		return
+	}
+	// Capture's working state (file snapshots, remembered lines) expires on
+	// its own clock, whether or not event retention is switched on.
+	if removed, ran, err := db.PruneEditStateIfDue(); err != nil {
+		logx.Debugf("worker: edit-state prune failed: %v", err)
+	} else if ran && removed > 0 {
+		logx.Debugf("worker: dropped %d stale edit-state row(s)", removed)
+	}
+	days := cfg.RetentionDays()
+	if days == 0 {
 		return
 	}
 	res, ran, err := db.PruneIfDue(store.PruneOptions{
