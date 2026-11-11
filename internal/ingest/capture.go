@@ -288,10 +288,13 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 		fc.change = overwriteChange(db, &fc, w.Content, firedAt)
 		fc.snapshotOf(w.Content, firedAt)
 		switch at := firstLineOf(w.Content, string(fc.post)); {
-		case at > 1:
-			// The text is in the file verbatim but no longer starts it:
+		case at > 1 && !addedLinesInPlace(fc.change, string(fc.post)):
+			// The lines this write added are no longer where it put them,
+			// and its whole text is in the file verbatim further down:
 			// something was put above it since. Its lines sit lower by that
-			// much, and that is where a commit will find them.
+			// much, and that is where a commit will find them. When the
+			// added lines are still in place the ranges are already right,
+			// and a verbatim copy lower down is somebody else's.
 			fc.change = fc.change.Shift(at - 1)
 		case at == 0 && !mostlyPresent(w.Content, string(fc.post)):
 			// Hardly any of it is in the file now: the command may not have
@@ -321,6 +324,23 @@ func firstLineOf(written, file string) int {
 		return 0
 	}
 	return 1 + strings.Count(file[:at], "\n")
+}
+
+// addedLinesInPlace reports whether every line the change added still reads
+// the same at the position its ranges give it in file.
+func addedLinesInPlace(c lineranges.Change, file string) bool {
+	lines := lineranges.Lines(file)
+	next := 0
+	for _, r := range c.Ranges {
+		for n := r.StartLine; n <= r.EndLine; n++ {
+			if n > len(lines) || next >= len(c.Added) ||
+				strings.TrimSuffix(lines[n-1], "\r") != strings.TrimSuffix(c.Added[next], "\r") {
+				return false
+			}
+			next++
+		}
+	}
+	return true
 }
 
 // mostlyPresent reports whether at least half the lines of written are still

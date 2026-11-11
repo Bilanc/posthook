@@ -185,6 +185,7 @@ func TestExactCapture(t *testing.T) {
 	t.Run("queued edit then write: the write is not diffed against a later disk", func(t *testing.T) { testQueuedEditThenWrite(t, home) })
 	t.Run("a file too large to snapshot keeps none", func(t *testing.T) { testOversizeFileKeepsNoSnapshot(t, home) })
 	t.Run("a shell rewrite found lower in the file points there", func(t *testing.T) { testShellRewriteFoundLowerInTheFile(t, home) })
+	t.Run("a shell rewrite is not moved onto a later copy of its text", func(t *testing.T) { testShellRewriteNotMovedOntoALaterCopy(t, home) })
 	t.Run("a shell event whose row names another file records the split", func(t *testing.T) { testShellSplitWhenRowNamesAnotherFile(t, home) })
 	t.Run("write without a patch diffs against HEAD, then the last copy", func(t *testing.T) { testWriteWithoutPatch(t, home) })
 	t.Run("files outside a repo or ignored count for nothing", func(t *testing.T) { testUncountableFiles(t, home) })
@@ -507,6 +508,28 @@ func testShellRewriteFoundLowerInTheFile(t *testing.T, home string) {
 	db := openDB(t)
 	wantCounts(t, db, "shifted-1", [2]int64{2, 0})
 	wantRanges(t, db, "shifted-1", rangeRow{2, 3})
+}
+
+func testShellRewriteNotMovedOntoALaterCopy(t *testing.T, home string) {
+	// HEAD holds "old, bar". A heredoc writes "foo, bar": line 1 changed.
+	// Before the event is handled, someone changes line 2 and appends an
+	// intact copy of the old text, so the file reads "foo, baz, foo, bar".
+	// The write's text is in the file verbatim from line 3, but its changed
+	// line is still line 1, and that is where the range must stay.
+	repo := filepath.Join(home, "repo-shell-duplicate")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "list.txt")
+	writeFile(t, path, "old\nbar\n")
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+	writeFile(t, path, "foo\nbaz\nfoo\nbar\n")
+	deliver(t, "claude-code", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "copy-1", "cwd": repo,
+		"tool_name": "Bash", "tool_input": map[string]any{"command": "cat > " + path + " <<'EOF'\nfoo\nbar\nEOF"},
+	})
+	db := openDB(t)
+	wantCounts(t, db, "copy-1", [2]int64{1, 0})
+	wantRanges(t, db, "copy-1", rangeRow{1, 1})
 }
 
 func testShellSplitWhenRowNamesAnotherFile(t *testing.T, home string) {
