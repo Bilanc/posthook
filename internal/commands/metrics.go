@@ -43,6 +43,8 @@ WITH ai_edits AS (
 		COALESCE(json_extract(e.payload, '$.tool_input.content'), '') AS content,
 		COALESCE(e.lines_added, 0) AS event_lines_added,
 		COALESCE(e.lines_removed, 0) AS event_lines_removed,
+		e.lines_generated AS exact_lines_generated,
+		e.lines_reworked AS exact_lines_reworked,
 		COALESCE((
 			SELECT SUM(elr.new_text_lines)
 			FROM event_line_ranges elr
@@ -57,6 +59,8 @@ WITH ai_edits AS (
 				json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
 				-- shell commands (Bash heredocs …) count once lines were located in the file
 				OR EXISTS (SELECT 1 FROM event_line_ranges selr WHERE selr.event_id = e.id)
+				-- … or measured without a position (the text had moved by the time it was read)
+				OR COALESCE(e.lines_generated, 0) > 0
 			)
 			AND NOT (
 				e.agent_slug = 'cursor'
@@ -80,7 +84,11 @@ WITH ai_edits AS (
 ai_edits_scored AS (
 	SELECT
 		*,
+		-- Measured at ingest when present (exact diff, net of the session's own
+		-- rework; see ingest/capture.go); the older estimate for events
+		-- recorded before that. The dashboard uses the same rule.
 		CASE
+			WHEN exact_lines_generated IS NOT NULL THEN exact_lines_generated - COALESCE(exact_lines_reworked, 0)
 			WHEN line_range_lines > 0 THEN line_range_lines
 			WHEN tool_name = 'apply_patch' THEN event_lines_added
 			ELSE ` + fmt.Sprintf(nl, "new_string", "new_string") + ` + ` + fmt.Sprintf(nl, "content", "content") + `
@@ -232,7 +240,7 @@ func runMetrics() error {
 	fmt.Println()
 	fmt.Println("Overall")
 	fmt.Printf("  AI edit events            %d\n", summary.edits)
-	fmt.Printf("  AI lines generated        %d  (ranges + tool payload)\n", summary.linesGenerated)
+	fmt.Printf("  AI lines generated        %d  (net of the agent's own rework)\n", summary.linesGenerated)
 	fmt.Printf("  AI lines replaced         %d\n", summary.linesReplaced)
 	fmt.Printf("  AI lines committed*       %d\n", summary.linesCommitted)
 	fmt.Printf("  AI code %%*                %.1f%%\n", aiCodePct)

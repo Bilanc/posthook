@@ -1,5 +1,5 @@
 import { db } from "../db.ts";
-import { AI_EDIT_EVENT_CONDITION, LINES_GENERATED } from "./edit-condition.ts";
+import { AI_EDIT_EVENT_CONDITION, LINES_GENERATED, LINES_WRITTEN } from "./edit-condition.ts";
 import { IDLE_GAP_MINUTES } from "./activity.ts";
 import { ATTRIBUTED } from "./outcomes.ts";
 
@@ -102,7 +102,7 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
               json_extract(e.payload, '$.tool_name') AS tool_name,
               COALESCE(json_extract(e.payload, '$.duration_ms'), json_extract(e.payload, '$.duration')) AS duration_ms,
               ${FILE_EXPR} AS file,
-              CASE WHEN ${AI_EDIT_EVENT_CONDITION} THEN ${LINES_GENERATED} ELSE 0 END AS lines_generated,
+              CASE WHEN ${AI_EDIT_EVENT_CONDITION} THEN ${LINES_WRITTEN} ELSE 0 END AS lines_generated,
               substr(COALESCE(json_extract(e.payload, '$.tool_input.command'),
                               json_extract(e.payload, '$.tool_input.description'),
                               json_extract(e.payload, '$.tool_input.pattern'),
@@ -134,12 +134,29 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
 
   const files = conn
     .prepare(
-      `SELECT f AS file, COUNT(*) AS edits, COALESCE(SUM(lines), 0) AS lines_generated
-       FROM (
-         SELECT ${FILE_EXPR} AS f, ${LINES_GENERATED} AS lines
+      // One row per file an edit touched. An edit that wrote one file puts
+      // its whole count there. An edit that wrote several (an apply_patch
+      // across files) is split by each line range's own path; before, all of
+      // it landed on the first file the patch named.
+      `WITH edit_events AS (
+         SELECT e.id,
+                ${FILE_EXPR} AS event_file,
+                ${LINES_GENERATED} AS lines,
+                (SELECT COUNT(DISTINCT COALESCE(x.rel_file_path, x.file_path))
+                 FROM event_line_ranges x WHERE x.event_id = e.id) AS range_files
          FROM events e
          WHERE e.session_id = ? AND ${AI_EDIT_EVENT_CONDITION}
+       ),
+       per_file AS (
+         SELECT event_file AS f, lines FROM edit_events WHERE range_files <= 1
+         UNION ALL
+         SELECT COALESCE(x.rel_file_path, x.file_path) AS f, SUM(x.new_text_lines) AS lines
+         FROM edit_events ee JOIN event_line_ranges x ON x.event_id = ee.id
+         WHERE ee.range_files > 1
+         GROUP BY ee.id, COALESCE(x.rel_file_path, x.file_path)
        )
+       SELECT f AS file, COUNT(*) AS edits, MAX(COALESCE(SUM(lines), 0), 0) AS lines_generated
+       FROM per_file
        WHERE f IS NOT NULL
        GROUP BY f
        ORDER BY lines_generated DESC, edits DESC`,
