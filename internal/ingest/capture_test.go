@@ -618,6 +618,33 @@ func testFileLinesNameEachFilesRepository(t *testing.T, home string) {
 	if none.RepoID != nil || none.RelFilePath != nil || none.LinesGenerated != 0 {
 		t.Errorf("scratch file: %+v", none)
 	}
+	// Every element carries the repo_id key, as JSON null for the file in no
+	// repository. A reader takes a missing key to mean "written before the
+	// key existed" and falls back to the event's repository, so the key must
+	// never be left out.
+	var raw string
+	if err := db.QueryRow(`SELECT file_lines FROM events WHERE session_id = 'repos-1'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var elements []map[string]any
+	if err := json.Unmarshal([]byte(raw), &elements); err != nil {
+		t.Fatal(err)
+	}
+	for i, el := range elements {
+		value, present := el["repo_id"]
+		if !present {
+			t.Errorf("element %d has no repo_id key: %s", i, raw)
+		}
+		if i == 2 && value != nil {
+			t.Errorf("the file in no repository should carry repo_id null, got %v", value)
+		}
+		if i < 2 {
+			if id, ok := value.(string); !ok || id == "" {
+				t.Errorf("element %d should carry its repository id, got %v", i, value)
+			}
+		}
+	}
+
 	// The event row itself names the first file's repository.
 	var eventRepo sql.NullString
 	if err := db.QueryRow(`SELECT repo_id FROM events WHERE session_id = 'repos-1'`).Scan(&eventRepo); err != nil {

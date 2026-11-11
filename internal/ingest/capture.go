@@ -567,6 +567,9 @@ func (c *editCapture) reworkedArg() sql.NullInt64 {
 // fileLines is one file's share of an event that wrote several, as stored
 // in events.file_lines.
 type fileLines struct {
+	// Always written, as null for a file in no repository; never omitted. A
+	// reader takes a missing key to mean the element predates it and falls
+	// back to the event's repository.
 	RepoID         *string `json:"repo_id"`
 	RelFilePath    *string `json:"rel_file_path"`
 	FilePath       string  `json:"file_path"`
