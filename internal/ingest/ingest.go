@@ -237,39 +237,58 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		sessIDArg = sql.NullString{String: sessionID, Valid: true}
 	}
 
+	// What the event wrote, worked out before the row is inserted so the
+	// counts go in with it (see capture.go). Read from the full in-memory
+	// `payload`: the patch Claude Code reports lives in tool_response, which
+	// TrimPayload drops below.
+	//
+	// firedAt is when the hook fired, as the hook itself recorded it. The
+	// worker gets to the event later, so this is the only clock that says
+	// which of the file's states the event could have seen (capture.go).
+	firedAt, err := time.Parse(time.RFC3339Nano, env.ReceivedAt)
+	if err != nil {
+		firedAt = time.Now()
+	}
+	var capture *editCapture
+	switch {
+	case eventType == "PostToolUse" && len(applyPatchFiles) > 0:
+		capture = captureApplyPatch(applyPatchFiles, cwd, workspaceRoots)
+	case len(shellWrites) > 0:
+		capture = captureShellWrites(db, shellWrites, cwd, workspaceRoots, firedAt)
+	default:
+		if toolName := lineRangeToolForEvent(agentSlug, eventType, payload); toolName != "" && canonicalFilePath != "" {
+			capture = captureToolEdit(db, canonicalFilePath, toolName, payload, firedAt)
+		}
+	}
+	if capture != nil {
+		capture.score(db, sessionID)
+	}
+
 	// Store the trimmed payload: tool output (file contents, command output,
 	// images) is dropped and oversized strings are capped. Everything the
-	// line-range, prompt and transcript extraction below needs is read from
-	// the full in-memory `payload`, not from the stored row.
+	// prompt and transcript extraction below needs is read from the full
+	// in-memory `payload`, not from the stored row.
 	stored, droppedBytes := store.TrimPayload(raw)
 
 	_, err = db.Exec(`
 		INSERT INTO events (
 			id, org_id, session_id, ts, event_type, agent_slug, cwd,
-			file_path, repo_id, rel_file_path, lines_added, lines_removed, payload
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			file_path, repo_id, rel_file_path, lines_added, lines_removed, payload,
+			lines_generated, lines_reworked, file_lines
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, store.LocalOrgID, sessIDArg, ts, eventType, agentSlug, cwd,
 		nullableString(finalFilePath), repoID, relFilePath,
-		patchLinesAdded, patchLinesRemoved, string(stored))
+		patchLinesAdded, patchLinesRemoved, string(stored),
+		capture.generatedArg(), capture.reworkedArg(), capture.fileLinesArg(db, finalFilePath, repoRoot, repoID))
 	if err != nil {
 		return err
 	}
 	logx.Debugf("ingested %s event %s (session=%s, payload %d bytes, dropped %d)", agentSlug, eventType, sessionID, len(stored), droppedBytes)
 
-	// Line-range capture. Fail-soft: never block ingest on these.
-	if eventType == "PostToolUse" && len(applyPatchFiles) > 0 {
-		if err := captureApplyPatchLineRanges(db, id, applyPatchFiles, cwd, workspaceRoots); err != nil {
+	// Line ranges and capture state. Fail-soft: never block ingest on these.
+	if capture != nil {
+		if err := capture.store(db, id, sessionID); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
-		}
-	} else if len(shellWrites) > 0 {
-		if err := captureShellWriteLineRanges(db, id, shellWrites, cwd, workspaceRoots); err != nil {
-			logx.Warnf("line-range capture failed: %v", err)
-		}
-	} else {
-		if toolName := lineRangeToolForEvent(agentSlug, eventType, payload); toolName != "" && canonicalFilePath != "" {
-			if err := captureLineRanges(db, id, canonicalFilePath, relFilePath, toolName, payload); err != nil {
-				logx.Warnf("line-range capture failed: %v", err)
-			}
 		}
 	}
 
@@ -580,65 +599,6 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) er
 
 // ── helpers ───────────────────────────────────────────────────────────────
 
-func captureLineRanges(
-	db *store.DB,
-	eventID, filePath string,
-	relFilePath sql.NullString,
-	toolName string,
-	payload map[string]any,
-) error {
-	if _, err := os.Stat(filePath); err != nil {
-		logx.Debugf("line-range: file gone, skipping (%s)", filePath)
-		return nil
-	}
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return err
-	}
-	input := lineRangeToolInput(payload)
-	if input == nil {
-		return nil
-	}
-	out := lineranges.Extract(toolName, *input, string(content))
-	return insertLineRanges(db, eventID, filePath, relFilePath, content, toolName, out)
-}
-
-func captureApplyPatchLineRanges(
-	db *store.DB,
-	eventID string,
-	files []lineranges.ApplyPatchFile,
-	cwd string,
-	workspaceRoots []string,
-) error {
-	for _, file := range files {
-		if len(file.Edits) == 0 {
-			continue
-		}
-		resolvedPath := resolveEventFilePath(file.FilePath, cwd, workspaceRoots)
-		canonicalPath := gitx.Canonicalize(resolvedPath)
-		if _, err := os.Stat(canonicalPath); err != nil {
-			logx.Debugf("line-range: file gone, skipping (%s)", canonicalPath)
-			continue
-		}
-		root := findEventRepoRoot(cwd, canonicalPath, workspaceRoots)
-		var rel sql.NullString
-		if root != "" {
-			if v := gitx.RelPathInRepo(root, canonicalPath); v != "" {
-				rel = sql.NullString{String: v, Valid: true}
-			}
-		}
-		content, err := os.ReadFile(canonicalPath)
-		if err != nil {
-			continue
-		}
-		out := lineranges.Extract("MultiEdit", lineranges.ToolInput{Edits: file.Edits}, string(content))
-		if err := insertLineRanges(db, eventID, canonicalPath, rel, content, "apply_patch", out); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // shellToolNames are the tool names under which agents run shell commands:
 // Claude Code's Bash, Codex CLI's shell / exec_command, Cursor's Shell.
 var shellToolNames = map[string]bool{
@@ -675,48 +635,6 @@ func shellWritesForPayload(payload map[string]any, eventType string) []linerange
 	return lineranges.ParseShellWrites(command)
 }
 
-// captureShellWriteLineRanges records line ranges for files a shell command
-// wrote. When the written text is known (heredoc, echo …) it is located in
-// the post-command file exactly like an Edit; otherwise the file is only
-// recorded as touched on the event and no lines are attributed.
-func captureShellWriteLineRanges(
-	db *store.DB,
-	eventID string,
-	writes []lineranges.ShellWrite,
-	cwd string,
-	workspaceRoots []string,
-) error {
-	for _, w := range writes {
-		if !w.Known || w.Content == "" {
-			logx.Debugf("line-range: shell wrote %s with unknown content, not attributing lines", w.FilePath)
-			continue
-		}
-		resolvedPath := resolveEventFilePath(w.FilePath, cwd, workspaceRoots)
-		canonicalPath := gitx.Canonicalize(resolvedPath)
-		if _, err := os.Stat(canonicalPath); err != nil {
-			logx.Debugf("line-range: file gone, skipping (%s)", canonicalPath)
-			continue
-		}
-		root := findEventRepoRoot(cwd, canonicalPath, workspaceRoots)
-		if root == "" {
-			continue // scratch files outside any repo carry no attribution
-		}
-		var rel sql.NullString
-		if v := gitx.RelPathInRepo(root, canonicalPath); v != "" {
-			rel = sql.NullString{String: v, Valid: true}
-		}
-		content, err := os.ReadFile(canonicalPath)
-		if err != nil {
-			continue
-		}
-		out := lineranges.Extract("ShellWrite", lineranges.ToolInput{Content: w.Content}, string(content))
-		if err := insertLineRanges(db, eventID, canonicalPath, rel, content, "shell", out); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func insertLineRanges(
 	db *store.DB,
 	eventID, filePath string,
@@ -731,8 +649,13 @@ func insertLineRanges(
 		}
 		return nil
 	}
-	sha := sha256.Sum256(content)
-	shaHex := hex.EncodeToString(sha[:])
+	// blob_sha_after is the file as read while handling the event; NULL when
+	// it was already gone and the ranges come from the payload alone.
+	var shaHex sql.NullString
+	if content != nil {
+		sha := sha256.Sum256(content)
+		shaHex = sql.NullString{String: hex.EncodeToString(sha[:]), Valid: true}
+	}
 	for _, r := range out.Ranges {
 		if _, err := db.Exec(`
 			INSERT INTO event_line_ranges (

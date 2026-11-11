@@ -45,6 +45,8 @@ WITH ai_edits AS (
     COALESCE(json_extract(e.payload, '$.tool_input.content'), '') AS content,
     COALESCE(e.lines_added, 0) AS event_lines_added,
     COALESCE(e.lines_removed, 0) AS event_lines_removed,
+    e.lines_generated AS exact_lines_generated,
+    e.lines_reworked AS exact_lines_reworked,
     COALESCE((
       SELECT SUM(elr.new_text_lines)
       FROM event_line_ranges elr
@@ -59,6 +61,11 @@ WITH ai_edits AS (
         json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
         -- shell commands (Bash heredocs …) count once lines were located in the file
         OR EXISTS (SELECT 1 FROM event_line_ranges selr WHERE selr.event_id = e.id)
+        -- … or measured without a position (the text had moved by the time it was
+        -- read), or measured as only removing the session's own lines: its
+        -- rework has to be subtracted even though it wrote nothing
+        OR COALESCE(e.lines_generated, 0) > 0
+        OR COALESCE(e.lines_reworked, 0) > 0
       )
       AND NOT (
         e.agent_slug = 'cursor'
@@ -83,7 +90,11 @@ WITH ai_edits AS (
 ai_edits_scored AS (
   SELECT
     *,
+    -- Measured by the client when present (exact diff, net of the session's
+    -- own rework); the older estimate otherwise. Same rule as LINES_GENERATED
+    -- in edit-condition.ts and aiEditsCTE in the CLI.
     CASE
+      WHEN exact_lines_generated IS NOT NULL THEN exact_lines_generated - COALESCE(exact_lines_reworked, 0)
       WHEN line_range_lines > 0 THEN line_range_lines
       WHEN tool_name = 'apply_patch' THEN event_lines_added
       ELSE ${NL("new_string")} + ${NL("content")}

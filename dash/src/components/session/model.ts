@@ -30,6 +30,7 @@ export function ms(iso: string | null | undefined): number {
 // ---- Files: generated vs committed -------------------------------------
 
 export interface FileRow {
+  key: string; // repository and path: unique per row, unlike the label
   path: string;
   generated: number; // lines the agent wrote, floored at the committed count
   committed: number; // lines from this session that landed in a commit
@@ -50,14 +51,44 @@ export function fileRows(
   commitFiles: CommitFile[],
   commits: SessionCommit[],
 ): FileSummary {
+  // A file is a path in a repository: one session can write README.md in two
+  // repositories, and those are two files. The repository is shown in front
+  // of the path only when the session's files span more than one, so a
+  // single-repository session reads exactly as it always has.
+  const repos = new Map<string, { name: string; root: string }>();
+  for (const f of [...files, ...commitFiles]) {
+    if (f.repo_id && !repos.has(f.repo_id)) {
+      repos.set(f.repo_id, { name: f.repo_name || f.repo_id, root: f.repo_root || "" });
+    }
+  }
+  // What to call each repository: the folder it lives in. Worktrees and
+  // second clones of one repository share its name (it comes from the
+  // remote) but not their folder. When two of the session's repositories
+  // have folders of the same name, the whole path. The label is for
+  // reading; rows are keyed by repository id, never by it.
+  const base = (root: string) => root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || root;
+  const folder = (r: { name: string; root: string }) => (r.root ? base(r.root) : r.name);
+  const folders = new Map<string, number>();
+  for (const r of repos.values()) folders.set(folder(r), (folders.get(folder(r)) ?? 0) + 1);
+  const repoLabel = (repoId: string) => {
+    const r = repos.get(repoId);
+    if (!r) return repoId;
+    return (folders.get(folder(r)) ?? 0) > 1 && r.root ? r.root : folder(r);
+  };
+  const label = (path: string, repoId?: string | null) =>
+    repos.size > 1 && repoId ? `${repoLabel(repoId)}/${path}` : path;
+  const key = (path: string, repoId?: string | null) => `${repoId ?? ""}\u0000${path}`;
+
   const by = new Map<string, FileRow>();
   for (const f of files) {
-    by.set(f.file, { path: f.file, generated: f.lines_generated, committed: 0, edits: f.edits });
+    const k = key(f.file, f.repo_id);
+    by.set(k, { key: k, path: label(f.file, f.repo_id), generated: f.lines_generated, committed: 0, edits: f.edits });
   }
   for (const c of commitFiles) {
-    const row = by.get(c.file_path) ?? { path: c.file_path, generated: 0, committed: 0, edits: 0 };
+    const k = key(c.file_path, c.repo_id);
+    const row = by.get(k) ?? { key: k, path: label(c.file_path, c.repo_id), generated: 0, committed: 0, edits: 0 };
     row.committed += c.lines_attributed;
-    by.set(c.file_path, row);
+    by.set(k, row);
   }
   for (const r of by.values()) if (r.committed > r.generated) r.generated = r.committed;
   const rows = [...by.values()].sort(

@@ -90,11 +90,21 @@ For Claude Code, the `Stop` hook parses the session transcript at `~/.claude/pro
 
 Posthook links AI work to commits at the **file level**: when a commit lands, each touched file is attributed to the AI session(s) that most recently edited it before that commit. From there it rolls up:
 
-- **`event_line_ranges`** — the raw line ranges each AI edit produced.
+- **`event_line_ranges`** — the lines each AI edit added or changed, as ranges in the file.
 - **`commit_sessions`** — for each commit, which sessions contributed, with event counts, files touched, and lines attributed.
 - **`commit_session_files`** — the same, broken down per file.
 
 This is what powers the "AI lines committed" and "AI code %" figures in `posthook metrics`, the per-line headers in `posthook blame`, and the breakdowns in the dashboard.
+
+**How generated lines are counted.** For every edit, posthook works out the lines the agent actually added or changed, not the size of the text the tool was handed:
+
+- Claude Code reports each edit as a patch against the file it read, and posthook uses that patch as is.
+- An old/new string pair from any other agent is diffed line by line, so the unchanged lines the agent repeated around its change are not counted.
+- A tool that hands over a whole file (a `Write`, a shell heredoc) is diffed against posthook's last snapshot of that file, or the version at `HEAD`. Rewriting a 300-line file to change four lines counts four. The snapshot is a fingerprint per line, not the file's content.
+- `apply_patch` hunks are placed by their context lines, so a one-line hunk lands where the patch put it, not on the first line of the file with the same text.
+- A file outside any git repository, or one git ignores, counts for nothing: it can never reach a commit.
+
+The count is stored on the event (`events.lines_generated`), along with how many of the lines that edit removed were the same session's earlier work (`events.lines_reworked`). A removed line counts as rework only when it cannot have been someone else's: deleting a blank line the file had before the session wrote one of its own subtracts nothing. "Lines generated" everywhere is the first minus the second, so a session's total is the lines it has standing, not the churn it took to get there. An edit whose lines are not all in the one file its event names (an `apply_patch` across files, a shell command that writes a second file) also records each file's share of both numbers and the repository that file is in (`events.file_lines`), so per-file figures are exact and net of rework too. A session that works across several repositories is split by repository and path: `README.md` in two repositories is two files, in the dashboard as in the data. Events recorded before this was measured keep the older estimate.
 
 ### How the git shadow works
 
@@ -134,7 +144,7 @@ Posthook records the path to the real git binary in `~/.posthook/git-path` at in
 
 | Path | What |
 |---|---|
-| `~/.posthook/posthook.db` | SQLite — all your data (`repositories`, `sessions`, `events`, `event_line_ranges`, `commits`, `commit_files`, `commit_sessions`, `commit_session_files`) |
+| `~/.posthook/posthook.db` | SQLite — all your data (`repositories`, `sessions`, `events`, `event_line_ranges`, `commits`, `commit_files`, `commit_sessions`, `commit_session_files`), plus two working tables that never leave the machine: `file_snapshots` (each file an agent edited as it was left, to diff the next whole-file write against) and `session_file_lines` (the lines each session wrote, to recognise rework). Both hold an 8-byte fingerprint per line and no file content. Rows in both are dropped after 30 days without a touch. |
 | `~/.posthook/config.json` | Cloud-sync settings (endpoint, install token, enabled flag, flush interval, sync mode), the engineer identity (work email + name) and the storage retention window (`storage.retention_days`). Absent until you configure one of them. |
 | `~/.posthook/git-path` | Absolute path to the real git binary. Written at install time, read on every shadow invocation. |
 | `~/.posthook/dash/` | Staged dashboard build, spawned by `posthook dash`. |
@@ -221,7 +231,7 @@ Access is invite-based — **[talk to the team](https://bilanc.co)** to get set 
 - **Single static Go binary**, built with `go build` — no runtime required on user machines.
 - **SQLite via `modernc.org/sqlite`** — a pure-Go driver, no CGO, cross-compiles to every platform. The schema mirrors the eventual server-side shape, so the cloud migration path stays simple.
 - **Per-agent installer modules** (`internal/installers/`) all follow the same idempotent merge-and-deduplicate pattern: read the existing config, surgically add or update only posthook's entry, write atomically.
-- **Line-range extractor** (`internal/lineranges/`) — a pure function from post-edit file content + tool input to the line range(s) the AI wrote. Testable in isolation.
+- **Line-range extractor** (`internal/lineranges/`) — pure functions from a tool call (its patch, its old and new strings, or the file before and after) to the lines the AI added or changed and the lines it removed. Testable in isolation. `internal/ingest/capture.go` picks the most exact source each agent offers.
 - **Transcript parser** (`internal/transcript/`) reads Claude Code JSONL, Codex rollouts and Copilot event streams for model + session-span + token backfill and prompt lookup during `posthook blame`.
 - **Cloud sync** (`internal/sync/`, `internal/config/`) — a per-row `synced_at` cursor and a single batched POST per flush. Append-only and at-least-once; safe to retry.
 - **Schema migrations** run automatically on `store.Open()` via `ALTER TABLE` guards, backfill passes for repo IDs and session models, and `datetime()`-wrapped time comparisons for timezone-correct windowing.

@@ -16,7 +16,7 @@ export function FilesPanel({ files }: { files: FileSummary }) {
       {files.rows.map((r) => {
         const lost = Math.max(0, r.generated - r.committed);
         return (
-          <div key={r.path} className="grid gap-1 text-xs">
+          <div key={r.key} className="grid gap-1 text-xs">
             <div className="truncate font-mono text-[11px] text-[var(--color-fg)]" title={r.path}>
               {r.path}
             </div>

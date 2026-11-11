@@ -338,3 +338,24 @@ func sortedKeys(m map[string]bool) string {
 	}
 	return strings.Join(keys, ",")
 }
+
+func TestRedactTables_MeasuredLineColumnsPassThrough(t *testing.T) {
+	// The counts ingest measures, and their per-file split, are metadata:
+	// numbers and file paths, like the columns beside them. Metadata-only
+	// mode must leave them alone while it strips the payload.
+	fileLines := `[{"rel_file_path":"a.go","file_path":"/repo/a.go","lines_generated":1,"lines_reworked":0},` +
+		`{"rel_file_path":"b.go","file_path":"/repo/b.go","lines_generated":1,"lines_reworked":1}]`
+	tables := map[string][]map[string]any{"events": {{
+		"id": "e1", "event_type": "PostToolUse",
+		"payload":         `{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n+TOP_SECRET_LINE"}}`,
+		"lines_generated": int64(2), "lines_reworked": int64(1), "file_lines": fileLines,
+	}}}
+	RedactTables(tables)
+	row := tables["events"][0]
+	if row["lines_generated"] != int64(2) || row["lines_reworked"] != int64(1) || row["file_lines"] != fileLines {
+		t.Errorf("measured columns changed: generated=%v reworked=%v file_lines=%v", row["lines_generated"], row["lines_reworked"], row["file_lines"])
+	}
+	if payload, _ := row["payload"].(string); strings.Contains(payload, "TOP_SECRET_LINE") {
+		t.Errorf("payload content survived: %s", payload)
+	}
+}

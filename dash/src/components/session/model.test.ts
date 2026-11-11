@@ -58,6 +58,75 @@ test("fileRows unions edited and committed files and floors generated at committ
   assert.equal(out.committed, 95);
 });
 
+test("fileRows keeps the same path in two repositories apart and names the repository", () => {
+  const out = fileRows(
+    [
+      { file: "README.md", edits: 2, lines_generated: 4, repo_id: "r1", repo_name: "demo" },
+      { file: "README.md", edits: 2, lines_generated: 6, repo_id: "r2", repo_name: "other" },
+      { file: "/home/dev/plan.md", edits: 1, lines_generated: 0, repo_id: null, repo_name: null },
+    ],
+    [
+      // Committed in the second repository: it must land on that README.
+      { commit_id: "c1", file_path: "README.md", lines_attributed: 5, repo_id: "r2", repo_name: "other" },
+    ],
+    [
+      { id: "c1", sha: "x", committed_at: "", message: null, lines_added: 5, lines_removed: 0, files_changed: 1, lines_attributed: 5, files_touched: 1 },
+    ],
+  );
+  assert.deepEqual(
+    out.rows.map((r) => [r.path, r.generated, r.committed, r.edits]),
+    [
+      ["other/README.md", 6, 5, 2],
+      ["demo/README.md", 4, 0, 2],
+      // A file in no repository keeps its own path.
+      ["/home/dev/plan.md", 0, 0, 1],
+    ],
+  );
+});
+
+test("fileRows tells repositories with the same name apart and keys every row uniquely", () => {
+  // A worktree beside the main clone shares the remote's name; two clones in
+  // folders of the same name share even that.
+  const out = fileRows(
+    [
+      { file: "README.md", edits: 1, lines_generated: 4, repo_id: "r1", repo_name: "posthook", repo_root: "/work/posthook" },
+      { file: "README.md", edits: 1, lines_generated: 20, repo_id: "r2", repo_name: "posthook", repo_root: "/work/posthook-wt-fix" },
+      { file: "README.md", edits: 1, lines_generated: 7, repo_id: "r3", repo_name: "demo", repo_root: "/work/one/demo" },
+      { file: "README.md", edits: 1, lines_generated: 9, repo_id: "r4", repo_name: "demo", repo_root: "/work/two/demo" },
+      { file: "README.md", edits: 1, lines_generated: 1, repo_id: "r5", repo_name: "docs", repo_root: "/work/docs" },
+    ],
+    [],
+    [],
+  );
+  assert.deepEqual(
+    out.rows.map((r) => [r.path, r.generated]),
+    [
+      ["posthook-wt-fix/README.md", 20],
+      ["/work/two/demo/README.md", 9],
+      ["/work/one/demo/README.md", 7],
+      ["posthook/README.md", 4],
+      ["docs/README.md", 1],
+    ],
+  );
+  assert.equal(new Set(out.rows.map((r) => r.key)).size, 5);
+  assert.equal(new Set(out.rows.map((r) => r.path)).size, 5);
+});
+
+test("fileRows shows bare paths when every file is in one repository", () => {
+  const out = fileRows(
+    [
+      { file: "a.go", edits: 1, lines_generated: 3, repo_id: "r1", repo_name: "demo" },
+      { file: "b.go", edits: 1, lines_generated: 2, repo_id: "r1", repo_name: "demo" },
+    ],
+    [{ commit_id: "c1", file_path: "a.go", lines_attributed: 3, repo_id: "r1", repo_name: "demo" }],
+    [],
+  );
+  assert.deepEqual(
+    out.rows.map((r) => r.path),
+    ["a.go", "b.go"],
+  );
+});
+
 test("resendDelays measures each prompt against the previous one by seq", () => {
   const d = resendDelays([
     { ts: "2026-10-10T10:00:00Z", seq: 1, text: "a" },

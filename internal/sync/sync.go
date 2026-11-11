@@ -85,8 +85,14 @@ type ingestPayload struct {
 // mode: session_prompts rows may carry prompt_chars + redacted with an empty
 // prompt_text, events.payload may be an allowlisted object stamped
 // posthook_redacted, events.lines_added may be set for Edit/Write-style
-// tools, and commits.message may be null.
-const schemaVersion = 10
+// tools, and commits.message may be null. v11: events rows may carry
+// lines_generated and lines_reworked, the per-event counts ingest computes
+// from an exact diff (NULL on events recorded by an older client), and
+// file_lines, a JSON array splitting those two counts by file (with each
+// file's repo_id) for an event whose lines are not all in the file its row
+// names (NULL otherwise). Metadata-only mode leaves all three
+// as they are: they are counts and file paths, like the columns beside them.
+const schemaVersion = 11
 
 type pendingRows struct {
 	rows []map[string]any
