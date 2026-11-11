@@ -379,3 +379,46 @@ func TestDiffLineSlicesMatchesDiffChange(t *testing.T) {
 		t.Fatal("the inputs were modified")
 	}
 }
+
+func TestAlignLinesPairsKeptLinesAndTakesTheEarliestMatch(t *testing.T) {
+	// Two lines put above, one changed in place, one copy appended.
+	a := []string{"foo", "bar", "baz"}
+	b := []string{"h1", "h2", "foo", "BAR", "baz", "foo"}
+	match, ok := AlignLines(a, b)
+	if want := []int{2, -1, 4}; !ok || !reflect.DeepEqual(match, want) {
+		t.Fatalf("match %v ok=%v, want %v", match, ok, want)
+	}
+	// Identical lists pair line for line.
+	if match, ok := AlignLines(a, a); !ok || !reflect.DeepEqual(match, []int{0, 1, 2}) {
+		t.Fatalf("identity: %v ok=%v", match, ok)
+	}
+	// Nothing in common, and an empty side.
+	if match, ok := AlignLines(a, []string{"x"}); !ok || !reflect.DeepEqual(match, []int{-1, -1, -1}) {
+		t.Fatalf("disjoint: %v ok=%v", match, ok)
+	}
+	if match, ok := AlignLines(a, nil); !ok || !reflect.DeepEqual(match, []int{-1, -1, -1}) {
+		t.Fatalf("empty b: %v ok=%v", match, ok)
+	}
+}
+
+func TestAlignLinesReportsWhenTheDifferenceIsTooLargeToAlign(t *testing.T) {
+	n := 2100
+	a := append([]string{"same"}, strings.Split(strings.TrimSuffix(lines(n, "old %d"), "\n"), "\n")...)
+	b := append([]string{"same"}, strings.Split(strings.TrimSuffix(lines(n, "new %d"), "\n"), "\n")...)
+	match, ok := AlignLines(a, b)
+	if ok || match[0] != 0 || match[1] != -1 {
+		t.Fatalf("ok=%v match[0]=%d match[1]=%d, want not ok with only the common first line paired", ok, match[0], match[1])
+	}
+}
+
+func TestRangesOfGroupsConsecutiveLines(t *testing.T) {
+	got := RangesOf([]int{3, 4, 5, 9, 11, 12})
+	want := []LineRange{
+		{StartLine: 3, EndLine: 5, NewTextLines: 3},
+		{StartLine: 9, EndLine: 9, NewTextLines: 1},
+		{StartLine: 11, EndLine: 12, NewTextLines: 2},
+	}
+	if !reflect.DeepEqual(got, want) || RangesOf(nil) != nil {
+		t.Fatalf("got %#v", got)
+	}
+}

@@ -185,6 +185,8 @@ func TestExactCapture(t *testing.T) {
 	t.Run("queued edit then write: the write is not diffed against a later disk", func(t *testing.T) { testQueuedEditThenWrite(t, home) })
 	t.Run("a file too large to snapshot keeps none", func(t *testing.T) { testOversizeFileKeepsNoSnapshot(t, home) })
 	t.Run("a shell rewrite found lower in the file points there", func(t *testing.T) { testShellRewriteFoundLowerInTheFile(t, home) })
+	t.Run("a shell rewrite with a line changed since keeps the other lines' positions", func(t *testing.T) { testShellRewriteWithALineChangedSince(t, home) })
+	t.Run("a patch-less write found lower in the file points there", func(t *testing.T) { testWriteWithoutPatchFoundLowerInTheFile(t, home) })
 	t.Run("a shell rewrite is not moved onto a later copy of its text", func(t *testing.T) { testShellRewriteNotMovedOntoALaterCopy(t, home) })
 	t.Run("a shell event whose row names another file records the split", func(t *testing.T) { testShellSplitWhenRowNamesAnotherFile(t, home) })
 	t.Run("write without a patch diffs against HEAD, then the last copy", func(t *testing.T) { testWriteWithoutPatch(t, home) })
@@ -495,19 +497,52 @@ func testQueuedEditThenWrite(t *testing.T, home string) {
 
 func testShellRewriteFoundLowerInTheFile(t *testing.T, home string) {
 	// A heredoc wrote the whole file; by the time the event is handled a
-	// later command has put a line above it. The text is still there
-	// verbatim, one line lower, and that is where its ranges must point.
+	// later edit has put two lines above it. Its lines are still there, two
+	// lines lower, and that is where its ranges must point.
 	repo := filepath.Join(home, "repo-shell-shifted")
 	initRepo(t, repo)
 	path := filepath.Join(repo, "list.txt")
-	writeFile(t, path, "# header\nalpha\nbeta\n")
+	writeFile(t, path, "# header\n\nalpha\nbeta\n")
 	deliver(t, "claude-code", repo, map[string]any{
 		"hook_event_name": "PostToolUse", "session_id": "shifted-1", "cwd": repo,
 		"tool_name": "Bash", "tool_input": map[string]any{"command": "cat > " + path + " <<'EOF'\nalpha\nbeta\nEOF"},
 	})
 	db := openDB(t)
 	wantCounts(t, db, "shifted-1", [2]int64{2, 0})
-	wantRanges(t, db, "shifted-1", rangeRow{2, 3})
+	wantRanges(t, db, "shifted-1", rangeRow{3, 4})
+}
+
+func testShellRewriteWithALineChangedSince(t *testing.T, home string) {
+	// A heredoc wrote three lines; a later edit changed the middle one in
+	// place before the event is handled. That line has no position any
+	// more, the other two keep theirs, and all three still count.
+	repo := filepath.Join(home, "repo-shell-changed")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "list.txt")
+	writeFile(t, path, "one\nTWO\nthree\n")
+	deliver(t, "claude-code", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "changed-1", "cwd": repo,
+		"tool_name": "Bash", "tool_input": map[string]any{"command": "cat > " + path + " <<'EOF'\none\ntwo\nthree\nEOF"},
+	})
+	db := openDB(t)
+	wantCounts(t, db, "changed-1", [2]int64{3, 0})
+	wantRanges(t, db, "changed-1", rangeRow{1, 1}, rangeRow{3, 3})
+}
+
+func testWriteWithoutPatchFoundLowerInTheFile(t *testing.T, home string) {
+	// The same placement for a whole-file Write from an agent that reports
+	// no patch: a later edit put a line above what it wrote.
+	repo := filepath.Join(home, "repo-write-shifted")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "list.txt")
+	writeFile(t, path, "# header\nx\ny\n")
+	deliver(t, "devin", repo, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "shifted-2", "cwd": repo,
+		"tool_name": "write", "tool_input": map[string]any{"file_path": path, "content": "x\ny\n"},
+	})
+	db := openDB(t)
+	wantCounts(t, db, "shifted-2", [2]int64{2, 0})
+	wantRanges(t, db, "shifted-2", rangeRow{2, 3})
 }
 
 func testShellRewriteNotMovedOntoALaterCopy(t *testing.T, home string) {

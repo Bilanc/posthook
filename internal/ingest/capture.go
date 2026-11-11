@@ -201,6 +201,11 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 		fc.change = overwriteChange(db, &fc, after, firedAt)
 		if input.Content != "" {
 			fc.snapshotOf(after, firedAt)
+			if fc.hasPost {
+				// The ranges are positions in the content the tool wrote;
+				// put them where those lines are in the file now.
+				fc.change, fc.unlocated = placeInFile(fc.change, after, string(fc.post))
+			}
 		} else {
 			fc.snapshotFromDisk()
 		}
@@ -284,19 +289,13 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 		// previous state is new. The snapshot is the command's text, never
 		// the disk: with two rewrites queued, the disk already holds the
 		// second while the first is handled, and saving it would make the
-		// second look like it changed nothing.
+		// second look like it changed nothing. It is saved even when none
+		// of the text is in the file any more, which is exactly that case.
 		fc.change = overwriteChange(db, &fc, w.Content, firedAt)
 		fc.snapshotOf(w.Content, firedAt)
-		switch at := firstLineOf(w.Content, string(fc.post)); {
-		case at > 1 && !addedLinesInPlace(fc.change, string(fc.post)):
-			// The lines this write added are no longer where it put them,
-			// and its whole text is in the file verbatim further down:
-			// something was put above it since. Its lines sit lower by that
-			// much, and that is where a commit will find them. When the
-			// added lines are still in place the ranges are already right,
-			// and a verbatim copy lower down is somebody else's.
-			fc.change = fc.change.Shift(at - 1)
-		case at == 0 && !mostlyPresent(w.Content, string(fc.post)):
+		if post := string(fc.post); strings.Contains(post, w.Content) || mostlyPresent(w.Content, post) {
+			fc.change, fc.unlocated = placeInFile(fc.change, w.Content, post)
+		} else {
 			// Hardly any of it is in the file now: the command may not have
 			// run the redirect, or the file has been rewritten since. Count
 			// it and claim no position.
@@ -311,19 +310,39 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 	return c
 }
 
-// firstLineOf returns the 1-based line of file where written first appears
-// verbatim, or 0 when it does not. A file with CRLF line endings is matched
-// against the LF text a command spells out.
-func firstLineOf(written, file string) int {
-	at := strings.Index(file, written)
-	if at < 0 && strings.Contains(file, "\r\n") {
-		file = strings.ReplaceAll(file, "\r\n", "\n")
-		at = strings.Index(file, strings.ReplaceAll(written, "\r\n", "\n"))
+// placeInFile puts a whole-file write's ranges where its added lines sit in
+// the file as read. The ranges come from diffing the written content, so
+// they are line numbers in that content; the worker reads the file later,
+// when other edits may have moved or changed those lines, and every other
+// source places its ranges in the file as read.
+//
+// If every added line still reads the same at its recorded position, the
+// ranges stand and nothing is searched for: a copy of the text elsewhere in
+// the file is not the write. Otherwise the written content is aligned with
+// the file line by line, and each added line moves to the line it is kept
+// as. An added line that is no longer in the file gets no range and still
+// counts; unplaced reports whether there was one. When the two differ by
+// more than the diff aligns, the recorded positions are kept.
+func placeInFile(c lineranges.Change, written, file string) (placed lineranges.Change, unplaced int) {
+	if addedLinesInPlace(c, file) {
+		return c, 0
 	}
-	if at < 0 {
-		return 0
+	match, ok := lineranges.AlignLines(lineranges.Lines(written), lineranges.Lines(file))
+	if !ok {
+		return c, 0
 	}
-	return 1 + strings.Count(file[:at], "\n")
+	var lines []int
+	for _, r := range c.Ranges {
+		for n := r.StartLine; n <= r.EndLine; n++ {
+			if n <= len(match) && match[n-1] >= 0 {
+				lines = append(lines, match[n-1]+1)
+			} else {
+				unplaced = 1
+			}
+		}
+	}
+	c.Ranges = lineranges.RangesOf(lines)
+	return c, unplaced
 }
 
 // addedLinesInPlace reports whether every line the change added still reads

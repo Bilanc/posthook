@@ -158,19 +158,6 @@ func editsChange(edits []Edit, postContent string) (Change, int) {
 	return c, unlocated
 }
 
-// Shift moves every range of the change down by delta lines.
-func (c Change) Shift(delta int) Change {
-	if delta == 0 {
-		return c
-	}
-	out := c
-	out.Ranges = make([]LineRange, len(c.Ranges))
-	for i, r := range c.Ranges {
-		out.Ranges[i] = LineRange{StartLine: r.StartLine + delta, EndLine: r.EndLine + delta, NewTextLines: r.NewTextLines}
-	}
-	return out
-}
-
 // LocateApplyPatch finds each hunk of one patched file in the post-edit
 // content and returns the lines the patch added there, plus the number of
 // hunks it could not find. Every hunk's added and removed lines are in the
@@ -338,22 +325,7 @@ func diffLines(a, b []string, firstLine int) Change {
 		return c
 	}
 
-	// Longest common subsequence, filled from the end so the walk below can
-	// run forward.
-	width := n + 1
-	lcs := make([]int32, (m+1)*width)
-	for i := m - 1; i >= 0; i-- {
-		for j := n - 1; j >= 0; j-- {
-			switch {
-			case sameLine(a[i], b[j]):
-				lcs[i*width+j] = lcs[(i+1)*width+j+1] + 1
-			case lcs[(i+1)*width+j] >= lcs[i*width+j+1]:
-				lcs[i*width+j] = lcs[(i+1)*width+j]
-			default:
-				lcs[i*width+j] = lcs[i*width+j+1]
-			}
-		}
-	}
+	lcs, width := lcsTable(a, b)
 	i, j := 0, 0
 	for i < m && j < n {
 		switch {
@@ -377,6 +349,91 @@ func diffLines(a, b []string, firstLine int) Change {
 	}
 	w.flush()
 	return c
+}
+
+// lcsTable is the longest-common-subsequence table of a and b, filled from
+// the end so a walk can run forward: entry i*width+j is the length of the
+// LCS of a[i:] and b[j:].
+func lcsTable(a, b []string) (lcs []int32, width int) {
+	m, n := len(a), len(b)
+	width = n + 1
+	lcs = make([]int32, (m+1)*width)
+	for i := m - 1; i >= 0; i-- {
+		for j := n - 1; j >= 0; j-- {
+			switch {
+			case sameLine(a[i], b[j]):
+				lcs[i*width+j] = lcs[(i+1)*width+j+1] + 1
+			case lcs[(i+1)*width+j] >= lcs[i*width+j+1]:
+				lcs[i*width+j] = lcs[(i+1)*width+j]
+			default:
+				lcs[i*width+j] = lcs[i*width+j+1]
+			}
+		}
+	}
+	return lcs, width
+}
+
+// AlignLines pairs the lines of a with the lines of b the way the diff does:
+// match[i] is the index in b of the line a[i] is kept as, or -1 when the
+// diff counts a[i] as removed. Pairs never cross, and where a line could be
+// kept as more than one line of b the walk takes the earliest.
+//
+// ok is false when the part of the two that differs is larger than the diff
+// aligns (maxDiffCells). The diff then treats that part as replaced
+// wholesale, so there are no positions to read from it; only the common
+// lines at either end are paired.
+func AlignLines(a, b []string) (match []int, ok bool) {
+	match = make([]int, len(a))
+	for i := range match {
+		match[i] = -1
+	}
+	prefix := 0
+	for prefix < len(a) && prefix < len(b) && sameLine(a[prefix], b[prefix]) {
+		match[prefix] = prefix
+		prefix++
+	}
+	suffix := 0
+	for suffix < len(a)-prefix && suffix < len(b)-prefix &&
+		sameLine(a[len(a)-1-suffix], b[len(b)-1-suffix]) {
+		match[len(a)-1-suffix] = len(b) - 1 - suffix
+		suffix++
+	}
+	a = a[prefix : len(a)-suffix]
+	b = b[prefix : len(b)-suffix]
+	m, n := len(a), len(b)
+	if m == 0 || n == 0 {
+		return match, true
+	}
+	if m*n > maxDiffCells {
+		return match, false
+	}
+	lcs, width := lcsTable(a, b)
+	i, j := 0, 0
+	for i < m && j < n {
+		switch {
+		case sameLine(a[i], b[j]):
+			match[prefix+i] = prefix + j
+			i++
+			j++
+		case lcs[(i+1)*width+j] >= lcs[i*width+j+1]:
+			i++
+		default:
+			j++
+		}
+	}
+	return match, true
+}
+
+// RangesOf groups ascending 1-based line numbers into ranges of consecutive
+// lines.
+func RangesOf(lines []int) []LineRange {
+	var c Change
+	w := rangeWriter{c: &c}
+	for _, n := range lines {
+		w.add(n)
+	}
+	w.flush()
+	return c.Ranges
 }
 
 // indexUnclaimed returns the first index at or after from where needle
