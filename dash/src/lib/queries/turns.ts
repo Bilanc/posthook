@@ -46,12 +46,15 @@ export interface SessionCommit {
 // repo_id / repo_name say which repository a file is in. One session can
 // write files in several, and a repo-relative path alone (README.md) does not
 // say which. Both are null for a file outside any repository.
+// repo_root is the repository's folder on disk: two checkouts of one
+// repository (a worktree beside the main clone) share a name, not a root.
 export interface CommitFile {
   commit_id: string;
   file_path: string;
   lines_attributed: number;
   repo_id?: string | null;
   repo_name?: string | null;
+  repo_root?: string | null;
 }
 
 export interface SessionFile {
@@ -60,6 +63,7 @@ export interface SessionFile {
   lines_generated: number;
   repo_id?: string | null;
   repo_name?: string | null;
+  repo_root?: string | null;
 }
 
 export interface SessionTimelineData {
@@ -135,7 +139,8 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
 
   const commit_files = conn
     .prepare(
-      `SELECT csf.commit_id, csf.file_path, csf.lines_attributed, c.repo_id, r.name AS repo_name
+      `SELECT csf.commit_id, csf.file_path, csf.lines_attributed, c.repo_id,
+              r.name AS repo_name, r.root_path AS repo_root
        FROM commit_session_files csf
        JOIN commits c ON c.id = csf.commit_id
        LEFT JOIN repositories r ON r.id = c.repo_id
@@ -154,31 +159,50 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
       //    gives two rows.
       //  - Without a split, an edit whose line ranges sit in several files
       //    is split by each range's own path. Its row names only the first.
+      //    If the client measured it, what is left of its count after the
+      //    located lines (unplaced lines, less its rework) goes to the file
+      //    the event names, so the files still add up to the event's count.
+      //    Only builds from before the split existed wrote such rows.
       //  - Otherwise the whole count goes to one file. For an edit the
       //    client measured that is the file its range sits in, when it has
       //    one: a shell command's row names its first target, which need not
       //    be the file it measurably wrote. Else the file the event names.
-      // Without a split the repository is the event's own (events.repo_id is
-      // taken from the file's path, not from the session's folder).
+      // Without a split the repository is the event's own, and only for a
+      // file with a repo-relative path: events.repo_id falls back to the
+      // session's folder for a file that is in no repository, and that file
+      // must not be shown under it.
       `WITH edit_events AS (
          SELECT e.id,
                 e.repo_id,
+                e.rel_file_path AS event_rel,
                 e.lines_generated AS measured,
                 CASE WHEN json_valid(e.file_lines) THEN e.file_lines END AS file_lines,
                 ${FILE_EXPR} AS event_file,
                 (SELECT COALESCE(x.rel_file_path, x.file_path)
                  FROM event_line_ranges x WHERE x.event_id = e.id LIMIT 1) AS range_file,
+                (SELECT x.rel_file_path FROM event_line_ranges x
+                 WHERE x.event_id = e.id AND x.rel_file_path IS NOT NULL LIMIT 1) AS range_rel,
                 ${LINES_GENERATED} AS lines,
                 (SELECT COUNT(DISTINCT COALESCE(x.rel_file_path, x.file_path))
                  FROM event_line_ranges x WHERE x.event_id = e.id) AS range_files
          FROM events e
          WHERE e.session_id = ? AND ${AI_EDIT_EVENT_CONDITION}
        ),
-       per_event_file AS (
+       located AS (
+         SELECT ee.id,
+                MAX(CASE WHEN x.rel_file_path IS NOT NULL THEN ee.repo_id END) AS repo_id,
+                COALESCE(x.rel_file_path, x.file_path) AS f,
+                SUM(x.new_text_lines) AS lines
+         FROM edit_events ee JOIN event_line_ranges x ON x.event_id = ee.id
+         WHERE ee.file_lines IS NULL AND ee.range_files > 1
+         GROUP BY ee.id, COALESCE(x.rel_file_path, x.file_path)
+       ),
+       pieces AS (
          -- A split written before elements carried repo_id has no such key:
          -- fall back to the event's repository. A key that is there and null
          -- means the file is in no repository.
-         SELECT CASE WHEN json_type(j.value, '$.repo_id') IS NULL THEN ee.repo_id
+         SELECT ee.id,
+                CASE WHEN json_type(j.value, '$.repo_id') IS NULL THEN ee.repo_id
                      ELSE json_extract(j.value, '$.repo_id') END AS repo_id,
                 COALESCE(json_extract(j.value, '$.rel_file_path'), json_extract(j.value, '$.file_path')) AS f,
                 COALESCE(json_extract(j.value, '$.lines_generated'), 0)
@@ -186,22 +210,33 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
          FROM edit_events ee, json_each(ee.file_lines) j
          WHERE ee.file_lines IS NOT NULL
          UNION ALL
-         SELECT ee.repo_id, COALESCE(x.rel_file_path, x.file_path) AS f, SUM(x.new_text_lines) AS lines
-         FROM edit_events ee JOIN event_line_ranges x ON x.event_id = ee.id
-         WHERE ee.file_lines IS NULL AND ee.range_files > 1
-         GROUP BY ee.id, COALESCE(x.rel_file_path, x.file_path)
+         SELECT id, repo_id, f, lines FROM located
          UNION ALL
-         SELECT repo_id,
+         SELECT ee.id,
+                CASE WHEN ee.event_rel IS NOT NULL THEN ee.repo_id END AS repo_id,
+                ee.event_file AS f,
+                ee.lines - (SELECT SUM(l.lines) FROM located l WHERE l.id = ee.id) AS lines
+         FROM edit_events ee
+         WHERE ee.file_lines IS NULL AND ee.range_files > 1 AND ee.measured IS NOT NULL
+         UNION ALL
+         SELECT id,
+                CASE WHEN COALESCE(event_rel, range_rel) IS NOT NULL THEN repo_id END AS repo_id,
                 CASE WHEN measured IS NOT NULL THEN COALESCE(range_file, event_file) ELSE event_file END AS f,
                 lines
          FROM edit_events
          WHERE file_lines IS NULL AND range_files <= 1
+       ),
+       per_event_file AS (
+         -- One edit can contribute two pieces to a file; it is still one edit.
+         SELECT id, repo_id, f, SUM(lines) AS lines
+         FROM pieces
+         WHERE f IS NOT NULL
+         GROUP BY id, repo_id, f
        )
-       SELECT pf.f AS file, pf.repo_id, r.name AS repo_name,
+       SELECT pf.f AS file, pf.repo_id, r.name AS repo_name, r.root_path AS repo_root,
               COUNT(*) AS edits, MAX(COALESCE(SUM(pf.lines), 0), 0) AS lines_generated
        FROM per_event_file pf
        LEFT JOIN repositories r ON r.id = pf.repo_id
-       WHERE pf.f IS NOT NULL
        GROUP BY pf.repo_id, pf.f
        ORDER BY lines_generated DESC, edits DESC`,
     )

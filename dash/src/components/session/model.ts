@@ -30,6 +30,7 @@ export function ms(iso: string | null | undefined): number {
 // ---- Files: generated vs committed -------------------------------------
 
 export interface FileRow {
+  key: string; // repository and path: unique per row, unlike the label
   path: string;
   generated: number; // lines the agent wrote, floored at the committed count
   committed: number; // lines from this session that landed in a commit
@@ -51,28 +52,45 @@ export function fileRows(
   commits: SessionCommit[],
 ): FileSummary {
   // A file is a path in a repository: one session can write README.md in two
-  // repositories, and those are two files. The repository name is shown in
-  // front of the path only when the session's files span more than one, so a
+  // repositories, and those are two files. The repository is shown in front
+  // of the path only when the session's files span more than one, so a
   // single-repository session reads exactly as it always has.
-  const repos = new Set<string>();
-  for (const f of files) if (f.repo_id) repos.add(f.repo_id);
-  for (const c of commitFiles) if (c.repo_id) repos.add(c.repo_id);
-  const label = (path: string, repoId?: string | null, repoName?: string | null) =>
-    repos.size > 1 && repoId ? `${repoName || repoId}/${path}` : path;
+  const repos = new Map<string, { name: string; root: string }>();
+  for (const f of [...files, ...commitFiles]) {
+    if (f.repo_id && !repos.has(f.repo_id)) {
+      repos.set(f.repo_id, { name: f.repo_name || f.repo_id, root: f.repo_root || "" });
+    }
+  }
+  // What to call each repository: its name, unless another of the session's
+  // repositories has the same one (a worktree beside the main clone shares
+  // the remote's name). Then the folder it lives in, then the whole path.
+  const base = (root: string) => root.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || root;
+  const shared = (pick: (r: { name: string; root: string }) => string) => {
+    const seen = new Map<string, number>();
+    for (const r of repos.values()) seen.set(pick(r), (seen.get(pick(r)) ?? 0) + 1);
+    return (v: string) => (seen.get(v) ?? 0) > 1;
+  };
+  const nameShared = shared((r) => r.name);
+  const folderShared = shared((r) => base(r.root));
+  const repoLabel = (repoId: string) => {
+    const r = repos.get(repoId);
+    if (!r) return repoId;
+    if (!nameShared(r.name)) return r.name;
+    if (r.root && !folderShared(base(r.root))) return base(r.root);
+    return r.root || repoId;
+  };
+  const label = (path: string, repoId?: string | null) =>
+    repos.size > 1 && repoId ? `${repoLabel(repoId)}/${path}` : path;
   const key = (path: string, repoId?: string | null) => `${repoId ?? ""}\u0000${path}`;
 
   const by = new Map<string, FileRow>();
   for (const f of files) {
-    by.set(key(f.file, f.repo_id), {
-      path: label(f.file, f.repo_id, f.repo_name),
-      generated: f.lines_generated,
-      committed: 0,
-      edits: f.edits,
-    });
+    const k = key(f.file, f.repo_id);
+    by.set(k, { key: k, path: label(f.file, f.repo_id), generated: f.lines_generated, committed: 0, edits: f.edits });
   }
   for (const c of commitFiles) {
     const k = key(c.file_path, c.repo_id);
-    const row = by.get(k) ?? { path: label(c.file_path, c.repo_id, c.repo_name), generated: 0, committed: 0, edits: 0 };
+    const row = by.get(k) ?? { key: k, path: label(c.file_path, c.repo_id), generated: 0, committed: 0, edits: 0 };
     row.committed += c.lines_attributed;
     by.set(k, row);
   }

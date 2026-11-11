@@ -34,7 +34,10 @@ const dbPath = installFixture();
 // recorded it: the row names a.go, the one range is in b.go.
 //
 // Session T: writes README.md in two repositories, first with one Write
-// each, then with one patch that touches both.
+// each, then with one patch that touches both; and a note outside any
+// repository, whose event row still carries the session folder's repository.
+// Session U: a measured patch with no split, ranges of 4 lines in a.go and 2
+// in b.go, that also reworked 2 of the session's lines.
 //
 // An event whose counts are not all its own row's file carries the split in
 // events.file_lines.
@@ -152,12 +155,21 @@ const dbPath = installFixture();
       ('t2', 'T', '2026-10-25T10:00:20Z', 'PostToolUse', 'codex', 'r2', 'README.md', '/tmp/other/README.md', NULL, 2, 0,
         '${post("Write", { content: "x" })}'),
       ('t3', 'T', '2026-10-25T10:00:30Z', 'PostToolUse', 'codex', 'r1', 'README.md', '/tmp/demo/README.md', 5, 5, 0,
+        '${post("apply_patch", { command: "*** Begin Patch" })}'),
+      ('t4', 'T', '2026-10-25T10:00:40Z', 'PostToolUse', 'codex', 'r1', NULL, '/tmp/notes.md', NULL, 0, 0,
+        '${post("Write", { content: "x" })}');
+    INSERT INTO sessions (id, agent_slug, model_slug, repo_id, branch, started_at, ended_at)
+    VALUES ('U', 'codex', 'gpt-6', 'r1', 'main', '2026-10-26T10:00:00Z', '2026-10-26T10:10:00Z');
+    INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, file_path, lines_added, lines_generated, lines_reworked, payload) VALUES
+      ('u1', 'U', '2026-10-26T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 6, 6, 2,
         '${post("apply_patch", { command: "*** Begin Patch" })}');
     INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, start_line, end_line, new_text_lines) VALUES
       ('r-t1', 't1', '/tmp/demo/README.md', 'README.md', 1, 3, 3),
       ('r-t2', 't2', '/tmp/other/README.md', 'README.md', 1, 2, 2),
       ('r-t3a', 't3', '/tmp/demo/README.md', 'README.md', 4, 4, 1),
-      ('r-t3b', 't3', '/tmp/other/README.md', 'README.md', 3, 6, 4);
+      ('r-t3b', 't3', '/tmp/other/README.md', 'README.md', 3, 6, 4),
+      ('r-u1a', 'u1', '/tmp/demo/a.go', 'a.go', 1, 4, 4),
+      ('r-u1b', 'u1', '/tmp/demo/b.go', 'b.go', 1, 2, 2);
     UPDATE events SET file_lines = '${J([
       { repo_id: "r1", rel_file_path: "README.md", file_path: "/tmp/demo/README.md", lines_generated: 1, lines_reworked: 0 },
       { repo_id: "r2", rel_file_path: "README.md", file_path: "/tmp/other/README.md", lines_generated: 4, lines_reworked: 0 },
@@ -277,13 +289,30 @@ test("the same path in two repositories is two files", () => {
   assert.deepEqual(files, [
     ["other", "README.md", 2, 6],
     ["demo", "README.md", 2, 4],
+    // Outside every repository: the event row names the session folder's
+    // repository, and the file must not be put under it.
+    [null, "/tmp/notes.md", 1, 0],
   ]);
   assert.equal(getSessionDetail("T")?.lines_generated, 10);
 });
 
-test("a single-repository session carries its one repository on every row", () => {
-  const repos = new Set(sessionTimelineData("F").files.map((r) => r.repo_name));
-  assert.deepEqual([...repos], ["demo"]);
+test("only files with a repo-relative path are in the event's repository", () => {
+  const rows = sessionTimelineData("F").files;
+  const inRepo = rows.filter((r) => !r.file.startsWith("/"));
+  assert.ok(inRepo.length > 0 && inRepo.every((r) => r.repo_name === "demo" && r.repo_root === "/tmp/demo"));
+  const outside = rows.find((r) => r.file === "/home/dev/plan.md");
+  assert.equal(outside?.repo_id, null);
+});
+
+test("a measured edit with no split keeps its count when its ranges span files", () => {
+  const files = Object.fromEntries(
+    sessionTimelineData("U").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
+  );
+  // 6 written and 2 reworked: the located lines go to their files, and the
+  // rest of the event's count (here the rework) to the file its row names.
+  // Summing the ranges alone would say 6 for a session that nets 4.
+  assert.deepEqual(files, { "a.go": [1, 2], "b.go": [1, 2] });
+  assert.equal(getSessionDetail("U")?.lines_generated, 4);
 });
 
 test("an older client's multi-file patch is still split by its ranges", () => {
@@ -294,7 +323,7 @@ test("an older client's multi-file patch is still split by its ranges", () => {
 });
 
 test("the files of a session add up to its total", () => {
-  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S", "T"]) {
+  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S", "T", "U"]) {
     const sum = sessionTimelineData(id).files.reduce((n, r) => n + r.lines_generated, 0);
     assert.equal(sum, getSessionDetail(id)?.lines_generated, `session ${id}`);
   }
