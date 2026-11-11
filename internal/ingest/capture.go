@@ -567,6 +567,7 @@ func (c *editCapture) reworkedArg() sql.NullInt64 {
 // fileLines is one file's share of an event that wrote several, as stored
 // in events.file_lines.
 type fileLines struct {
+	RepoID         *string `json:"repo_id"`
 	RelFilePath    *string `json:"rel_file_path"`
 	FilePath       string  `json:"file_path"`
 	LinesGenerated int     `json:"lines_generated"`
@@ -586,11 +587,18 @@ type fileLines struct {
 // (outside the repo, ignored) is listed with zeros; the elements add up to
 // the event's two counts. A reader can therefore rely on this: no split
 // means the event's own file has all of it.
-func (c *editCapture) fileLinesArg(eventPath string) sql.NullString {
+//
+// Each element also names its file's repository (repo_id, the repositories
+// row for the root the file is in; null for a file in none). One command can
+// write files in several repositories, and a repo-relative path alone does
+// not say which README.md is meant. eventRoot and eventRepoID are the event
+// row's own repository, so the usual case costs no lookup.
+func (c *editCapture) fileLinesArg(db *store.DB, eventPath, eventRoot string, eventRepoID sql.NullString) sql.NullString {
 	if c == nil {
 		return sql.NullString{}
 	}
 	var files []fileLines
+	var roots []string
 	index := map[string]int{}
 	for i := range c.files {
 		fc := &c.files[i]
@@ -604,6 +612,7 @@ func (c *editCapture) fileLinesArg(eventPath string) sql.NullString {
 				entry.RelFilePath = &rel
 			}
 			files = append(files, entry)
+			roots = append(roots, fc.root)
 		}
 		files[at].LinesGenerated += fc.generated
 		files[at].LinesReworked += fc.reworked
@@ -611,6 +620,27 @@ func (c *editCapture) fileLinesArg(eventPath string) sql.NullString {
 	if len(files) == 0 || (len(files) == 1 && files[0].FilePath == eventPath) {
 		return sql.NullString{}
 	}
+
+	repoIDs := map[string]*string{}
+	for i, root := range roots {
+		if root == "" {
+			continue
+		}
+		id, known := repoIDs[root]
+		if !known {
+			if root == eventRoot && eventRepoID.Valid {
+				v := eventRepoID.String
+				id = &v
+			} else if got, err := upsertRepositoryByCwd(db, root); err == nil {
+				id = &got
+			} else {
+				logx.Debugf("file_lines: no repository row for %s: %v", root, err)
+			}
+			repoIDs[root] = id
+		}
+		files[i].RepoID = id
+	}
+
 	encoded, err := json.Marshal(files)
 	if err != nil {
 		return sql.NullString{}

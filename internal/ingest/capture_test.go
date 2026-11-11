@@ -189,6 +189,7 @@ func TestExactCapture(t *testing.T) {
 	t.Run("a patch-less write found lower in the file points there", func(t *testing.T) { testWriteWithoutPatchFoundLowerInTheFile(t, home) })
 	t.Run("a shell rewrite is not moved onto a later copy of its text", func(t *testing.T) { testShellRewriteNotMovedOntoALaterCopy(t, home) })
 	t.Run("a shell event whose row names another file records the split", func(t *testing.T) { testShellSplitWhenRowNamesAnotherFile(t, home) })
+	t.Run("the split names each file's repository", func(t *testing.T) { testFileLinesNameEachFilesRepository(t, home) })
 	t.Run("write without a patch diffs against HEAD, then the last copy", func(t *testing.T) { testWriteWithoutPatch(t, home) })
 	t.Run("files outside a repo or ignored count for nothing", func(t *testing.T) { testUncountableFiles(t, home) })
 	t.Run("shell heredoc rewrite counts only the changed line", func(t *testing.T) { testShellRewrite(t, home) })
@@ -565,6 +566,77 @@ func testShellRewriteNotMovedOntoALaterCopy(t *testing.T, home string) {
 	db := openDB(t)
 	wantCounts(t, db, "copy-1", [2]int64{1, 0})
 	wantRanges(t, db, "copy-1", rangeRow{1, 1})
+}
+
+func testFileLinesNameEachFilesRepository(t *testing.T, home string) {
+	// One patch writes README.md in two repositories, and a scratch file in
+	// none. The repo-relative path is the same for both READMEs; only the
+	// repository on each element tells them apart.
+	repoA := filepath.Join(home, "repo-multi-a")
+	repoB := filepath.Join(home, "repo-multi-b")
+	initRepo(t, repoA)
+	initRepo(t, repoB)
+	readmeA := filepath.Join(repoA, "README.md")
+	readmeB := filepath.Join(repoB, "README.md")
+	scratch := filepath.Join(home, "scratch-multi", "notes.md")
+	writeFile(t, readmeA, "# a\n")
+	writeFile(t, readmeB, "# b\nmore\n")
+	writeFile(t, scratch, "note\n")
+	deliver(t, "codex", repoA, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "repos-1", "cwd": repoA,
+		"tool_name": "apply_patch", "tool_input": map[string]any{"command": "*** Begin Patch\n" +
+			"*** Add File: " + readmeA + "\n+# a\n" +
+			"*** Add File: " + readmeB + "\n+# b\n+more\n" +
+			"*** Add File: " + scratch + "\n+note\n" +
+			"*** End Patch\n"},
+	})
+
+	db := openDB(t)
+	wantCounts(t, db, "repos-1", [2]int64{3, 0})
+	split := fileLinesForSession(t, db, "repos-1")
+	if len(split) != 1 || len(split[0]) != 3 {
+		t.Fatalf("file_lines = %+v, want one event with three files", split)
+	}
+	repoOf := func(root string) string {
+		t.Helper()
+		var id string
+		if err := db.QueryRow(`SELECT id FROM repositories WHERE root_path = ?`, gitxCanonical(t, root)).Scan(&id); err != nil {
+			t.Fatalf("no repositories row for %s: %v", root, err)
+		}
+		return id
+	}
+	a, b, none := split[0][0], split[0][1], split[0][2]
+	if a.RepoID == nil || *a.RepoID != repoOf(repoA) || a.RelFilePath == nil || *a.RelFilePath != "README.md" || a.LinesGenerated != 1 {
+		t.Errorf("first README: %+v", a)
+	}
+	if b.RepoID == nil || *b.RepoID != repoOf(repoB) || b.RelFilePath == nil || *b.RelFilePath != "README.md" || b.LinesGenerated != 2 {
+		t.Errorf("second README: %+v", b)
+	}
+	if a.RepoID != nil && b.RepoID != nil && *a.RepoID == *b.RepoID {
+		t.Error("both READMEs carry the same repository")
+	}
+	if none.RepoID != nil || none.RelFilePath != nil || none.LinesGenerated != 0 {
+		t.Errorf("scratch file: %+v", none)
+	}
+	// The event row itself names the first file's repository.
+	var eventRepo sql.NullString
+	if err := db.QueryRow(`SELECT repo_id FROM events WHERE session_id = 'repos-1'`).Scan(&eventRepo); err != nil {
+		t.Fatal(err)
+	}
+	if eventRepo.String != repoOf(repoA) {
+		t.Errorf("event repo %q, want the first file's", eventRepo.String)
+	}
+}
+
+// gitxCanonical resolves symlinks the way ingest does before it stores a
+// repository's root (macOS temp directories live behind /private).
+func gitxCanonical(t *testing.T, path string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
 }
 
 func testShellSplitWhenRowNamesAnotherFile(t *testing.T, home string) {
