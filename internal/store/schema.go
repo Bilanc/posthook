@@ -37,7 +37,16 @@ const LocalOrgID = "local"
 // session_file_lines. Events recorded before v15 keep NULL in both columns
 // and are scored the old way wherever lines are summed. No backfill: the
 // before-content an exact diff needs was never stored for them.
-const schemaVersion = 15
+//
+// v16 finishes that work, for two things that changed while v15 was still
+// unreleased. It adds events.file_lines, the per-file split of an edit that
+// wrote several files. And it rebuilds file_snapshots where a pre-release
+// v15 build created it holding a gzip copy of each file: the table now keeps
+// a fingerprint per line, and a database already at 15 would never have been
+// migrated again. The old rows are discarded, not converted: they are
+// working state, and the next whole-file write of such a file is diffed
+// against HEAD (or counted whole) once.
+const schemaVersion = 16
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
@@ -56,6 +65,15 @@ var SyncableTables = []string{
 	"event_line_ranges",
 	"session_prompts",
 }
+
+// fileSnapshotsDDL is shared with the v16 migration, which recreates the
+// table. updated_at is the instant the snapshot's content was true; a NULL
+// or empty line_hashes is an empty file.
+const fileSnapshotsDDL = `CREATE TABLE IF NOT EXISTS file_snapshots (
+  file_path TEXT PRIMARY KEY,
+  line_hashes BLOB,
+  updated_at TEXT NOT NULL
+);`
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -112,7 +130,8 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT,
   synced_at TEXT,
   lines_generated INTEGER,
-  lines_reworked INTEGER
+  lines_reworked INTEGER,
+  file_lines TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_org_ts ON events(org_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
@@ -216,14 +235,8 @@ CREATE INDEX IF NOT EXISTS idx_session_prompts_session ON session_prompts(sessio
 CREATE INDEX IF NOT EXISTS idx_session_prompts_synced ON session_prompts(synced_at);
 
 -- Local working state for exact edit capture (editstate.go). Never synced.
--- Both hold 8-byte line fingerprints, no file content. file_snapshots:
--- updated_at is the instant the snapshot's content was true; a NULL or
--- empty line_hashes is an empty file.
-CREATE TABLE IF NOT EXISTS file_snapshots (
-  file_path TEXT PRIMARY KEY,
-  line_hashes BLOB,
-  updated_at TEXT NOT NULL
-);
+-- Both hold 8-byte line fingerprints, no file content.
+` + fileSnapshotsDDL + `
 CREATE TABLE IF NOT EXISTS session_file_lines (
   session_id TEXT NOT NULL,
   file_path TEXT NOT NULL,

@@ -134,6 +134,30 @@ func (db *DB) applyMigrations() error {
 			}
 		}
 	}
+
+	// v16: the per-file split of an edit that wrote several files.
+	if !eventColsV15["file_lines"] {
+		if _, err := db.Exec(`ALTER TABLE events ADD COLUMN file_lines TEXT`); err != nil {
+			return err
+		}
+	}
+	// v16: a pre-release v15 build created file_snapshots with a gzip copy
+	// of each file (a `content` column). schemaSQL's CREATE IF NOT EXISTS
+	// leaves such a table as it is, and every read and write of line_hashes
+	// would then fail. The rows are working state: drop them and start the
+	// table again in the fingerprint layout.
+	snapshotCols, err := db.columnSet("file_snapshots")
+	if err != nil {
+		return err
+	}
+	if len(snapshotCols) > 0 && !snapshotCols["line_hashes"] {
+		if _, err := db.Exec(`DROP TABLE file_snapshots`); err != nil {
+			return err
+		}
+		if _, err := db.Exec(fileSnapshotsDDL); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

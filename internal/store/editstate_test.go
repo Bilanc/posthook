@@ -164,19 +164,33 @@ func TestEditStateTablesAreNotSynced(t *testing.T) {
 	}
 }
 
-func TestMigrationAddsLineCountColumnsToAnOlderDatabase(t *testing.T) {
-	// A database as v14 left it: an events table without the two columns.
+// oldEventsTail and newEventsTail are the end of the events DDL before and
+// after the measured-line columns, for building a database as an older
+// release left it.
+const newEventsTail = ",\n  lines_generated INTEGER,\n  lines_reworked INTEGER,\n  file_lines TEXT\n);"
+
+func openBareDB(t *testing.T, ddl string) *DB {
+	t.Helper()
 	sqlDB, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "old.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { sqlDB.Close() })
 	db := &DB{DB: sqlDB}
-	mustExec(t, db, strings.Replace(schemaSQL, ",\n  lines_generated INTEGER,\n  lines_reworked INTEGER\n);", "\n);", 1))
-	cols, err := db.columnSet("events")
-	if err != nil || cols["lines_generated"] || cols["lines_reworked"] {
-		t.Fatalf("test setup: the old schema should lack the columns (cols=%v err=%v)", cols, err)
+	mustExec(t, db, ddl)
+	return db
+}
+
+func TestMigrationFromV14AddsTheMeasuredLineColumns(t *testing.T) {
+	// A database as v14 left it: an events table without the columns, and
+	// neither working table.
+	if !strings.Contains(schemaSQL, newEventsTail) {
+		t.Fatal("test setup: the events DDL no longer ends the way this test expects")
 	}
+	ddl := strings.Replace(schemaSQL, newEventsTail, "\n);", 1)
+	db := openBareDB(t, ddl)
+	mustExec(t, db, `DROP TABLE file_snapshots`)
+	mustExec(t, db, `DROP TABLE session_file_lines`)
 	mustExec(t, db, `INSERT INTO events (id, ts, event_type, agent_slug, lines_added) VALUES ('old', '2026-01-01T00:00:00Z', 'PostToolUse', 'codex', 7)`)
 	mustExec(t, db, `INSERT INTO schema_version (version) VALUES (14)`)
 
@@ -186,16 +200,74 @@ func TestMigrationAddsLineCountColumnsToAnOlderDatabase(t *testing.T) {
 	if v := db.currentSchemaVersion(); v != schemaVersion {
 		t.Fatalf("schema version %d, want %d", v, schemaVersion)
 	}
-	// The old event keeps NULL in both: it was never measured.
+	// The old event keeps NULL in all three: it was never measured.
 	var generated, reworked sql.NullInt64
+	var fileLines sql.NullString
 	var linesAdded int
-	mustQueryRow(t, db, `SELECT lines_generated, lines_reworked, lines_added FROM events WHERE id = 'old'`, nil, &generated, &reworked, &linesAdded)
-	if generated.Valid || reworked.Valid || linesAdded != 7 {
-		t.Errorf("old event: generated=%v reworked=%v lines_added=%d", generated, reworked, linesAdded)
+	mustQueryRow(t, db, `SELECT lines_generated, lines_reworked, file_lines, lines_added FROM events WHERE id = 'old'`, nil, &generated, &reworked, &fileLines, &linesAdded)
+	if generated.Valid || reworked.Valid || fileLines.Valid || linesAdded != 7 {
+		t.Errorf("old event: generated=%v reworked=%v file_lines=%v lines_added=%d", generated, reworked, fileLines, linesAdded)
 	}
+	assertSnapshotTableUsable(t, db)
 	// The column guards are safe to run again (Open gates migrate() itself
 	// on the version, so it is not called twice).
 	if err := db.applyMigrations(); err != nil {
 		t.Fatalf("second applyMigrations: %v", err)
+	}
+}
+
+func TestMigrationFromPreReleaseV15RebuildsTheSnapshotTable(t *testing.T) {
+	// A database that ran an early build of v15: the two line-count columns
+	// are there, file_lines is not, and file_snapshots holds file copies.
+	ddl := strings.Replace(schemaSQL, ",\n  file_lines TEXT\n);", "\n);", 1)
+	ddl = strings.Replace(ddl, fileSnapshotsDDL, `CREATE TABLE IF NOT EXISTS file_snapshots (
+  file_path TEXT PRIMARY KEY,
+  content BLOB NOT NULL,
+  updated_at TEXT NOT NULL
+);`, 1)
+	db := openBareDB(t, ddl)
+	cols, err := db.columnSet("file_snapshots")
+	if err != nil || !cols["content"] || cols["line_hashes"] {
+		t.Fatalf("test setup: expected the old snapshot layout (cols=%v err=%v)", cols, err)
+	}
+	mustExec(t, db, `INSERT INTO file_snapshots (file_path, content, updated_at) VALUES ('/repo/a.go', x'1f8b0800', '2026-11-10T10:00:00Z')`)
+	mustExec(t, db, `INSERT INTO events (id, ts, event_type, agent_slug, lines_generated, lines_reworked) VALUES ('e', '2026-11-10T10:00:00Z', 'PostToolUse', 'codex', 4, 1)`)
+	mustExec(t, db, `INSERT INTO schema_version (version) VALUES (15)`)
+
+	if err := db.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if v := db.currentSchemaVersion(); v != schemaVersion {
+		t.Fatalf("schema version %d, want %d", v, schemaVersion)
+	}
+	cols, err = db.columnSet("file_snapshots")
+	if err != nil || cols["content"] || !cols["line_hashes"] {
+		t.Fatalf("file_snapshots was not rebuilt (cols=%v err=%v)", cols, err)
+	}
+	// The file copy is gone, not carried over.
+	if _, _, ok := db.FileSnapshot("/repo/a.go"); ok {
+		t.Error("an old snapshot row survived the rebuild")
+	}
+	assertSnapshotTableUsable(t, db)
+	// Measured counts already recorded are kept, and the new column is there.
+	var generated, reworked int
+	var fileLines sql.NullString
+	mustQueryRow(t, db, `SELECT lines_generated, lines_reworked, file_lines FROM events WHERE id = 'e'`, nil, &generated, &reworked, &fileLines)
+	if generated != 4 || reworked != 1 || fileLines.Valid {
+		t.Errorf("event: generated=%d reworked=%d file_lines=%v", generated, reworked, fileLines)
+	}
+}
+
+func assertSnapshotTableUsable(t *testing.T, db *DB) {
+	t.Helper()
+	want := []uint64{LineHash("a"), LineHash("b")}
+	if err := db.SaveFileSnapshot("/repo/new.go", want, time.Now()); err != nil {
+		t.Fatalf("save after migration: %v", err)
+	}
+	if got, _, ok := db.FileSnapshot("/repo/new.go"); !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("read after migration: %v ok=%v", got, ok)
+	}
+	if err := db.SaveSessionFileLines("s", "/repo/new.go", want); err != nil {
+		t.Fatalf("ledger after migration: %v", err)
 	}
 }

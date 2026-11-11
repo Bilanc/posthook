@@ -274,12 +274,12 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		INSERT INTO events (
 			id, org_id, session_id, ts, event_type, agent_slug, cwd,
 			file_path, repo_id, rel_file_path, lines_added, lines_removed, payload,
-			lines_generated, lines_reworked
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			lines_generated, lines_reworked, file_lines
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, store.LocalOrgID, sessIDArg, ts, eventType, agentSlug, cwd,
 		nullableString(finalFilePath), repoID, relFilePath,
 		patchLinesAdded, patchLinesRemoved, string(stored),
-		capture.generatedArg(), capture.reworkedArg())
+		capture.generatedArg(), capture.reworkedArg(), capture.fileLinesArg())
 	if err != nil {
 		return err
 	}

@@ -92,8 +92,11 @@ type fileCapture struct {
 	snapshotAsOf  time.Time
 	snapshotBytes int
 
-	// lines is the session's ledger for this file after this event; set by
-	// score.
+	// generated and reworked are this file's share of the event's counts,
+	// and lines the session's ledger for the file after the event. All set
+	// by score.
+	generated int
+	reworked  int
 	lines     []uint64
 	saveLines bool
 }
@@ -404,7 +407,8 @@ func (c *editCapture) score(db *store.DB, sessionID string) {
 		if !fc.countable {
 			continue
 		}
-		c.generated += fc.change.LinesAdded()
+		fc.generated = fc.change.LinesAdded()
+		c.generated += fc.generated
 		if sessionID == "" {
 			continue
 		}
@@ -425,6 +429,7 @@ func (c *editCapture) score(db *store.DB, sessionID string) {
 				}
 				if rework > 0 {
 					drop[h] = rework
+					fc.reworked += rework
 					c.reworked += rework
 				}
 			}
@@ -497,6 +502,54 @@ func (c *editCapture) reworkedArg() sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: int64(c.reworked), Valid: true}
+}
+
+// fileLines is one file's share of an event that wrote several, as stored
+// in events.file_lines.
+type fileLines struct {
+	RelFilePath    *string `json:"rel_file_path"`
+	FilePath       string  `json:"file_path"`
+	LinesGenerated int     `json:"lines_generated"`
+	LinesReworked  int     `json:"lines_reworked"`
+}
+
+// fileLinesArg is events.file_lines: NULL unless the event wrote more than
+// one file, otherwise a JSON array with one element per file, in the order
+// the event wrote them. lines_generated and lines_reworked on the event are
+// one number each, and its row names a single path, so without this a
+// reader cannot say which file an edit's lines or its rework belong to. A
+// file that counts for nothing (outside the repo, ignored) is listed with
+// zeros; the elements add up to the event's two counts.
+func (c *editCapture) fileLinesArg() sql.NullString {
+	if c == nil {
+		return sql.NullString{}
+	}
+	var files []fileLines
+	index := map[string]int{}
+	for i := range c.files {
+		fc := &c.files[i]
+		at, seen := index[fc.path]
+		if !seen {
+			at = len(files)
+			index[fc.path] = at
+			entry := fileLines{FilePath: fc.path}
+			if fc.rel.Valid {
+				rel := fc.rel.String
+				entry.RelFilePath = &rel
+			}
+			files = append(files, entry)
+		}
+		files[at].LinesGenerated += fc.generated
+		files[at].LinesReworked += fc.reworked
+	}
+	if len(files) < 2 {
+		return sql.NullString{}
+	}
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: string(encoded), Valid: true}
 }
 
 // hashLines fingerprints each line of text.

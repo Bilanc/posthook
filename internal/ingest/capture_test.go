@@ -62,6 +62,34 @@ func countsForSession(t *testing.T, db *store.DB, sessionID string) []eventCount
 	return out
 }
 
+// fileLinesForSession returns the decoded events.file_lines of the session's
+// events in ingest order; nil where the column is NULL.
+func fileLinesForSession(t *testing.T, db *store.DB, sessionID string) [][]fileLines {
+	t.Helper()
+	rows, err := db.Query(`SELECT file_lines FROM events WHERE session_id = ? ORDER BY rowid`, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out [][]fileLines
+	for rows.Next() {
+		var raw sql.NullString
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if !raw.Valid {
+			out = append(out, nil)
+			continue
+		}
+		var files []fileLines
+		if err := json.Unmarshal([]byte(raw.String), &files); err != nil {
+			t.Fatalf("file_lines is not JSON: %v: %s", err, raw.String)
+		}
+		out = append(out, files)
+	}
+	return out
+}
+
 // wantCounts asserts the session's events carry exactly these
 // (generated, reworked) pairs.
 func wantCounts(t *testing.T, db *store.DB, sessionID string, want ...[2]int64) {
@@ -160,6 +188,7 @@ func TestExactCapture(t *testing.T) {
 	t.Run("files outside a repo or ignored count for nothing", func(t *testing.T) { testUncountableFiles(t, home) })
 	t.Run("shell heredoc rewrite counts only the changed line", func(t *testing.T) { testShellRewrite(t, home) })
 	t.Run("apply_patch: per-file ranges, out-of-repo file left out", func(t *testing.T) { testApplyPatchFiles(t, home) })
+	t.Run("a patch across files records each file's lines and rework", func(t *testing.T) { testFileLinesSplitReworkByFile(t, home) })
 	t.Run("an edit that can no longer be placed still counts", func(t *testing.T) { testUnlocatedEdit(t, home) })
 	t.Run("cursor afterFileEdit diffs its old and new strings", func(t *testing.T) { testCursorAfterFileEdit(t, home) })
 	t.Run("non-edit events carry no counts", func(t *testing.T) { testNonEditEvent(t, home) })
@@ -620,6 +649,64 @@ func testApplyPatchFiles(t *testing.T, home string) {
 	}
 	if linesAdded.Int64 != 10 {
 		t.Errorf("lines_added = %d, want the patch's own 10", linesAdded.Int64)
+	}
+	// Two files written, so the event says which got what: all eight lines
+	// are the repo file's, and the scratch file is listed with nothing.
+	split := fileLinesForSession(t, db, "patch-1")
+	if len(split) != 1 || len(split[0]) != 2 {
+		t.Fatalf("file_lines = %+v, want one event with two files", split)
+	}
+	first, second := split[0][0], split[0][1]
+	if first.RelFilePath == nil || *first.RelFilePath != "Question.php" || first.LinesGenerated != 8 || first.LinesReworked != 0 {
+		t.Errorf("repo file: %+v", first)
+	}
+	if second.RelFilePath != nil || !strings.HasSuffix(second.FilePath, "notes.md") || second.LinesGenerated != 0 || second.LinesReworked != 0 {
+		t.Errorf("scratch file: %+v", second)
+	}
+}
+
+func testFileLinesSplitReworkByFile(t *testing.T, home string) {
+	repo := filepath.Join(home, "repo-file-lines")
+	initRepo(t, repo)
+	aPath := filepath.Join(repo, "a.go")
+	bPath := filepath.Join(repo, "b.go")
+	writeFile(t, aPath, "package a\n")
+	gitIn(t, repo, "add", ".")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+	patch := func(body string) {
+		deliver(t, "codex", repo, map[string]any{
+			"hook_event_name": "PostToolUse", "session_id": "split-1", "cwd": repo,
+			"tool_name": "apply_patch", "tool_input": map[string]any{"command": "*** Begin Patch\n" + body + "*** End Patch\n"},
+		})
+	}
+
+	// The session writes b.go: one file, so no split is recorded.
+	writeFile(t, bPath, "package b\n\nfunc B() {}\n")
+	patch("*** Add File: " + bPath + "\n+package b\n+\n+func B() {}\n")
+
+	// One patch then adds two lines to a.go and rewrites one of the
+	// session's own lines in b.go. The event's totals are 3 generated and 1
+	// reworked; only the split can say the rework was in b.go.
+	writeFile(t, aPath, "package a\n\nfunc A() {}\n")
+	writeFile(t, bPath, "package b\n\nfunc B() int { return 1 }\n")
+	patch("*** Update File: " + aPath + "\n@@\n package a\n+\n+func A() {}\n" +
+		"*** Update File: " + bPath + "\n@@\n-func B() {}\n+func B() int { return 1 }\n")
+
+	db := openDB(t)
+	wantCounts(t, db, "split-1", [2]int64{3, 0}, [2]int64{3, 1})
+	split := fileLinesForSession(t, db, "split-1")
+	if len(split) != 2 || split[0] != nil || len(split[1]) != 2 {
+		t.Fatalf("file_lines = %+v, want NULL then two files", split)
+	}
+	a, b := split[1][0], split[1][1]
+	if a.RelFilePath == nil || *a.RelFilePath != "a.go" || a.LinesGenerated != 2 || a.LinesReworked != 0 {
+		t.Errorf("a.go: %+v", a)
+	}
+	if b.RelFilePath == nil || *b.RelFilePath != "b.go" || b.LinesGenerated != 1 || b.LinesReworked != 1 {
+		t.Errorf("b.go: %+v", b)
+	}
+	if a.LinesGenerated+b.LinesGenerated != 3 || a.LinesReworked+b.LinesReworked != 1 {
+		t.Errorf("the files do not add up to the event's 3 generated and 1 reworked: %+v %+v", a, b)
 	}
 }
 

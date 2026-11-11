@@ -104,7 +104,7 @@ This is what powers the "AI lines committed" and "AI code %" figures in `posthoo
 - `apply_patch` hunks are placed by their context lines, so a one-line hunk lands where the patch put it, not on the first line of the file with the same text.
 - A file outside any git repository, or one git ignores, counts for nothing: it can never reach a commit.
 
-The count is stored on the event (`events.lines_generated`), along with how many of the lines that edit removed were the same session's earlier work (`events.lines_reworked`). A removed line counts as rework only when it cannot have been someone else's: deleting a blank line the file had before the session wrote one of its own subtracts nothing. "Lines generated" everywhere is the first minus the second, so a session's total is the lines it has standing, not the churn it took to get there. Events recorded before this was measured keep the older estimate.
+The count is stored on the event (`events.lines_generated`), along with how many of the lines that edit removed were the same session's earlier work (`events.lines_reworked`). A removed line counts as rework only when it cannot have been someone else's: deleting a blank line the file had before the session wrote one of its own subtracts nothing. "Lines generated" everywhere is the first minus the second, so a session's total is the lines it has standing, not the churn it took to get there. An edit that wrote several files (an `apply_patch` across files) also records each file's share of both numbers (`events.file_lines`), so per-file figures are exact and net of rework too. Events recorded before this was measured keep the older estimate.
 
 ### How the git shadow works
 
