@@ -14,6 +14,9 @@ const dbPath = installFixture();
 //   f3  Write  ~/plan.md  40 lines outside the repo                           -> 0
 //   f4  apply_patch across src/g.ts (4 lines) and src/h.ts (2 lines)          -> 6
 //   f5  Bash   src/k.sh   3 lines measured, but no position (text had moved)  -> 3
+//
+// Session G: one apply_patch that names a.go first. Its 3 lines there could
+// not be placed; its 2 lines in b.go could.
 {
   const J = (o: unknown) => JSON.stringify(o).replaceAll("'", "''");
   const post = (tool: string, input: Record<string, unknown>) =>
@@ -38,6 +41,13 @@ const dbPath = installFixture();
       ('r-f2', 'f2', '/tmp/demo/src/f.ts', 'src/f.ts', 3, 4, 2),
       ('r-f4a', 'f4', '/tmp/demo/src/g.ts', 'src/g.ts', 1, 4, 4),
       ('r-f4b', 'f4', '/tmp/demo/src/h.ts', 'src/h.ts', 10, 11, 2);
+    INSERT INTO sessions (id, agent_slug, model_slug, repo_id, branch, started_at, ended_at)
+    VALUES ('G', 'codex', 'gpt-6', 'r1', 'main', '2026-10-16T10:00:00Z', '2026-10-16T10:10:00Z');
+    INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, file_path, lines_added, lines_generated, lines_reworked, payload) VALUES
+      ('g1', 'G', '2026-10-16T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 5, 5, 0,
+        '${post("apply_patch", { command: "*** Begin Patch" })}');
+    INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, start_line, end_line, new_text_lines) VALUES
+      ('r-g1', 'g1', '/tmp/demo/b.go', 'b.go', 4, 5, 2);
   `);
   w.close();
 }
@@ -76,6 +86,24 @@ test("the files panel splits a multi-file edit by each range's own file", () => 
     "src/k.sh": [1, 3],
     "/home/dev/plan.md": [1, 0], // listed as touched, counts for nothing
   });
+});
+
+test("a patch placed in only one of its files is split, not put on the first file", () => {
+  const files = Object.fromEntries(
+    sessionTimelineData("G").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
+  );
+  // b.go gets its two located lines; the three that could not be placed stay
+  // on a.go, the file the event names. Before, a.go showed all five and b.go
+  // was missing.
+  assert.deepEqual(files, { "a.go": [1, 3], "b.go": [1, 2] });
+  assert.equal(getSessionDetail("G")?.lines_generated, 5);
+});
+
+test("the files of a session add up to its total", () => {
+  for (const id of ["A", "C", "F", "G"]) {
+    const sum = sessionTimelineData(id).files.reduce((n, r) => n + r.lines_generated, 0);
+    assert.equal(sum, getSessionDetail(id)?.lines_generated, `session ${id}`);
+  }
 });
 
 test("a tool call in the timeline shows what that edit wrote, before rework", () => {

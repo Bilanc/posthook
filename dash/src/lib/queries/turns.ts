@@ -76,6 +76,16 @@ const FILE_EXPR = `COALESCE(
   e.file_path
 )`;
 
+// The file a line range sits in, for the per-file query below (ee = the edit
+// event, x = one of its ranges). The oldest ranges carry only an absolute
+// path; when that is the event's own file, use the event's name for it so
+// the file is not listed twice.
+const RANGE_FILE = `COALESCE(
+  x.rel_file_path,
+  CASE WHEN x.file_path = ee.abs_file THEN ee.event_file END,
+  x.file_path
+)`;
+
 export function sessionTimelineData(sessionId: string): SessionTimelineData {
   const conn = db();
   const stops = conn
@@ -134,30 +144,41 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
 
   const files = conn
     .prepare(
-      // One row per file an edit touched. An edit that wrote one file puts
-      // its whole count there. An edit that wrote several (an apply_patch
-      // across files) is split by each line range's own path; before, all of
-      // it landed on the first file the patch named.
+      // One row per file an edit touched. Lines with a position go to the
+      // file their range sits in, whichever file the event row names: an
+      // apply_patch across files carries one path, the first it named. The
+      // rest of the event's count (lines measured without a position, less
+      // the session's own rework) goes to the file the event names. So a
+      // patch that could place its lines in only one of its files no longer
+      // puts everything on the first, and the files still add up to the
+      // session's total.
       `WITH edit_events AS (
          SELECT e.id,
+                e.file_path AS abs_file,
                 ${FILE_EXPR} AS event_file,
-                ${LINES_GENERATED} AS lines,
-                (SELECT COUNT(DISTINCT COALESCE(x.rel_file_path, x.file_path))
-                 FROM event_line_ranges x WHERE x.event_id = e.id) AS range_files
+                ${LINES_GENERATED} AS lines
          FROM events e
          WHERE e.session_id = ? AND ${AI_EDIT_EVENT_CONDITION}
        ),
-       per_file AS (
-         SELECT event_file AS f, lines FROM edit_events WHERE range_files <= 1
-         UNION ALL
-         SELECT COALESCE(x.rel_file_path, x.file_path) AS f, SUM(x.new_text_lines) AS lines
+       located AS (
+         SELECT ee.id, ${RANGE_FILE} AS f, SUM(x.new_text_lines) AS lines
          FROM edit_events ee JOIN event_line_ranges x ON x.event_id = ee.id
-         WHERE ee.range_files > 1
-         GROUP BY ee.id, COALESCE(x.rel_file_path, x.file_path)
+         GROUP BY ee.id, ${RANGE_FILE}
+       ),
+       per_event_file AS (
+         SELECT id, f, SUM(lines) AS lines
+         FROM (
+           SELECT id, f, lines FROM located
+           UNION ALL
+           SELECT ee.id, ee.event_file AS f,
+                  ee.lines - COALESCE((SELECT SUM(l.lines) FROM located l WHERE l.id = ee.id), 0) AS lines
+           FROM edit_events ee
+         )
+         WHERE f IS NOT NULL
+         GROUP BY id, f
        )
        SELECT f AS file, COUNT(*) AS edits, MAX(COALESCE(SUM(lines), 0), 0) AS lines_generated
-       FROM per_file
-       WHERE f IS NOT NULL
+       FROM per_event_file
        GROUP BY f
        ORDER BY lines_generated DESC, edits DESC`,
     )
