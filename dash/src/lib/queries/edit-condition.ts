@@ -45,8 +45,11 @@ export const AI_EDIT_EVENT_CONDITION = `(
       json_extract(e.payload, '$.tool_name') IN ('Edit', 'Write', 'MultiEdit', 'apply_patch')
       -- shell commands (Bash heredocs …) count once lines were located in the file
       OR EXISTS (SELECT 1 FROM event_line_ranges selr WHERE selr.event_id = e.id)
-      -- … or measured without a position (the text had moved by the time it was read)
+      -- … or measured without a position (the text had moved by the time it was
+      -- read), or measured as only removing the session's own lines: its rework
+      -- has to be subtracted even though it wrote nothing
       OR COALESCE(e.lines_generated, 0) > 0
+      OR COALESCE(e.lines_reworked, 0) > 0
     )
     AND NOT (
       e.agent_slug = 'cursor'
