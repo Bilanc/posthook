@@ -159,10 +159,13 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
       //    gives two rows.
       //  - Without a split, an edit whose line ranges sit in several files
       //    is split by each range's own path. Its row names only the first.
-      //    If the client measured it, what is left of its count after the
-      //    located lines (unplaced lines, less its rework) goes to the file
-      //    the event names, so the files still add up to the event's count.
-      //    Only builds from before the split existed wrote such rows.
+      //    If the client measured it, its files must still add up to its
+      //    count, and without a split nothing says which file the difference
+      //    belongs to. Lines it wrote that have no range go to the file the
+      //    event names. Rework (a negative difference) comes off the file
+      //    with the most located lines, the likeliest place for it and the
+      //    one it cannot erase. Only builds from before the split existed
+      //    wrote such rows.
       //  - Otherwise the whole count goes to one file. For an edit the
       //    client measured that is the file its range sits in, when it has
       //    one: a shell command's row names its first target, which need not
@@ -197,6 +200,14 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
          WHERE ee.file_lines IS NULL AND ee.range_files > 1
          GROUP BY ee.id, COALESCE(x.rel_file_path, x.file_path)
        ),
+       located_totals AS (
+         SELECT id, SUM(lines) AS lines FROM located GROUP BY id
+       ),
+       largest_located AS (
+         SELECT id, repo_id, f
+         FROM (SELECT id, repo_id, f, ROW_NUMBER() OVER (PARTITION BY id ORDER BY lines DESC, f) AS rn FROM located)
+         WHERE rn = 1
+       ),
        pieces AS (
          -- A split written before elements carried repo_id has no such key:
          -- fall back to the event's repository. A key that is there and null
@@ -213,10 +224,13 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
          SELECT id, repo_id, f, lines FROM located
          UNION ALL
          SELECT ee.id,
-                CASE WHEN ee.event_rel IS NOT NULL THEN ee.repo_id END AS repo_id,
-                ee.event_file AS f,
-                ee.lines - (SELECT SUM(l.lines) FROM located l WHERE l.id = ee.id) AS lines
+                CASE WHEN ee.lines < lt.lines THEN lg.repo_id
+                     WHEN ee.event_rel IS NOT NULL THEN ee.repo_id END AS repo_id,
+                CASE WHEN ee.lines < lt.lines THEN lg.f ELSE ee.event_file END AS f,
+                ee.lines - lt.lines AS lines
          FROM edit_events ee
+         JOIN located_totals lt ON lt.id = ee.id
+         JOIN largest_located lg ON lg.id = ee.id
          WHERE ee.file_lines IS NULL AND ee.range_files > 1 AND ee.measured IS NOT NULL
          UNION ALL
          SELECT id,

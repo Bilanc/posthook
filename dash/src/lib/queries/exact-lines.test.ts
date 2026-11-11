@@ -38,6 +38,8 @@ const dbPath = installFixture();
 // repository, whose event row still carries the session folder's repository.
 // Session U: a measured patch with no split, ranges of 4 lines in a.go and 2
 // in b.go, that also reworked 2 of the session's lines.
+// Session V: the same shape with 1 line in a.go (the file its row names) and
+// 5 in b.go.
 //
 // An event whose counts are not all its own row's file carries the split in
 // events.file_lines.
@@ -159,9 +161,12 @@ const dbPath = installFixture();
       ('t4', 'T', '2026-10-25T10:00:40Z', 'PostToolUse', 'codex', 'r1', NULL, '/tmp/notes.md', NULL, 0, 0,
         '${post("Write", { content: "x" })}');
     INSERT INTO sessions (id, agent_slug, model_slug, repo_id, branch, started_at, ended_at)
-    VALUES ('U', 'codex', 'gpt-6', 'r1', 'main', '2026-10-26T10:00:00Z', '2026-10-26T10:10:00Z');
+    VALUES ('U', 'codex', 'gpt-6', 'r1', 'main', '2026-10-26T10:00:00Z', '2026-10-26T10:10:00Z'),
+           ('V', 'codex', 'gpt-6', 'r1', 'main', '2026-10-27T10:00:00Z', '2026-10-27T10:10:00Z');
     INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, file_path, lines_added, lines_generated, lines_reworked, payload) VALUES
       ('u1', 'U', '2026-10-26T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 6, 6, 2,
+        '${post("apply_patch", { command: "*** Begin Patch" })}'),
+      ('v1', 'V', '2026-10-27T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 6, 6, 2,
         '${post("apply_patch", { command: "*** Begin Patch" })}');
     INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, start_line, end_line, new_text_lines) VALUES
       ('r-t1', 't1', '/tmp/demo/README.md', 'README.md', 1, 3, 3),
@@ -169,7 +174,9 @@ const dbPath = installFixture();
       ('r-t3a', 't3', '/tmp/demo/README.md', 'README.md', 4, 4, 1),
       ('r-t3b', 't3', '/tmp/other/README.md', 'README.md', 3, 6, 4),
       ('r-u1a', 'u1', '/tmp/demo/a.go', 'a.go', 1, 4, 4),
-      ('r-u1b', 'u1', '/tmp/demo/b.go', 'b.go', 1, 2, 2);
+      ('r-u1b', 'u1', '/tmp/demo/b.go', 'b.go', 1, 2, 2),
+      ('r-v1a', 'v1', '/tmp/demo/a.go', 'a.go', 1, 1, 1),
+      ('r-v1b', 'v1', '/tmp/demo/b.go', 'b.go', 1, 5, 5);
     UPDATE events SET file_lines = '${J([
       { repo_id: "r1", rel_file_path: "README.md", file_path: "/tmp/demo/README.md", lines_generated: 1, lines_reworked: 0 },
       { repo_id: "r2", rel_file_path: "README.md", file_path: "/tmp/other/README.md", lines_generated: 4, lines_reworked: 0 },
@@ -309,10 +316,20 @@ test("a measured edit with no split keeps its count when its ranges span files",
     sessionTimelineData("U").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
   );
   // 6 written and 2 reworked: the located lines go to their files, and the
-  // rest of the event's count (here the rework) to the file its row names.
-  // Summing the ranges alone would say 6 for a session that nets 4.
+  // rework comes off the file with the most located lines. Summing the
+  // ranges alone would say 6 for a session that nets 4.
   assert.deepEqual(files, { "a.go": [1, 2], "b.go": [1, 2] });
   assert.equal(getSessionDetail("U")?.lines_generated, 4);
+});
+
+test("an unsplit edit's rework does not erase the lines of the file its row names", () => {
+  const files = Object.fromEntries(
+    sessionTimelineData("V").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
+  );
+  // One line in a.go, five in b.go, two reworked. Taking the rework off a.go,
+  // the file the row names, left 0 and 5 once floored; it comes off b.go.
+  assert.deepEqual(files, { "a.go": [1, 1], "b.go": [1, 3] });
+  assert.equal(getSessionDetail("V")?.lines_generated, 4);
 });
 
 test("an older client's multi-file patch is still split by its ranges", () => {
@@ -323,7 +340,7 @@ test("an older client's multi-file patch is still split by its ranges", () => {
 });
 
 test("the files of a session add up to its total", () => {
-  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S", "T", "U"]) {
+  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S", "T", "U", "V"]) {
     const sum = sessionTimelineData(id).files.reduce((n, r) => n + r.lines_generated, 0);
     assert.equal(sum, getSessionDetail(id)?.lines_generated, `session ${id}`);
   }
