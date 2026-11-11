@@ -25,6 +25,14 @@ const dbPath = installFixture();
 // Session L: a shell command whose row names a.go (edited in place, content
 // unknown) while the one line posthook measured went to b.go.
 //
+// Session R: the session writes 30 lines to b.go; one patch then names a.go
+// first, adds a line there and replaces the 30 lines in b.go with five.
+// Session S: the same, after the session had already written 3 lines to a.go.
+// Session M: a measured patch with no split (as a pre-release build recorded
+// it) whose ranges are 4 lines in a.go and 2 in b.go.
+// Session N: the shell command of session L as a build without the split
+// recorded it: the row names a.go, the one range is in b.go.
+//
 // An event whose counts are not all its own row's file carries the split in
 // events.file_lines.
 {
@@ -63,7 +71,11 @@ const dbPath = installFixture();
       ('J', 'codex', 'gpt-6', 'r1', 'main', '2026-10-17T10:00:00Z', '2026-10-17T10:10:00Z'),
       ('H', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-10-18T10:00:00Z', '2026-10-18T10:10:00Z'),
       ('K', 'codex', 'gpt-6', 'r1', 'main', '2026-10-19T10:00:00Z', '2026-10-19T10:10:00Z'),
-      ('L', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-10-20T10:00:00Z', '2026-10-20T10:10:00Z');
+      ('L', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-10-20T10:00:00Z', '2026-10-20T10:10:00Z'),
+      ('R', 'codex', 'gpt-6', 'r1', 'main', '2026-10-21T10:00:00Z', '2026-10-21T10:10:00Z'),
+      ('S', 'codex', 'gpt-6', 'r1', 'main', '2026-10-22T10:00:00Z', '2026-10-22T10:10:00Z'),
+      ('M', 'codex', 'gpt-6', 'r1', 'main', '2026-10-23T10:00:00Z', '2026-10-23T10:10:00Z'),
+      ('N', 'claude-code', 'claude-fable-5-1', 'r1', 'main', '2026-10-24T10:00:00Z', '2026-10-24T10:10:00Z');
     INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, file_path, lines_added, lines_generated, lines_reworked, payload) VALUES
       ('j1', 'J', '2026-10-17T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 2, 2, 1,
         '${post("apply_patch", { command: "*** Begin Patch" })}'),
@@ -74,6 +86,20 @@ const dbPath = installFixture();
       ('k1', 'K', '2026-10-19T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'src/p.ts', '/tmp/demo/src/p.ts', 7, NULL, NULL,
         '${post("apply_patch", { command: "*** Begin Patch" })}'),
       ('l1', 'L', '2026-10-20T10:00:10Z', 'PostToolUse', 'claude-code', 'r1', 'a.go', '/tmp/demo/a.go', NULL, 1, 0,
+        '${post("Bash", { command: "sed -i s/old/new/ a.go; echo hello > b.go" })}'),
+      ('r1', 'R', '2026-10-21T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'b.go', '/tmp/demo/b.go', NULL, 30, 0,
+        '${post("Write", { content: "x" })}'),
+      ('r2', 'R', '2026-10-21T10:00:20Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 6, 6, 30,
+        '${post("apply_patch", { command: "*** Begin Patch" })}'),
+      ('s1', 'S', '2026-10-22T10:00:05Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', NULL, 3, 0,
+        '${post("Edit", { old_string: "", new_string: "x" })}'),
+      ('s2', 'S', '2026-10-22T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'b.go', '/tmp/demo/b.go', NULL, 30, 0,
+        '${post("Write", { content: "x" })}'),
+      ('s3', 'S', '2026-10-22T10:00:20Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 6, 6, 30,
+        '${post("apply_patch", { command: "*** Begin Patch" })}'),
+      ('m1', 'M', '2026-10-23T10:00:10Z', 'PostToolUse', 'codex', 'r1', 'a.go', '/tmp/demo/a.go', 6, 6, 0,
+        '${post("apply_patch", { command: "*** Begin Patch" })}'),
+      ('n1', 'N', '2026-10-24T10:00:10Z', 'PostToolUse', 'claude-code', 'r1', 'a.go', '/tmp/demo/a.go', NULL, 1, 0,
         '${post("Bash", { command: "sed -i s/old/new/ a.go; echo hello > b.go" })}');
     INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, start_line, end_line, new_text_lines) VALUES
       ('r-j1a', 'j1', '/tmp/demo/a.go', 'a.go', 9, 9, 1),
@@ -81,7 +107,17 @@ const dbPath = installFixture();
       ('r-h1', 'h1', '/tmp/demo/src/s.sh', 'src/s.sh', 1, 5, 5),
       ('r-k1a', 'k1', '/tmp/demo/src/p.ts', 'src/p.ts', 1, 4, 4),
       ('r-k1b', 'k1', '/tmp/demo/src/q.ts', 'src/q.ts', 1, 3, 3),
-      ('r-l1', 'l1', '/tmp/demo/b.go', 'b.go', 1, 1, 1);
+      ('r-l1', 'l1', '/tmp/demo/b.go', 'b.go', 1, 1, 1),
+      ('r-r1', 'r1', '/tmp/demo/b.go', 'b.go', 1, 30, 30),
+      ('r-r2a', 'r2', '/tmp/demo/a.go', 'a.go', 2, 2, 1),
+      ('r-r2b', 'r2', '/tmp/demo/b.go', 'b.go', 1, 5, 5),
+      ('r-s1', 's1', '/tmp/demo/a.go', 'a.go', 1, 3, 3),
+      ('r-s2', 's2', '/tmp/demo/b.go', 'b.go', 1, 30, 30),
+      ('r-s3a', 's3', '/tmp/demo/a.go', 'a.go', 4, 4, 1),
+      ('r-s3b', 's3', '/tmp/demo/b.go', 'b.go', 1, 5, 5),
+      ('r-m1a', 'm1', '/tmp/demo/a.go', 'a.go', 1, 4, 4),
+      ('r-m1b', 'm1', '/tmp/demo/b.go', 'b.go', 1, 2, 2),
+      ('r-n1', 'n1', '/tmp/demo/b.go', 'b.go', 1, 1, 1);
 
     UPDATE events SET file_lines = '${J([
       { rel_file_path: "src/g.ts", file_path: "/tmp/demo/src/g.ts", lines_generated: 4, lines_reworked: 0 },
@@ -99,6 +135,10 @@ const dbPath = installFixture();
     UPDATE events SET file_lines = '${J([
       { rel_file_path: "b.go", file_path: "/tmp/demo/b.go", lines_generated: 1, lines_reworked: 0 },
     ])}' WHERE id = 'l1';
+    UPDATE events SET file_lines = '${J([
+      { rel_file_path: "a.go", file_path: "/tmp/demo/a.go", lines_generated: 1, lines_reworked: 0 },
+      { rel_file_path: "b.go", file_path: "/tmp/demo/b.go", lines_generated: 5, lines_reworked: 30 },
+    ])}' WHERE id IN ('r2', 's3');
   `);
   w.close();
 }
@@ -177,6 +217,36 @@ test("a split of one file moves the count off the file the event row names", () 
   assert.deepEqual(files, [["b.go", 1, 1]]);
 });
 
+test("a patch that replaces 30 of the session's lines in another file nets them there", () => {
+  const files = Object.fromEntries(
+    sessionTimelineData("R").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
+  );
+  // 30 written to b.go, then a patch: +1 in a.go, and b.go's 30 become 5.
+  // Taking the patch's rework off the file its row names gave a.go 0, b.go 35.
+  assert.deepEqual(files, { "a.go": [1, 1], "b.go": [2, 5] });
+  assert.equal(getSessionDetail("R")?.lines_generated, 6);
+});
+
+test("rework in one file of a patch leaves the other file's earlier edits alone", () => {
+  const files = Object.fromEntries(
+    sessionTimelineData("S").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
+  );
+  // a.go already had 3 of the session's lines; the patch adds 1 more there.
+  assert.deepEqual(files, { "a.go": [2, 4], "b.go": [2, 5] });
+  assert.equal(getSessionDetail("S")?.lines_generated, 9);
+});
+
+test("a measured edit without a split follows its ranges", () => {
+  // Ranges in two files: split by range path, as an older client's patch is.
+  const multi = Object.fromEntries(
+    sessionTimelineData("M").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
+  );
+  assert.deepEqual(multi, { "a.go": [1, 4], "b.go": [1, 2] });
+  // One range, in a file the row does not name: the count goes to that file.
+  const single = sessionTimelineData("N").files.map((r) => [r.file, r.edits, r.lines_generated]);
+  assert.deepEqual(single, [["b.go", 1, 1]]);
+});
+
 test("an older client's multi-file patch is still split by its ranges", () => {
   const files = Object.fromEntries(
     sessionTimelineData("K").files.map((r) => [r.file, [r.edits, r.lines_generated]]),
@@ -185,7 +255,7 @@ test("an older client's multi-file patch is still split by its ranges", () => {
 });
 
 test("the files of a session add up to its total", () => {
-  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L"]) {
+  for (const id of ["A", "C", "F", "G", "H", "J", "K", "L", "M", "N", "R", "S"]) {
     const sum = sessionTimelineData(id).files.reduce((n, r) => n + r.lines_generated, 0);
     assert.equal(sum, getSessionDetail(id)?.lines_generated, `session ${id}`);
   }

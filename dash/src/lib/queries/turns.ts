@@ -135,21 +135,24 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
   const files = conn
     .prepare(
       // One row per file an edit touched.
-      //  - An edit the client measured that wrote several files carries its
-      //    own split (events.file_lines): each file's lines and each file's
-      //    rework, so a patch that adds a line in one file and rewrites the
-      //    session's work in another is not netted on the first.
-      //  - A measured edit without a split wrote one file: its count goes
-      //    to the file the event names.
-      //  - An edit from an older client is split by each line range's own
-      //    path when its ranges sit in several files, since its event row
-      //    names only the first; otherwise it too goes to the event's file.
-      // Either way a session's files add up to its total.
+      //  - An edit that carries its own split (events.file_lines) gives one
+      //    row per file in it: that file's lines less that file's rework. So
+      //    a patch that adds a line in one file and rewrites the session's
+      //    work in another is not netted on the first, and one file's
+      //    rework cannot eat another edit's lines on the file the row names.
+      //  - Without a split, an edit whose line ranges sit in several files
+      //    is split by each range's own path. Its row names only the first.
+      //  - Otherwise the whole count goes to one file. For an edit the
+      //    client measured that is the file its range sits in, when it has
+      //    one: a shell command's row names its first target, which need not
+      //    be the file it measurably wrote. Else the file the event names.
       `WITH edit_events AS (
          SELECT e.id,
                 e.lines_generated AS measured,
                 CASE WHEN json_valid(e.file_lines) THEN e.file_lines END AS file_lines,
                 ${FILE_EXPR} AS event_file,
+                (SELECT COALESCE(x.rel_file_path, x.file_path)
+                 FROM event_line_ranges x WHERE x.event_id = e.id LIMIT 1) AS range_file,
                 ${LINES_GENERATED} AS lines,
                 (SELECT COUNT(DISTINCT COALESCE(x.rel_file_path, x.file_path))
                  FROM event_line_ranges x WHERE x.event_id = e.id) AS range_files
@@ -163,14 +166,15 @@ export function sessionTimelineData(sessionId: string): SessionTimelineData {
          FROM edit_events ee, json_each(ee.file_lines) j
          WHERE ee.file_lines IS NOT NULL
          UNION ALL
-         SELECT event_file AS f, lines
-         FROM edit_events
-         WHERE file_lines IS NULL AND (measured IS NOT NULL OR range_files <= 1)
-         UNION ALL
          SELECT COALESCE(x.rel_file_path, x.file_path) AS f, SUM(x.new_text_lines) AS lines
          FROM edit_events ee JOIN event_line_ranges x ON x.event_id = ee.id
-         WHERE ee.file_lines IS NULL AND ee.measured IS NULL AND ee.range_files > 1
+         WHERE ee.file_lines IS NULL AND ee.range_files > 1
          GROUP BY ee.id, COALESCE(x.rel_file_path, x.file_path)
+         UNION ALL
+         SELECT CASE WHEN measured IS NOT NULL THEN COALESCE(range_file, event_file) ELSE event_file END AS f,
+                lines
+         FROM edit_events
+         WHERE file_lines IS NULL AND range_files <= 1
        )
        SELECT f AS file, COUNT(*) AS edits, MAX(COALESCE(SUM(lines), 0), 0) AS lines_generated
        FROM per_event_file
