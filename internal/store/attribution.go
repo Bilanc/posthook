@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bilanc/posthook/internal/gitx"
 )
@@ -136,6 +137,7 @@ func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string) (
 	if len(files) == 0 {
 		return 0, nil
 	}
+	strangers := db.StrangerCommits(commitID, sha, repoID, committedAt, root)
 
 	// sessionID -> file -> agg
 	perSessionFile := map[string]map[string]*fileAgg{}
@@ -172,7 +174,7 @@ func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string) (
 	}
 
 	for file, linesAdded := range files {
-		cands, err := db.candidateRanges(repoID, file, committedAt)
+		cands, err := db.candidateRanges(repoID, file, committedAt, strangers)
 		if err != nil {
 			return 0, err
 		}
@@ -295,7 +297,15 @@ func (db *DB) commitFilesWithAdds(commitID string) (map[string]int, error) {
 // window for one file: edits on the same repo+file that happened before the
 // commit, with no intervening commit touching the file (the next-file-commit
 // boundary). Ordered ts-ascending so latest-edit-wins de-dup works downstream.
-func (db *DB) candidateRanges(repoID, file, committedAt string) ([]candRange, error) {
+//
+// strangers are recorded commits that are not in this commit's history (see
+// StrangerCommits). They do not close the window: an edit that a commit on
+// another branch, or a commit since rewritten away, already took is still
+// this commit's to take.
+func (db *DB) candidateRanges(repoID, file, committedAt string, strangers []string) ([]candRange, error) {
+	notStranger, strangerArgs := NotInClause("c2.id", strangers)
+	args := []any{repoID, file, committedAt, committedAt}
+	args = append(args, strangerArgs...)
 	rows, err := db.Query(`
 		SELECT elr.event_id, e.session_id, e.agent_slug,
 		       COALESCE(s.model_slug, json_extract(e.payload, '$.model')) AS model_slug,
@@ -314,10 +324,10 @@ func (db *DB) candidateRanges(repoID, file, committedAt string) ([]candRange, er
 			WHERE c2.repo_id = e.repo_id
 			  AND cf2.file_path = elr.rel_file_path
 			  AND datetime(c2.committed_at) >= datetime(e.ts)
-			  AND datetime(c2.committed_at) < datetime(?)
+			  AND datetime(c2.committed_at) < datetime(?)`+notStranger+`
 		  )
 		ORDER BY datetime(e.ts) ASC`,
-		repoID, file, committedAt, committedAt)
+		args...)
 	if err != nil {
 		return nil, err
 	}
@@ -371,4 +381,123 @@ func addedLineSet(root, sha, file string) (map[int]bool, bool) {
 		}
 	}
 	return set, true
+}
+
+// StrangerCommits returns the ids of recorded commits in the same repository
+// that touch a file this commit added lines to, were committed before it, and
+// are not among its ancestors.
+//
+// The attribution window for a file closes at the previous commit that
+// touched it. "Previous" has to mean previous in this commit's own history.
+// Judged by time alone, a commit on another branch closes the window for
+// this one, and so does a commit that a rebase, an amend or a squash has
+// since replaced: the replacement then finds every edit already taken and
+// is attributed nothing. A cherry-pick has the same problem in reverse.
+//
+// One `git rev-list` is run, and only when the store holds such a commit at
+// all. With no access to the repository the answer is none, which is the old
+// behaviour.
+func (db *DB) StrangerCommits(commitID, sha, repoID, committedAt, root string) []string {
+	if root == "" || sha == "" {
+		return nil
+	}
+	rows, err := db.Query(`
+		SELECT DISTINCT c2.id, c2.sha, CAST(strftime('%s', c2.committed_at) AS INTEGER)
+		FROM commits c2
+		JOIN commit_files cf2 ON cf2.commit_id = c2.id
+		WHERE c2.repo_id = ?
+		  AND c2.id != ?
+		  AND datetime(c2.committed_at) < datetime(?)
+		  AND cf2.file_path IN (
+			SELECT file_path FROM commit_files WHERE commit_id = ? AND lines_added > 0
+		  )`, repoID, commitID, committedAt, commitID)
+	if err != nil {
+		return nil
+	}
+	type earlier struct{ id, sha string }
+	var earlierCommits []earlier
+	oldest := int64(0)
+	for rows.Next() {
+		var e earlier
+		var at sql.NullInt64
+		if err := rows.Scan(&e.id, &e.sha, &at); err != nil {
+			rows.Close()
+			return nil
+		}
+		if at.Valid && (oldest == 0 || at.Int64 < oldest) {
+			oldest = at.Int64
+		}
+		earlierCommits = append(earlierCommits, e)
+	}
+	rows.Close()
+	if len(earlierCommits) == 0 {
+		return nil
+	}
+
+	// The commit's ancestors back to the oldest of those commits, with a day
+	// of slack for clocks: committer dates need not be in order.
+	args := []string{"rev-list", sha}
+	if oldest > 0 {
+		args = append(args, "--since="+strconv.FormatInt(oldest-86400, 10))
+	}
+	out, err := gitx.Output(root, args...)
+	if err != nil {
+		return nil
+	}
+	ancestors := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			ancestors[line] = true
+		}
+	}
+	var strangers []string
+	for _, e := range earlierCommits {
+		if !ancestors[e.sha] {
+			strangers = append(strangers, e.id)
+		}
+	}
+	return strangers
+}
+
+// NotInClause renders " AND <column> NOT IN (?, ?, …)" and its arguments, or
+// nothing for an empty list.
+func NotInClause(column string, values []string) (string, []any) {
+	if len(values) == 0 {
+		return "", nil
+	}
+	args := make([]any, len(values))
+	for i, v := range values {
+		args[i] = v
+	}
+	return " AND " + column + " NOT IN (?" + strings.Repeat(", ?", len(values)-1) + ")", args
+}
+
+// InstalledAt is when this database was created: the first schema version's
+// timestamp. Commits made before it were made before posthook was on the
+// machine.
+func (db *DB) InstalledAt() (time.Time, bool) {
+	var v sql.NullString
+	if err := db.QueryRow(`SELECT MIN(applied_at) FROM schema_version`).Scan(&v); err != nil || !v.Valid {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006-01-02 15:04:05", v.String)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t.UTC(), true
+}
+
+// ClearCommitAttribution zeroes a commit's attributed lines and marks the rows
+// for re-sync. Used for a commit that no branch holds any more: its
+// replacement carries the lines now, and counting both would double them.
+// The rows are kept at zero rather than deleted because the cloud landing
+// zone has no tombstones.
+func (db *DB) ClearCommitAttribution(commitID string) error {
+	if _, err := db.Exec(`UPDATE commit_session_files SET lines_attributed = 0, synced_at = NULL
+		WHERE commit_id = ? AND lines_attributed != 0`, commitID); err != nil {
+		return err
+	}
+	_, err := db.Exec(`UPDATE commit_sessions SET lines_attributed = 0, files_touched = 0, synced_at = NULL
+		WHERE commit_id = ? AND lines_attributed != 0`, commitID)
+	return err
 }
