@@ -461,8 +461,9 @@ const checkoutsOf = `(
 //     or cherry-picked from the main checkout;
 //   - it is not one of this commit's ancestors;
 //   - more than half of the lines it adds to those files are lines this
-//     commit adds too. Lines are compared as text without their surrounding
-//     whitespace, and a line with no letter or digit in it is not counted.
+//     commit adds too, to the same file. Lines are compared as text without
+//     their surrounding whitespace, and a line with no letter or digit in it
+//     is not counted.
 //
 // The last test is what tells a rewrite from a commit that only touches the
 // same file: work on another branch, a branch merged by squash on the server
@@ -613,44 +614,52 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 	return carried
 }
 
+// addedLine is one line a commit adds: the file it is added to, as the diff
+// names it, and its text.
+type addedLine struct{ file, text string }
+
 // addedLinesByCommit reads the output of `git log --format=%x00%H -p
-// --unified=0` and returns, per commit, the lines it adds and how often:
-// trimmed of surrounding whitespace, and without the lines that have no
-// letter or digit in them (a lone brace, a blank line), which say nothing
-// about whose work a commit carries.
-func addedLinesByCommit(out []byte) map[string]map[string]int {
-	added := map[string]map[string]int{}
-	var current map[string]int
+// --unified=0` and returns, per commit, the lines it adds to each file and
+// how often: trimmed of surrounding whitespace, and without the lines that
+// have no letter or digit in them (a lone brace, a blank line), which say
+// nothing about whose work a commit carries.
+func addedLinesByCommit(out []byte) map[string]map[addedLine]int {
+	added := map[string]map[addedLine]int{}
+	var current map[addedLine]int
+	file := ""
 	inHunk := false
 	for _, line := range strings.Split(string(out), "\n") {
 		switch {
 		case strings.HasPrefix(line, "\x00"):
-			current = map[string]int{}
+			current = map[addedLine]int{}
 			added[strings.TrimSpace(line[1:])] = current
-			inHunk = false
+			file, inHunk = "", false
 		case strings.HasPrefix(line, "diff --git "):
 			// Inside a hunk every line starts with "+", "-" or "\", so this
-			// is the next file's header and not content.
-			inHunk = false
+			// is the next file's header and not content. The header names
+			// the file the same way in every commit of one output.
+			file, inHunk = strings.TrimPrefix(line, "diff --git "), false
 		case strings.HasPrefix(line, "@@"):
 			inHunk = true
 		case inHunk && current != nil && strings.HasPrefix(line, "+"):
 			text := strings.TrimSpace(line[1:])
 			if strings.IndexFunc(text, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0 {
-				current[text]++
+				current[addedLine{file, text}]++
 			}
 		}
 	}
 	return added
 }
 
-// carries reports whether more than half of the lines theirs adds are among
-// the lines mine adds, each line counted as often as it occurs.
-func carries(mine, theirs map[string]int) bool {
+// carries reports whether more than half of the lines theirs adds are lines
+// mine adds to the same file, each line counted as often as it occurs. The
+// same text in another file does not count: a rewrite puts a commit's lines
+// back where they were.
+func carries(mine, theirs map[addedLine]int) bool {
 	total, shared := 0, 0
-	for text, n := range theirs {
+	for line, n := range theirs {
 		total += n
-		if m := mine[text]; m < n {
+		if m := mine[line]; m < n {
 			shared += m
 		} else {
 			shared += n
@@ -693,10 +702,13 @@ func (db *DB) InstalledAt() (time.Time, bool) {
 // Used for a carried commit (CarriedCommits) that no branch holds any more;
 // counting both would double the lines.
 //
-// Nothing else is taken. Lines the replacement was not attributed (a file the
-// rewrite dropped, lines it moved to where attribution by position does not
-// find them) stay on the retired commit, so no line is ever dropped without
-// another commit holding it.
+// It works per session and file, not per line. A file the rewrite dropped,
+// or one where attribution by position found none of the session's lines on
+// the replacement, stays with the retired commit. Where the replacement
+// holds some of a session's lines in a file, the retired commit gives up all
+// it had there: the lines the replacement was not credited cannot be told
+// from lines the rewrite removed, and keeping the difference would count
+// removed lines for good, once more for every further rewrite of the commit.
 //
 // The rows are kept at zero rather than deleted because the cloud landing
 // zone has no tombstones. It reports whether anything changed.

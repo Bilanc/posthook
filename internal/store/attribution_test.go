@@ -236,13 +236,14 @@ func TestAddedLinesByCommit(t *testing.T) {
 		"diff --git a/f.go b/f.go\nindex 1..2 100644\n--- a/f.go\n+++ b/f.go\n" +
 		"@@ -2,0 +3,5 @@ func f() {\n+\tx := load()\n+++ odd\n+\n+}\n+\tx := load()\n" +
 		"@@ -9 +14 @@\n-old\n+new line\r\n" +
-		"diff --git a/g.go b/g.go\nnew file mode 100644\n--- /dev/null\n+++ b/g.go\n@@ -0,0 +1 @@\n+package g\n" +
+		"diff --git a/g.go b/g.go\nnew file mode 100644\n--- /dev/null\n+++ b/g.go\n@@ -0,0 +1,2 @@\n+package g\n+x := load()\n" +
 		"\x00bbb\n\n" +
 		"diff --git a/f.go b/f.go\n--- a/f.go\n+++ b/f.go\n@@ -1,0 +2 @@\n+x := load()\n"
 	got := addedLinesByCommit([]byte(out))
-	want := map[string]map[string]int{
-		"aaa": {"x := load()": 2, "++ odd": 1, "new line": 1, "package g": 1},
-		"bbb": {"x := load()": 1},
+	const f, g = "a/f.go b/f.go", "a/g.go b/g.go"
+	want := map[string]map[addedLine]int{
+		"aaa": {{f, "x := load()"}: 2, {f, "++ odd"}: 1, {f, "new line"}: 1, {g, "package g"}: 1, {g, "x := load()"}: 1},
+		"bbb": {{f, "x := load()"}: 1},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("commits = %v, want %v", got, want)
@@ -252,27 +253,29 @@ func TestAddedLinesByCommit(t *testing.T) {
 			t.Errorf("%s: lines = %v, want %v", sha, got[sha], lines)
 			continue
 		}
-		for text, n := range lines {
-			if got[sha][text] != n {
-				t.Errorf("%s: %q counted %d times, want %d", sha, text, got[sha][text], n)
+		for line, n := range lines {
+			if got[sha][line] != n {
+				t.Errorf("%s: %v counted %d times, want %d", sha, line, got[sha][line], n)
 			}
 		}
 	}
 }
 
 func TestCarries(t *testing.T) {
-	mine := map[string]int{"a := 1": 1, "b := 2": 2, "return a": 1}
+	const f, g = "a/f.go b/f.go", "a/g.go b/g.go"
+	mine := map[addedLine]int{{f, "a := 1"}: 1, {f, "b := 2"}: 2, {f, "return a"}: 1, {g, "c := 3"}: 2}
 	for _, c := range []struct {
 		name   string
-		theirs map[string]int
+		theirs map[addedLine]int
 		want   bool
 	}{
-		{"the same lines", map[string]int{"a := 1": 1, "b := 2": 2}, true},
-		{"more than half", map[string]int{"a := 1": 1, "b := 2": 1, "c := 3": 1}, true},
-		{"exactly half", map[string]int{"a := 1": 1, "c := 3": 1}, false},
-		{"a repeated line counts as often as both have it", map[string]int{"a := 1": 3}, false},
-		{"other lines", map[string]int{"c := 3": 4}, false},
-		{"nothing to compare", map[string]int{}, false},
+		{"the same lines", map[addedLine]int{{f, "a := 1"}: 1, {f, "b := 2"}: 2}, true},
+		{"more than half", map[addedLine]int{{f, "a := 1"}: 1, {f, "b := 2"}: 1, {f, "d := 4"}: 1}, true},
+		{"exactly half", map[addedLine]int{{f, "a := 1"}: 1, {f, "d := 4"}: 1}, false},
+		{"a repeated line counts as often as both have it", map[addedLine]int{{f, "a := 1"}: 3}, false},
+		{"the same text in another file", map[addedLine]int{{f, "c := 3"}: 2}, false},
+		{"other lines", map[addedLine]int{{f, "d := 4"}: 4}, false},
+		{"nothing to compare", map[addedLine]int{}, false},
 	} {
 		if got := carries(mine, c.theirs); got != c.want {
 			t.Errorf("%s: carries = %v, want %v", c.name, got, c.want)

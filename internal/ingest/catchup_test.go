@@ -154,6 +154,7 @@ func TestCommitCatchUp(t *testing.T) {
 	t.Run("an amend in the second of its original retires the original", func(t *testing.T) { testAmendInTheSameSecond(t, home) })
 	t.Run("a replaced commit keeps the lines its replacement does not hold", func(t *testing.T) { testAmendThatDropsAFile(t, home) })
 	t.Run("a commit on a deleted branch keeps its lines when a later commit only touches the same file", func(t *testing.T) { testCatchUpDeletedBranch(t, home) })
+	t.Run("the same lines added to another file do not make a commit a rewrite", func(t *testing.T) { testCatchUpSameLinesInAnotherFile(t, home) })
 	t.Run("an ancestor whose lines a commit adds again is not carried", func(t *testing.T) { testCatchUpRevertOfRevert(t, home) })
 	t.Run("a note whose ranges belong to a commit recorded later is removed", func(t *testing.T) { testCatchUpRemovesStaleNote(t, home) })
 	t.Run("a push job records commits that are on the remote by the time it runs, and sends their notes", func(t *testing.T) { testCatchUpPushJob(t, home) })
@@ -514,6 +515,31 @@ func testCatchUpDeletedBranch(t *testing.T, home string) {
 	byHand := commitAll(t, repo, "add c by hand")
 
 	sweep(t, repo)
+	wantCommit(t, db, "the later commit, typed by hand", byHand, 0)
+	wantCommit(t, db, "the commit on the deleted branch", onBranch, 3)
+}
+
+func testCatchUpSameLinesInAnotherFile(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "elsewhere")
+	gitOut(t, repo, "checkout", "-q", "-b", "feature")
+	agentWrites(t, "elsewhere-1", repo, "a.txt", numbered(3, "from the agent %d"))
+	onBranch := commitAll(t, repo, "add a on the branch")
+	if err := GitCommit(repo, onBranch); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repo, "checkout", "-q", "main")
+	gitOut(t, repo, "branch", "-q", "-D", "feature")
+	laterSecond()
+	// A later commit, typed by hand, writes other lines to the same file on
+	// the same line numbers, and happens to add the agent's lines to a
+	// different file. The two commits share a file, but not what they add
+	// to it.
+	writeFile(t, filepath.Join(repo, "a.txt"), numbered(3, "typed by hand %d"))
+	writeFile(t, filepath.Join(repo, "b.txt"), numbered(3, "from the agent %d"))
+	byHand := commitAll(t, repo, "add a and b by hand")
+
+	sweep(t, repo)
+	db := openDB(t)
 	wantCommit(t, db, "the later commit, typed by hand", byHand, 0)
 	wantCommit(t, db, "the commit on the deleted branch", onBranch, 3)
 }
