@@ -132,3 +132,87 @@ func Pending() (int, error) {
 	}
 	return n, nil
 }
+
+// CommitJob asks the worker to record commits the git shadow saw were about
+// to be pushed and that posthook may never have seen being made: made by a
+// git that does not go through the shadow, or by a rebase, a merge or a
+// cherry-pick. SHAs are oldest first.
+type CommitJob struct {
+	RepoRoot   string   `json:"repo_root"`
+	SHAs       []string `json:"shas"`
+	ReceivedAt string   `json:"received_at"`
+}
+
+// CommitJobsDir is where commit jobs wait (~/.posthook/spool/commits). A
+// directory of their own, not another kind of Envelope: Drain skips
+// directories, so a worker from an older binary that is still running never
+// picks one up and stores it as an agent event.
+func CommitJobsDir() string { return filepath.Join(Dir(), "commits") }
+
+// WriteCommitJob atomically drops one job into the commit spool.
+func WriteCommitJob(job CommitJob) error {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	name := strings.ReplaceAll(job.ReceivedAt+"-"+uuid.NewString()+".json", ":", "")
+	return atomicfs.Write(filepath.Join(CommitJobsDir(), name), data, 0o644)
+}
+
+// DrainCommitJobs processes every job in the commit spool, oldest first, with
+// the same rules as Drain: a job is removed once process returns nil, left
+// for the next pass on an error, and dropped if it cannot be parsed.
+func DrainCommitJobs(process func(CommitJob) error) (int, error) {
+	names, err := jsonFiles(CommitJobsDir())
+	if err != nil {
+		return 0, err
+	}
+	handled := 0
+	for _, n := range names {
+		path := filepath.Join(CommitJobsDir(), n)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return handled, err
+		}
+		var job CommitJob
+		if err := json.Unmarshal(data, &job); err != nil {
+			_ = os.Remove(path)
+			continue
+		}
+		if err := process(job); err != nil {
+			return handled, err
+		}
+		_ = os.Remove(path)
+		handled++
+	}
+	return handled, nil
+}
+
+// PendingCommitJobs reports how many commit jobs are waiting.
+func PendingCommitJobs() (int, error) {
+	names, err := jsonFiles(CommitJobsDir())
+	return len(names), err
+}
+
+// jsonFiles lists the complete records in a spool directory, sorted by name
+// (arrival order). A missing directory is an empty spool.
+func jsonFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
