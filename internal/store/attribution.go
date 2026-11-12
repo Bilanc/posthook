@@ -35,26 +35,31 @@ func (db *DB) RefreshCommitAttributions(commitID string) (int, error) {
 		// before schema v12) judges "previous commit" by time alone, as it
 		// always has. It has no step that retires a replaced commit, so
 		// crediting a replacement here would count its lines twice.
-		return db.refreshCommitAttributions("", []string{})
+		return db.refreshCommitAttributions("", "", []string{})
 	}
-	return db.refreshCommitAttributions(commitID, nil)
+	return db.refreshCommitAttributions(commitID, "", nil)
 }
 
 // RefreshCommitAttributionCarrying is RefreshCommitAttributions for one commit
 // whose carried commits (see CarriedCommits) the caller has already worked
 // out, so the git calls behind that list are made once per commit.
-func (db *DB) RefreshCommitAttributionCarrying(commitID string, carried []string) (int, error) {
+//
+// root is the working tree to ask git in. The commit's own repository row
+// may name a checkout that is gone (a removed worktree) while the commit is
+// being recorded from another checkout of the same repository.
+func (db *DB) RefreshCommitAttributionCarrying(commitID, root string, carried []string) (int, error) {
 	if commitID == "" {
 		return 0, nil
 	}
 	if carried == nil {
 		carried = []string{}
 	}
-	return db.refreshCommitAttributions(commitID, carried)
+	return db.refreshCommitAttributions(commitID, root, carried)
 }
 
-// carried is nil when it has to be worked out per commit.
-func (db *DB) refreshCommitAttributions(commitID string, carried []string) (int, error) {
+// carried is nil when it has to be worked out per commit; root is empty to
+// use each commit's own repository row.
+func (db *DB) refreshCommitAttributions(commitID, root string, carried []string) (int, error) {
 	var commitArg any
 	if commitID != "" {
 		if _, err := db.Exec(`DELETE FROM commit_sessions WHERE commit_id = ?`, commitID); err != nil {
@@ -102,6 +107,9 @@ func (db *DB) refreshCommitAttributions(commitID string, carried []string) (int,
 
 	total := 0
 	for _, c := range commits {
+		if root != "" {
+			c.root = root
+		}
 		n, err := db.attributeCommit(c.id, c.sha, c.repoID, c.committedAt, c.root, carried)
 		if err != nil {
 			return total, err
@@ -423,6 +431,17 @@ const (
 // parents.
 const maxParentChain = 500
 
+// checkoutsOf is the subquery for the repository rows that are checkouts of
+// one repository: the row itself (first argument) and every row that has its
+// remote (second argument, the same id). Every working tree is a row of its
+// own, so the worktrees of a repository, and separate clones of it, are
+// several rows. A repository with no remote has only its own row.
+const checkoutsOf = `(
+	SELECT id FROM repositories
+	WHERE id = ?
+	   OR (COALESCE(remote_url, '') != ''
+	       AND remote_url = (SELECT remote_url FROM repositories WHERE id = ?)))`
+
 // CarriedCommits returns the ids of recorded commits whose work this commit
 // carries: the originals of a rebase, an amend, a squash or a cherry-pick.
 //
@@ -436,7 +455,10 @@ const maxParentChain = 500
 // A recorded commit is carried when all of these hold:
 //
 //   - it is in the same repository, was committed no later than this commit,
-//     and adds lines to a file this commit adds lines to;
+//     and adds lines to a file this commit adds lines to. The same
+//     repository is this commit's row or another checkout of it (a row with
+//     the same remote): a branch made in a worktree is often amended, rebased
+//     or cherry-picked from the main checkout;
 //   - it is not one of this commit's ancestors;
 //   - more than half of the lines it adds to those files are lines this
 //     commit adds too. Lines are compared as text without their surrounding
@@ -464,7 +486,7 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 		       SUM(cf2.lines_added)
 		FROM commits c2
 		JOIN commit_files cf2 ON cf2.commit_id = c2.id
-		WHERE c2.repo_id = ?
+		WHERE c2.repo_id IN `+checkoutsOf+`
 		  AND c2.id != ?
 		  AND datetime(c2.committed_at) <= datetime(?)
 		  AND cf2.lines_added > 0
@@ -472,7 +494,7 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 			SELECT file_path FROM commit_files WHERE commit_id = ? AND lines_added > 0
 		  )
 		GROUP BY c2.id, c2.sha, c2.committed_at
-		ORDER BY 3 DESC`, repoID, commitID, committedAt, commitID)
+		ORDER BY 3 DESC`, repoID, repoID, commitID, committedAt, commitID)
 	if err != nil {
 		return nil
 	}
@@ -501,14 +523,15 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 	// the few that get that far.
 	onChain := map[string]bool{}
 	rows, err = db.Query(`
-		WITH RECURSIVE chain(sha, depth) AS (
+		WITH RECURSIVE checkouts(id) AS `+checkoutsOf+`,
+		chain(sha, depth) AS (
 			SELECT parent_sha, 1 FROM commits WHERE id = ?
-			UNION ALL
+			UNION
 			SELECT c.parent_sha, chain.depth + 1
-			FROM chain JOIN commits c ON c.repo_id = ? AND c.sha = chain.sha
+			FROM chain JOIN commits c ON c.sha = chain.sha AND c.repo_id IN (SELECT id FROM checkouts)
 			WHERE chain.depth < ?
 		)
-		SELECT sha FROM chain WHERE sha IS NOT NULL`, commitID, repoID, maxParentChain)
+		SELECT sha FROM chain WHERE sha IS NOT NULL`, repoID, repoID, commitID, maxParentChain)
 	if err != nil {
 		return nil
 	}
@@ -554,7 +577,8 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 
 	// One diff of this commit and the candidates, limited to this commit's
 	// files. Revisions and paths go in on stdin so their number is not
-	// limited by the command line.
+	// limited by the command line. A candidate from another checkout that
+	// this one does not have the objects of (a separate clone) is skipped.
 	var stdin strings.Builder
 	stdin.WriteString(sha + "\n")
 	for _, e := range candidates {
@@ -565,7 +589,7 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 		stdin.WriteString(path + "\n")
 	}
 	out, err := gitx.OutputWithInput(root, stdin.String(),
-		"--literal-pathspecs", "log", "--no-walk=unsorted", "--format=%x00%H",
+		"--literal-pathspecs", "log", "--ignore-missing", "--no-walk=unsorted", "--format=%x00%H",
 		"-p", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
 		"--stdin")
 	if err != nil {

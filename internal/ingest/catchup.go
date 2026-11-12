@@ -42,7 +42,9 @@ import (
 //   - Only the checked-out branch, not every local branch: worktrees of one
 //     repository share their branches, and each is its own repository to
 //     posthook, with its own edits. A commit recorded from the wrong
-//     worktree would be attributed against edits that are not there.
+//     worktree would be attributed against edits that are not there. For the
+//     same reason a rewrite made in another checkout is recorded with the
+//     checkout its original was recorded in (homeRepository).
 //
 // What this cannot see: a commit made and pushed by a git that never goes
 // through the shadow, with no agent turn ending in between.
@@ -251,14 +253,18 @@ func settleCommits(db *store.DB, repoRoot, repoID string, shas []string, reattri
 		noted = notedCommits(repoRoot)
 	}
 	for _, sha := range shas {
-		var commitID string
-		if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&commitID); err != nil {
+		// The row the commit is recorded under, which is this checkout's
+		// unless it was recorded from another checkout of the repository or
+		// moved to one (homeRepository).
+		var commitID, commitRepo string
+		if err := db.QueryRow(`SELECT id, repo_id FROM commits WHERE sha = ? ORDER BY (repo_id = ?) DESC LIMIT 1`,
+			sha, repoID).Scan(&commitID, &commitRepo); err != nil {
 			continue
 		}
 		if reattribute {
-			attributeAndNote(db, repoRoot, repoID, sha, commitID, noted[sha])
+			attributeAndNote(db, repoRoot, commitRepo, sha, commitID, noted[sha])
 		} else {
-			retireCarried(db, repoRoot, sha, commitID, carriedBy(db, repoRoot, repoID, sha, commitID))
+			retireCarried(db, repoRoot, sha, commitID, carriedBy(db, repoRoot, commitRepo, sha, commitID))
 		}
 	}
 }

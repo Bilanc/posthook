@@ -160,6 +160,7 @@ func TestCommitCatchUp(t *testing.T) {
 	t.Run("a force-pushed rebase retires the original it replaced on the remote", func(t *testing.T) { testCatchUpForcePush(t, home) })
 	t.Run("one repository is looked at once a minute on Stop", func(t *testing.T) { testCatchUpThrottle(t, home) })
 	t.Run("a commit is recorded from the worktree it was made in, and only once", func(t *testing.T) { testCatchUpWorktrees(t, home) })
+	t.Run("a rewrite made in another checkout carries the commit recorded in a worktree", func(t *testing.T) { testCatchUpRewriteFromAnotherCheckout(t, home) })
 }
 
 func testCatchUpWorktrees(t *testing.T, home string) {
@@ -200,6 +201,52 @@ func testCatchUpWorktrees(t *testing.T, home string) {
 	if copies != 1 {
 		t.Errorf("the commit is recorded %d times", copies)
 	}
+}
+
+func testCatchUpRewriteFromAnotherCheckout(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "across")
+	tree := filepath.Join(home, "across-wt-topic")
+	gitOut(t, repo, "worktree", "add", "-q", "-b", "topic", tree)
+	// The agent works in a worktree and the commit is recorded there.
+	agentWrites(t, "across-1", tree, "x.txt", numbered(4, "x %d"))
+	original := commitAll(t, tree, "add x")
+	if err := GitCommit(tree, original); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t)
+	wantCommit(t, db, "the commit made in the worktree", original, 4)
+
+	// The worktree is removed. Its branch is checked out in the main
+	// checkout and the commit is amended there, by a git posthook does not
+	// see. The edits are the worktree's, and the main checkout has none.
+	gitOut(t, repo, "worktree", "remove", "--force", tree)
+	gitOut(t, repo, "checkout", "-q", "topic")
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add x, reworded")
+	amended := gitOut(t, repo, "rev-parse", "HEAD")
+	if amended == original {
+		t.Fatal("test setup: the amend did not rewrite the commit")
+	}
+
+	sweep(t, repo)
+	wantCommit(t, db, "the amended commit, made in the main checkout", amended, 4)
+	wantCommit(t, db, "the commit it replaced", original, 0)
+	// The amended commit is recorded with the checkout its edits were made
+	// in, like the commit it replaces.
+	var sameRow bool
+	if err := db.QueryRow(`SELECT (SELECT repo_id FROM commits WHERE sha = ?) = (SELECT repo_id FROM commits WHERE sha = ?)`,
+		amended, original).Scan(&sameRow); err != nil {
+		t.Fatal(err)
+	}
+	if !sameRow {
+		t.Errorf("the amended commit is recorded under another repository row than its original")
+	}
+
+	// A later look from the main checkout still finds it, and settles it
+	// again without recording anything.
+	if n := sweep(t, repo); n != 0 {
+		t.Errorf("a second look recorded %d commit(s)", n)
+	}
+	wantCommit(t, db, "the amended commit after a second look", amended, 4)
 }
 
 func testCatchUpOnStop(t *testing.T, home string) {
