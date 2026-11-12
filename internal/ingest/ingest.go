@@ -462,24 +462,32 @@ func GitCommit(repoRoot, sha string) error {
 	if committedAt == "" {
 		committedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, err = db.Exec(`
-		INSERT INTO commits (
-			id, org_id, repo_id, sha, parent_sha, author_email, author_name,
-			committed_at, branch, message, lines_added, lines_removed, files_changed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo_id, sha) DO NOTHING`,
-		commitID, store.LocalOrgID, repoID, sha, nullableString(parentSha),
-		nullableString(email), nullableString(name), committedAt,
-		nullableString(branch), nullableString(subject),
-		added, removed, filesChanged)
-	if err != nil {
-		logx.Warnf("commit insert failed: %v", err)
-		return nil
-	}
-
-	var finalCommitID string
-	if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&finalCommitID); err != nil {
-		finalCommitID = commitID
+	// A commit is recorded once per repository, whichever of its checkouts
+	// reports it. A rewrite is kept with the checkout of its original
+	// (homeRepository); when it is reported again from the checkout it was
+	// made in (the post-commit hook and the shadow both report a commit),
+	// that record is the one to use, not a second one under this checkout.
+	finalCommitID, recordedIn, known := recordedCommit(db, repoID, sha)
+	if known {
+		repoID = recordedIn
+	} else {
+		_, err = db.Exec(`
+			INSERT INTO commits (
+				id, org_id, repo_id, sha, parent_sha, author_email, author_name,
+				committed_at, branch, message, lines_added, lines_removed, files_changed
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(repo_id, sha) DO NOTHING`,
+			commitID, store.LocalOrgID, repoID, sha, nullableString(parentSha),
+			nullableString(email), nullableString(name), committedAt,
+			nullableString(branch), nullableString(subject),
+			added, removed, filesChanged)
+		if err != nil {
+			logx.Warnf("commit insert failed: %v", err)
+			return nil
+		}
+		if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&finalCommitID); err != nil {
+			finalCommitID = commitID
+		}
 	}
 
 	for _, f := range perFile {
@@ -512,7 +520,9 @@ func GitCommit(repoRoot, sha string) error {
 // checkout it was made in, it would be attributed against that checkout's
 // edits and get nothing, and the merge request it lands in would count with
 // 0 AI lines. carried is newest first; a commit that carries one of its own
-// row's commits stays where it is.
+// row's commits stays where it is. A commit that carries commits from
+// several other rows goes with the newest, and its attribution reads the
+// edits of the others as well (store.AttributionSources).
 func homeRepository(db *store.DB, repoID, commitID string, carried []string) string {
 	home := ""
 	for _, carriedID := range carried {
@@ -535,6 +545,18 @@ func homeRepository(db *store.DB, repoID, commitID string, carried []string) str
 		return repoID
 	}
 	return home
+}
+
+// recordedCommit finds the record of a commit in the repository that repoID
+// is a checkout of: under that row, else under another checkout of the same
+// repository. A commit with the same SHA in an unrelated repository (a fork
+// with its own remote) is not this repository's record.
+func recordedCommit(db *store.DB, repoID, sha string) (commitID, recordedIn string, ok bool) {
+	err := db.QueryRow(`
+		SELECT id, repo_id FROM commits
+		WHERE sha = ? AND repo_id IN `+store.CheckoutsOf+`
+		ORDER BY (repo_id = ?) DESC LIMIT 1`, sha, repoID, repoID, repoID).Scan(&commitID, &recordedIn)
+	return commitID, recordedIn, err == nil
 }
 
 // attributeAndNote (re)computes one recorded commit's attribution, retires
@@ -565,39 +587,10 @@ func attributeCarrying(db *store.DB, repoRoot, repoID, sha, commitID string, car
 }
 
 func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, carried []string, hadNote bool) error {
-	// The same window as attribution: a commit this one carries does not
-	// close it (store.CarriedCommits).
-	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
-	args := append([]any{commitID, repoID}, carriedArgs...)
-	rows, err := db.Query(`
-		SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
-		       e.ts AS event_ts, elr.start_line, elr.end_line
-		FROM commits c
-		JOIN commit_files cf ON cf.commit_id = c.id
-		JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
-		JOIN events e ON e.id = elr.event_id
-		LEFT JOIN sessions s ON s.id = e.session_id
-		WHERE c.id = ?
-		  AND c.repo_id = ?
-		  AND e.repo_id = c.repo_id
-		  AND elr.rel_file_path IS NOT NULL
-		  AND datetime(c.committed_at) >= datetime(e.ts)
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM commits c2
-			JOIN commit_files cf2 ON cf2.commit_id = c2.id
-			WHERE c2.repo_id = c.repo_id
-			  AND cf2.file_path = cf.file_path
-			  AND datetime(c2.committed_at) >= datetime(e.ts)
-			  AND datetime(c2.committed_at) < datetime(c.committed_at)`+notCarried+`
-		  )
-		ORDER BY elr.rel_file_path, elr.start_line`,
-		args...)
-	if err != nil {
+	var committedAt string
+	if err := db.QueryRow(`SELECT committed_at FROM commits WHERE id = ?`, commitID).Scan(&committedAt); err != nil {
 		return err
 	}
-	defer rows.Close()
-
 	type entry struct {
 		Lines   string `json:"lines"`
 		Agent   string `json:"agent"`
@@ -607,28 +600,64 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 	}
 	files := map[string][]entry{}
 	count := 0
-	for rows.Next() {
-		var rel, agent, ts string
-		var session, model sql.NullString
-		var start, end int
-		if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
+	// The same edits as attribution reads (store.AttributionSources), in the
+	// same window: a commit this one carries does not close it
+	// (store.CarriedCommits), and neither does one that gave the file up.
+	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
+	for _, src := range db.AttributionSources(repoID, committedAt, carried) {
+		args := append([]any{commitID, src.RepoID, src.Until, src.Until}, carriedArgs...)
+		rows, err := db.Query(`
+			SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
+			       e.ts AS event_ts, elr.start_line, elr.end_line
+			FROM commit_files cf
+			JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
+			JOIN events e ON e.id = elr.event_id
+			LEFT JOIN sessions s ON s.id = e.session_id
+			WHERE cf.commit_id = ?
+			  AND e.repo_id = ?
+			  AND elr.rel_file_path IS NOT NULL
+			  AND datetime(?) >= datetime(e.ts)
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM commits c2
+				JOIN commit_files cf2 ON cf2.commit_id = c2.id
+				WHERE c2.repo_id = e.repo_id
+				  AND cf2.file_path = cf.file_path
+				  AND datetime(c2.committed_at) >= datetime(e.ts)
+				  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
+				  AND `+store.HoldsFile+`
+			  )
+			ORDER BY elr.rel_file_path, elr.start_line`,
+			args...)
+		if err != nil {
 			return err
 		}
-		lineRange := fmt.Sprintf("%d", start)
-		if start != end {
-			lineRange = fmt.Sprintf("%d-%d", start, end)
+		for rows.Next() {
+			var rel, agent, ts string
+			var session, model sql.NullString
+			var start, end int
+			if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
+				rows.Close()
+				return err
+			}
+			lineRange := fmt.Sprintf("%d", start)
+			if start != end {
+				lineRange = fmt.Sprintf("%d-%d", start, end)
+			}
+			files[rel] = append(files[rel], entry{
+				Lines:   lineRange,
+				Agent:   agent,
+				Session: session.String,
+				Model:   model.String,
+				TS:      ts,
+			})
+			count++
 		}
-		files[rel] = append(files[rel], entry{
-			Lines:   lineRange,
-			Agent:   agent,
-			Session: session.String,
-			Model:   model.String,
-			TS:      ts,
-		})
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return err
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
 	}
 	if count == 0 {
 		if hadNote {

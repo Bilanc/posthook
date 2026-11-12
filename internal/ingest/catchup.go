@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,10 +256,10 @@ func settleCommits(db *store.DB, repoRoot, repoID string, shas []string, reattri
 	for _, sha := range shas {
 		// The row the commit is recorded under, which is this checkout's
 		// unless it was recorded from another checkout of the repository or
-		// moved to one (homeRepository).
-		var commitID, commitRepo string
-		if err := db.QueryRow(`SELECT id, repo_id FROM commits WHERE sha = ? ORDER BY (repo_id = ?) DESC LIMIT 1`,
-			sha, repoID).Scan(&commitID, &commitRepo); err != nil {
+		// moved to one (homeRepository). A commit recorded only in an
+		// unrelated repository is not this one's to settle.
+		commitID, commitRepo, ok := recordedCommit(db, repoID, sha)
+		if !ok {
 			continue
 		}
 		if reattribute {
@@ -276,11 +277,20 @@ func settleCommits(db *store.DB, repoRoot, repoID string, shas []string, reattri
 // original) keeps its attribution.
 func retireCarried(db *store.DB, repoRoot, sha, commitID string, carried []string) {
 	for _, carriedID := range carried {
-		var carriedSHA string
-		if err := db.QueryRow(`SELECT sha FROM commits WHERE id = ?`, carriedID).Scan(&carriedSHA); err != nil {
+		var carriedSHA, recordedAt string
+		if err := db.QueryRow(`
+			SELECT c.sha, COALESCE(r.root_path, '')
+			FROM commits c LEFT JOIN repositories r ON r.id = c.repo_id
+			WHERE c.id = ?`, carriedID).Scan(&carriedSHA, &recordedAt); err != nil {
 			continue
 		}
 		if onAnyBranch(repoRoot, carriedSHA) {
+			continue
+		}
+		// A commit recorded in another checkout can be on a branch only that
+		// checkout has: a separate clone keeps its own branches. (Worktrees
+		// share theirs, and a checkout that is gone has none.)
+		if recordedAt != "" && recordedAt != repoRoot && checkoutMayHold(recordedAt, carriedSHA) {
 			continue
 		}
 		changed, err := db.GiveUpAttribution(carriedID, commitID)
@@ -305,6 +315,16 @@ func carriedBy(db *store.DB, repoRoot, repoID, sha, commitID string) []string {
 // the commit. A commit git no longer has is on none.
 func onAnyBranch(repoRoot, sha string) bool {
 	return gitx.Run(repoRoot, "branch", "--all", "--contains", sha, "--format=%(refname)") != ""
+}
+
+// checkoutMayHold reports whether a branch of the checkout at root holds the
+// commit, or may: a checkout that cannot be looked at is not taken to have
+// lost its branches. One that no longer exists holds nothing.
+func checkoutMayHold(root, sha string) bool {
+	if _, err := os.Stat(root); err != nil {
+		return !os.IsNotExist(err)
+	}
+	return onAnyBranch(root, sha)
 }
 
 // recordedSHAs returns which of shas the store holds, under any repository:

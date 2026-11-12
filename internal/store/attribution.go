@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -209,10 +210,20 @@ func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string, c
 		}
 	}
 
+	sources := db.AttributionSources(repoID, committedAt, carried)
 	for file, linesAdded := range files {
-		cands, err := db.candidateRanges(repoID, file, committedAt, carried)
-		if err != nil {
-			return 0, err
+		var cands []candRange
+		for _, src := range sources {
+			more, err := db.candidateRanges(src.RepoID, file, src.Until, carried)
+			if err != nil {
+				return 0, err
+			}
+			cands = append(cands, more...)
+		}
+		if len(sources) > 1 {
+			// Latest edit wins per line, so the edits of several checkouts
+			// have to be in one order of time.
+			sort.SliceStable(cands, func(i, j int) bool { return eventTime(cands[i].ts).Before(eventTime(cands[j].ts)) })
 		}
 		if len(cands) == 0 {
 			continue
@@ -337,7 +348,7 @@ func (db *DB) commitFilesWithAdds(commitID string) (map[string]int, error) {
 // carried are the recorded commits whose work this commit carries (see
 // CarriedCommits). They do not close the window: an edit that the original of
 // a rebase, an amend, a squash or a cherry-pick took is this commit's to take
-// too.
+// too. Neither does a commit that has given the file up (HoldsFile).
 func (db *DB) candidateRanges(repoID, file, committedAt string, carried []string) ([]candRange, error) {
 	notCarried, carriedArgs := NotInClause("c2.id", carried)
 	args := []any{repoID, file, committedAt, committedAt}
@@ -361,6 +372,7 @@ func (db *DB) candidateRanges(repoID, file, committedAt string, carried []string
 			  AND cf2.file_path = elr.rel_file_path
 			  AND datetime(c2.committed_at) >= datetime(e.ts)
 			  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
+			  AND `+HoldsFile+`
 		  )
 		ORDER BY datetime(e.ts) ASC`,
 		args...)
@@ -431,12 +443,73 @@ const (
 // parents.
 const maxParentChain = 500
 
-// checkoutsOf is the subquery for the repository rows that are checkouts of
+// HoldsFile is the SQL test, on a commit c2 and its file row cf2, that the
+// commit still closes the attribution window for that file. One that has
+// given the file up (GiveUpAttribution: its rows for it are all at zero) does
+// not, once a later commit in the same checkout has attribution rows for the
+// file. That later commit is the replacement it gave its lines to, or a
+// rewrite of that replacement, and it closes the window in its place. When
+// the replacement is rewritten in turn, the next commit has to see past the
+// first original too, and by then it cannot be compared any more: git drops
+// a commit nothing refers to.
+//
+// A retired commit whose replacement is recorded with another checkout (a
+// squash of commits from several worktrees) keeps closing the window in its
+// own. So does a commit with no attribution rows for the file: one made by
+// hand holds it like any other.
+const HoldsFile = `NOT (
+	COALESCE((
+		SELECT MAX(g.lines_attributed) FROM commit_session_files g
+		WHERE g.commit_id = c2.id AND g.file_path = cf2.file_path), 1) = 0
+	AND EXISTS (
+		SELECT 1 FROM commits c3
+		JOIN commit_session_files g3 ON g3.commit_id = c3.id
+		WHERE c3.repo_id = c2.repo_id
+		  AND c3.id != c2.id
+		  AND g3.file_path = cf2.file_path
+		  AND datetime(c3.committed_at) >= datetime(c2.committed_at)))`
+
+// EventSource is one place a commit's edits were captured: a repository row,
+// and the time up to which its edits count.
+type EventSource struct{ RepoID, Until string }
+
+// AttributionSources returns where to look for the edits of a commit: its own
+// repository row, up to the commit, and the row of every commit it carries
+// that was recorded in another checkout, up to that commit. A squash made in
+// one checkout can carry commits from several worktrees, and each worktree
+// holds only its own edits.
+func (db *DB) AttributionSources(repoID, committedAt string, carried []string) []EventSource {
+	sources := []EventSource{{repoID, committedAt}}
+	seen := map[string]bool{repoID: true}
+	// carried is newest first, so the first commit met in a row is its latest.
+	for _, id := range carried {
+		var row, at string
+		if err := db.QueryRow(`SELECT repo_id, committed_at FROM commits WHERE id = ?`, id).Scan(&row, &at); err != nil {
+			continue
+		}
+		if !seen[row] {
+			seen[row] = true
+			sources = append(sources, EventSource{row, at})
+		}
+	}
+	return sources
+}
+
+// eventTime parses an event timestamp; one that does not parse sorts first.
+func eventTime(ts string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// CheckoutsOf is the subquery for the repository rows that are checkouts of
 // one repository: the row itself (first argument) and every row that has its
 // remote (second argument, the same id). Every working tree is a row of its
 // own, so the worktrees of a repository, and separate clones of it, are
 // several rows. A repository with no remote has only its own row.
-const checkoutsOf = `(
+const CheckoutsOf = `(
 	SELECT id FROM repositories
 	WHERE id = ?
 	   OR (COALESCE(remote_url, '') != ''
@@ -487,7 +560,7 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 		       SUM(cf2.lines_added)
 		FROM commits c2
 		JOIN commit_files cf2 ON cf2.commit_id = c2.id
-		WHERE c2.repo_id IN `+checkoutsOf+`
+		WHERE c2.repo_id IN `+CheckoutsOf+`
 		  AND c2.id != ?
 		  AND datetime(c2.committed_at) <= datetime(?)
 		  AND cf2.lines_added > 0
@@ -524,7 +597,7 @@ func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []
 	// the few that get that far.
 	onChain := map[string]bool{}
 	rows, err = db.Query(`
-		WITH RECURSIVE checkouts(id) AS `+checkoutsOf+`,
+		WITH RECURSIVE checkouts(id) AS `+CheckoutsOf+`,
 		chain(sha, depth) AS (
 			SELECT parent_sha, 1 FROM commits WHERE id = ?
 			UNION

@@ -162,6 +162,11 @@ func TestCommitCatchUp(t *testing.T) {
 	t.Run("one repository is looked at once a minute on Stop", func(t *testing.T) { testCatchUpThrottle(t, home) })
 	t.Run("a commit is recorded from the worktree it was made in, and only once", func(t *testing.T) { testCatchUpWorktrees(t, home) })
 	t.Run("a rewrite made in another checkout carries the commit recorded in a worktree", func(t *testing.T) { testCatchUpRewriteFromAnotherCheckout(t, home) })
+	t.Run("a rewrite reported twice from another checkout is recorded once", func(t *testing.T) { testRewriteReportedTwice(t, home) })
+	t.Run("a squash of commits from two worktrees carries both", func(t *testing.T) { testSquashAcrossWorktrees(t, home) })
+	t.Run("a cherry-pick from another clone leaves the original on its branch alone", func(t *testing.T) { testCherryPickFromAnotherClone(t, home) })
+	t.Run("a commit recorded in an unrelated repository is left alone", func(t *testing.T) { testCatchUpLeavesOtherRepositoriesAlone(t, home) })
+	t.Run("a second rewrite is carried after git has dropped the first original", func(t *testing.T) { testRewriteAfterOriginalIsPruned(t, home) })
 }
 
 func testCatchUpWorktrees(t *testing.T, home string) {
@@ -248,6 +253,186 @@ func testCatchUpRewriteFromAnotherCheckout(t *testing.T, home string) {
 		t.Errorf("a second look recorded %d commit(s)", n)
 	}
 	wantCommit(t, db, "the amended commit after a second look", amended, 4)
+}
+
+func testRewriteReportedTwice(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "twice")
+	tree := filepath.Join(home, "twice-wt-topic")
+	gitOut(t, repo, "worktree", "add", "-q", "-b", "topic", tree)
+	agentWrites(t, "twice-1", tree, "y.txt", numbered(4, "y %d"))
+	original := commitAll(t, tree, "add y")
+	if err := GitCommit(tree, original); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repo, "worktree", "remove", "--force", tree)
+	gitOut(t, repo, "checkout", "-q", "topic")
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add y, reworded")
+	amended := gitOut(t, repo, "rev-parse", "HEAD")
+	// The post-commit hook and the git shadow both report a commit.
+	for i := 0; i < 2; i++ {
+		if err := GitCommit(repo, amended); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db := openDB(t)
+	var copies int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM commits WHERE sha = ?`, amended).Scan(&copies); err != nil {
+		t.Fatal(err)
+	}
+	if copies != 1 {
+		t.Errorf("the amended commit is recorded %d times", copies)
+	}
+	wantCommit(t, db, "the amended commit", amended, 4)
+
+	// A later look records another commit and settles this one again. It
+	// keeps its lines and its note.
+	writeFile(t, filepath.Join(repo, "z.txt"), "z\n")
+	commitAll(t, repo, "add z")
+	if n := sweep(t, repo); n != 1 {
+		t.Errorf("recorded %d commit(s), want the new one", n)
+	}
+	wantCommit(t, db, "the amended commit after a later look", amended, 4)
+	if !hasNote(repo, amended) {
+		t.Errorf("the amended commit lost its note")
+	}
+}
+
+func testSquashAcrossWorktrees(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "both")
+	// One branch, worked on in two worktrees one after the other.
+	first := filepath.Join(home, "both-wt-one")
+	gitOut(t, repo, "worktree", "add", "-q", "-b", "topic", first)
+	agentWrites(t, "both-1", first, "a.txt", numbered(4, "a %d"))
+	one := commitAll(t, first, "add a")
+	if err := GitCommit(first, one); err != nil {
+		t.Fatal(err)
+	}
+	// The first worktree stays, on other work.
+	gitOut(t, first, "checkout", "-q", "--detach", "main")
+	second := filepath.Join(home, "both-wt-two")
+	gitOut(t, repo, "worktree", "add", "-q", second, "topic")
+	agentWrites(t, "both-2", second, "b.txt", numbered(3, "b %d"))
+	two := commitAll(t, second, "add b")
+	if err := GitCommit(second, two); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repo, "worktree", "remove", "--force", second)
+
+	// The branch is squashed in the main checkout before it is pushed.
+	gitOut(t, repo, "checkout", "-q", "topic")
+	gitOut(t, repo, "reset", "-q", "--soft", "main")
+	squashed := commitAll(t, repo, "add a and b")
+
+	sweep(t, repo)
+	db := openDB(t)
+	wantCommit(t, db, "the squashed commit", squashed, 7)
+	wantCommit(t, db, "the commit from the first worktree", one, 0)
+	wantCommit(t, db, "the commit from the second worktree", two, 0)
+
+	// The squashed commit is recorded with the second worktree. In the
+	// first, the commit it replaced still stands between its edits and
+	// later work there: a file written by hand on the same line numbers
+	// takes none of them.
+	laterSecond()
+	writeFile(t, filepath.Join(first, "a.txt"), numbered(4, "typed by hand %d"))
+	byHand := commitAll(t, first, "add a by hand")
+	sweep(t, first)
+	wantCommit(t, db, "a later commit in the first worktree, typed by hand", byHand, 0)
+	wantCommit(t, db, "the squashed commit after it", squashed, 7)
+}
+
+func testCherryPickFromAnotherClone(t *testing.T, home string) {
+	repo, remote := repoWithRemote(t, home, "twins")
+	other := filepath.Join(home, "twins-other")
+	gitOut(t, home, "clone", "-q", remote, other)
+	gitOut(t, other, "config", "user.email", "mate@example.com")
+	gitOut(t, other, "config", "user.name", "Mate")
+
+	// An unpublished commit on a branch of the first clone.
+	gitOut(t, repo, "checkout", "-q", "-b", "topic")
+	agentWrites(t, "twins-1", repo, "t.txt", numbered(4, "t %d"))
+	original := commitAll(t, repo, "add t")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+	// The second clone takes it straight from the first and cherry-picks it.
+	// No branch of the second clone holds the original.
+	gitOut(t, other, "fetch", "-q", repo, "topic")
+	gitOut(t, other, "cherry-pick", "FETCH_HEAD")
+	picked := gitOut(t, other, "rev-parse", "HEAD")
+	if picked == original {
+		t.Fatal("test setup: the cherry-pick did not make a new commit")
+	}
+
+	sweep(t, other)
+	db := openDB(t)
+	wantCommit(t, db, "the cherry-pick", picked, 4)
+	wantCommit(t, db, "the original, still on its branch in the first clone", original, 4)
+}
+
+func testCatchUpLeavesOtherRepositoriesAlone(t *testing.T, home string) {
+	upstream, upstreamRemote := repoWithRemote(t, home, "up")
+	agentWrites(t, "up-1", upstream, "u.txt", numbered(3, "u %d"))
+	shared := commitAll(t, upstream, "add u")
+	if err := GitCommit(upstream, shared); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fork: a repository with a remote of its own that holds the same
+	// commit, taken straight from the upstream clone and not yet pushed.
+	forkRemote := filepath.Join(home, "up-fork.git")
+	gitOut(t, home, "clone", "-q", "--bare", upstreamRemote, forkRemote)
+	fork := filepath.Join(home, "up-fork")
+	gitOut(t, home, "clone", "-q", forkRemote, fork)
+	gitOut(t, fork, "config", "user.email", "dev@example.com")
+	gitOut(t, fork, "config", "user.name", "Dev")
+	gitOut(t, fork, "pull", "-q", "--ff-only", upstream, "main")
+	writeFile(t, filepath.Join(fork, "own.txt"), "own\n")
+	own := commitAll(t, fork, "add own")
+
+	if n := sweep(t, fork); n != 1 {
+		t.Errorf("recorded %d commit(s) in the fork, want its own one", n)
+	}
+	db := openDB(t)
+	wantCommit(t, db, "the fork's own commit", own, 0)
+	wantCommit(t, db, "the commit recorded in the upstream clone", shared, 3)
+	// The fork has none of that commit's edits. Its look must not attribute
+	// the other repository's record or write a note for it here.
+	if hasNote(fork, shared) {
+		t.Errorf("a look from the fork wrote a note for a commit recorded in another repository")
+	}
+}
+
+func testRewriteAfterOriginalIsPruned(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "pruned")
+	agentWrites(t, "pruned-1", repo, "p.txt", numbered(4, "p %d"))
+	original := commitAll(t, repo, "add p")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add p, reworded")
+	firstRewrite := gitOut(t, repo, "rev-parse", "HEAD")
+	if err := GitCommit(repo, firstRewrite); err != nil {
+		t.Fatal(err)
+	}
+	// git drops the original: nothing refers to it any more.
+	gitOut(t, repo, "reflog", "expire", "--expire=now", "--all")
+	gitOut(t, repo, "gc", "-q", "--prune=now")
+	gone := exec.Command("git", "cat-file", "-e", original)
+	gone.Dir = repo
+	if gone.Run() == nil {
+		t.Fatal("test setup: git still has the original")
+	}
+
+	// The store still lists the original as an earlier commit on this file.
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add p, reworded again")
+	secondRewrite := gitOut(t, repo, "rev-parse", "HEAD")
+	if err := GitCommit(repo, secondRewrite); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t)
+	wantCommit(t, db, "the second rewrite", secondRewrite, 4)
+	wantCommit(t, db, "the first rewrite", firstRewrite, 0)
 }
 
 func testCatchUpOnStop(t *testing.T, home string) {
