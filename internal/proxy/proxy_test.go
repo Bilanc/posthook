@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bilanc/posthook/internal/notes"
+	"github.com/bilanc/posthook/internal/spool"
 )
 
 func TestSplitGitInvocation(t *testing.T) {
@@ -281,5 +282,62 @@ func TestGlobalOptions(t *testing.T) {
 	}
 	if got := globalOptions(nil, nil); got != nil {
 		t.Fatalf("expected nil for an empty invocation, got %q", got)
+	}
+}
+
+// A push is the last moment a commit can be told from everyone else's: the
+// shadow lists what no remote has before the push and queues it after.
+func TestPushQueuesTheCommitsNoRemoteHas(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	repo := filepath.Join(root, "repo")
+	mustGit(t, root, "init", "-q", "--bare", "--initial-branch=main", remote)
+	mustGit(t, root, "init", "-q", "--initial-branch=main", repo)
+	mustGit(t, repo, "remote", "add", "origin", remote)
+	mustGit(t, repo, "commit", "-q", "--allow-empty", "-m", "pushed")
+	mustGit(t, repo, "push", "-q", "-u", "origin", "main")
+	mustGit(t, repo, "commit", "-q", "--allow-empty", "-m", "first unpushed")
+	first := mustGit(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "commit", "-q", "--allow-empty", "-m", "second unpushed")
+	second := mustGit(t, repo, "rev-parse", "HEAD")
+	chdir(t, t.TempDir()) // the push names its repo with -C
+
+	gotRoot := preflight(realGit, []string{"-C", repo}, "push")
+	shas := unpushedBeforePush(realGit, gotRoot)
+	if len(shas) != 2 || shas[0] != first || shas[1] != second {
+		t.Fatalf("unpushed = %v, want [%s %s] oldest first", shas, first, second)
+	}
+	queueCatchUp(gotRoot, shas)
+
+	var jobs []spool.CommitJob
+	if _, err := spool.DrainCommitJobs(func(j spool.CommitJob) error { jobs = append(jobs, j); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || len(jobs[0].SHAs) != 2 || jobs[0].SHAs[0] != first {
+		t.Fatalf("queued jobs = %+v", jobs)
+	}
+	resolved, _ := filepath.EvalSymlinks(repo)
+	if jobs[0].RepoRoot != resolved {
+		t.Errorf("job repo = %q, want %q", jobs[0].RepoRoot, resolved)
+	}
+
+	// Nothing unpushed, nothing listed: the usual push queues no job.
+	mustGit(t, repo, "push", "-q", "origin", "main")
+	if shas := unpushedBeforePush(realGit, gotRoot); len(shas) != 0 {
+		t.Errorf("after the push still lists %v", shas)
+	}
+	// Outside a repository there is nothing to resolve or to list.
+	if root := preflight(realGit, nil, "push"); root != "" || len(unpushedBeforePush(realGit, root)) != 0 {
+		t.Errorf("outside a repo: root %q", root)
+	}
+	// Only push, fetch and pull resolve the repository at all.
+	if root := preflight(realGit, []string{"-C", repo}, "status"); root != "" {
+		t.Errorf("preflight resolved %q for a subcommand it does not act on", root)
 	}
 }

@@ -25,11 +25,13 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/ingest"
 	"github.com/bilanc/posthook/internal/logx"
 	"github.com/bilanc/posthook/internal/notes"
+	"github.com/bilanc/posthook/internal/spool"
 )
 
 // Run is the proxy entrypoint. Never returns; calls os.Exit with the
@@ -47,10 +49,22 @@ func Run(args []string) {
 	globals := globalOptions(args, subcommandArgs)
 	interceptable := !bypass && isInterceptable(subcommand)
 
+	var root string
 	if !bypass {
-		preflight(realGit, globals, subcommand)
+		root = preflight(realGit, globals, subcommand)
+	}
+	// Commits that are on no remote yet, noted before the push because
+	// afterwards they are indistinguishable from everyone else's.
+	pushRoot := root
+	var unpushed []string
+	if !bypass && subcommand == "push" {
+		unpushed = unpushedBeforePush(realGit, pushRoot)
 	}
 	code := spawnPassthrough(realGit, args)
+	if len(unpushed) > 0 {
+		// Whatever the push's exit code: the commits exist either way.
+		queueCatchUp(pushRoot, unpushed)
+	}
 
 	if interceptable && code == 0 {
 		defer func() {
@@ -91,20 +105,23 @@ func Run(args []string) {
 // globals are the options git received before the subcommand (`-C dir`,
 // `--git-dir`, `-c k=v`, ...) so the repo is resolved exactly as git itself
 // will resolve it.
-func preflight(realGit string, globals []string, subcommand string) {
+//
+// It returns the working tree it resolved, empty for other subcommands and
+// outside a repository, so the caller does not ask git for it again.
+func preflight(realGit string, globals []string, subcommand string) (root string) {
 	switch subcommand {
 	case "push", "fetch", "pull":
 	default:
-		return
+		return ""
 	}
 	defer func() {
 		if r := recover(); r != nil {
 			logx.Warnf("proxy preflight panicked for %s: %v", subcommand, r)
 		}
 	}()
-	root := repoRoot(realGit, globals)
+	root = repoRoot(realGit, globals)
 	if root == "" {
-		return
+		return ""
 	}
 	// Every remote is repaired, not just the one named on the command line:
 	// `--all` and `--multiple` touch several, and the cost is the same single
@@ -112,6 +129,70 @@ func preflight(realGit string, globals []string, subcommand string) {
 	if notes.RepairRefspec(root, "") {
 		logx.Debugf("proxy: repaired notes refspec before %s", subcommand)
 	}
+	return root
+}
+
+// unpushedBeforePush lists the recent commits on the checked-out branch that
+// no remote has, oldest first, for the working tree a push is about to run in.
+// One rev-list; every failure yields nothing.
+func unpushedBeforePush(realGit, root string) (shas []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Warnf("proxy: listing unpushed commits panicked: %v", r)
+			shas = nil
+		}
+	}()
+	if root == "" {
+		return nil
+	}
+	out := runRealGit(realGit, root, ingest.UnpushedCommitsArgs()...)
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			shas = append(shas, line)
+		}
+	}
+	return shas
+}
+
+// queueCatchUp hands the commits a push carried to the worker, which records
+// the ones posthook has not seen. The shadow itself does not open the store:
+// a push must not wait on it. Almost always every commit is already recorded
+// and the worker has nothing to do.
+func queueCatchUp(root string, shas []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Warnf("proxy: queueing commit catch-up panicked: %v", r)
+		}
+	}()
+	job := spool.CommitJob{RepoRoot: root, SHAs: shas, ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if err := spool.WriteCommitJob(job); err != nil {
+		logx.Warnf("proxy: queueing commit catch-up failed: %v", err)
+		return
+	}
+	kickWorker()
+}
+
+// kickWorker starts `posthook worker` detached so a queued job is handled
+// even when no agent hook fires afterwards. The worker is a singleton: one
+// that finds another running exits at once. Only the installed binary is
+// started, never a test binary or a build under another name.
+func kickWorker() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	if filepath.Base(exe) != "posthook" {
+		return
+	}
+	cmd := exec.Command(exe, "worker")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	_ = cmd.Process.Release()
 }
 
 // globalOptions returns the arguments git received before its subcommand.

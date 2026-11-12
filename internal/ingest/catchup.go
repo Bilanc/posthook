@@ -1,0 +1,313 @@
+package ingest
+
+import (
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/bilanc/posthook/internal/gitx"
+	"github.com/bilanc/posthook/internal/logx"
+	"github.com/bilanc/posthook/internal/spool"
+	"github.com/bilanc/posthook/internal/store"
+)
+
+// Catch-up: recording commits posthook did not see being made.
+//
+// A commit is normally recorded the moment it is made, by the git shadow
+// (`git commit` through ~/.local/bin/git) or by the per-repo post-commit
+// hook. Both can be missing: an IDE runs its own git, a tool calls git by
+// absolute path, ~/.local/bin is not first on PATH, an older checkout or a
+// worktree has no hook. And neither fires for commits that `git rebase`,
+// `git merge`, `git pull`, `git cherry-pick` or `git revert` create. A commit
+// nobody recorded has no attribution, and a merge request made only of such
+// commits is invisible.
+//
+// So at two moments posthook looks for what it missed in a repository:
+//
+//   - when an agent turn ends (Stop), in every repository the session worked
+//     in;
+//   - when the shadow sees `git push`, for the repository being pushed (the
+//     shadow lists the commits and the worker does the rest).
+//
+// "Missed" means: on the branch checked out in that working tree, on no
+// remote, made after posthook was installed, and not in the store.
+//
+//   - "On no remote" is what tells a commit made on this machine from one
+//     that was fetched: everyone else's commits arrive through a
+//     remote-tracking ref. It also means the list has to be taken before a
+//     push, not after.
+//   - Only the checked-out branch, not every local branch: worktrees of one
+//     repository share their branches, and each is its own repository to
+//     posthook, with its own edits. A commit recorded from the wrong
+//     worktree would be attributed against edits that are not there.
+//
+// What this cannot see: a commit made and pushed by a git that never goes
+// through the shadow, with no agent turn ending in between.
+
+// maxCatchUpCommits bounds one look at a repository.
+const maxCatchUpCommits = 200
+
+// catchUpLookback is how far back a look goes. A checkout can hold years of
+// local branches whose commits are on no remote any more (merged by squash,
+// branch deleted); the commits worth recording are the recent ones.
+const catchUpLookback = "30.days.ago"
+
+// catchUpInterval is how often one repository is looked at on Stop events.
+const catchUpInterval = time.Minute
+
+var (
+	catchUpMu   sync.Mutex
+	lastCatchUp = map[string]time.Time{}
+)
+
+// UnpushedCommitsArgs are the git arguments that list the commits on the
+// checked-out branch that no remote has and that were made within
+// catchUpLookback, oldest first, newest maxCatchUpCommits.
+func UnpushedCommitsArgs() []string {
+	return []string{"rev-list", "HEAD", "--not", "--remotes",
+		"--since=" + catchUpLookback,
+		"--max-count=" + strconv.Itoa(maxCatchUpCommits), "--reverse"}
+}
+
+// ProcessCommitJob handles one job the git shadow queued at a push.
+func ProcessCommitJob(job spool.CommitJob) error {
+	_, err := RecordMissingCommits(job.RepoRoot, job.SHAs)
+	return err
+}
+
+// catchUpSessionRepos looks for missed commits in the repositories a session
+// has events in, and in the repository its last event resolved to. Fail-soft:
+// a session's Stop must not fail because of this.
+func catchUpSessionRepos(db *store.DB, sessionID, repoRoot string) {
+	roots := []string{}
+	seen := map[string]bool{}
+	add := func(root string) {
+		if root != "" && !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	add(repoRoot)
+	rows, err := db.Query(`
+		SELECT DISTINCT r.root_path
+		FROM events e JOIN repositories r ON r.id = e.repo_id
+		WHERE e.session_id = ?
+		LIMIT 20`, sessionID)
+	if err == nil {
+		for rows.Next() {
+			var root string
+			if rows.Scan(&root) == nil {
+				add(root)
+			}
+		}
+		rows.Close()
+	}
+	for _, root := range roots {
+		if _, err := CatchUpRepo(root); err != nil {
+			logx.Warnf("commit catch-up failed in %s: %v", root, err)
+		}
+	}
+}
+
+// CatchUpRepo records the missed commits of one repository. It looks at most
+// once per catchUpInterval; a call inside that window does nothing.
+func CatchUpRepo(root string) (int, error) {
+	root = gitx.Canonicalize(root)
+	catchUpMu.Lock()
+	if last, ok := lastCatchUp[root]; ok && time.Since(last) < catchUpInterval {
+		catchUpMu.Unlock()
+		return 0, nil
+	}
+	lastCatchUp[root] = time.Now()
+	catchUpMu.Unlock()
+
+	if gitx.FindRepoRoot(root) == "" {
+		return 0, nil
+	}
+	out, err := gitx.Output(root, UnpushedCommitsArgs()...)
+	if err != nil {
+		return 0, nil // not a repository any more, or an empty one
+	}
+	return RecordMissingCommits(root, nonEmptyLines(string(out)))
+}
+
+// RecordMissingCommits records those of shas (oldest first) that the store
+// does not hold and that were made after posthook was installed, and returns
+// how many it recorded. Then it settles what the new commits change: a later
+// commit on the same files may have taken edits that belong to an earlier
+// one that was only just recorded, and a commit that no branch holds any
+// more has been replaced.
+func RecordMissingCommits(repoRoot string, shas []string) (int, error) {
+	if repoRoot == "" || len(shas) == 0 {
+		return 0, nil
+	}
+	repoRoot = gitx.Canonicalize(repoRoot)
+	if gitx.FindRepoRoot(repoRoot) == "" {
+		return 0, nil
+	}
+	if len(shas) > maxCatchUpCommits {
+		shas = shas[len(shas)-maxCatchUpCommits:]
+	}
+	db, err := store.Open()
+	if err != nil {
+		return 0, err
+	}
+	repoID, err := upsertRepositoryByCwd(db, repoRoot)
+	if err != nil {
+		return 0, err
+	}
+
+	known, err := recordedSHAs(db, shas)
+	if err != nil {
+		return 0, err
+	}
+	var missing []string
+	for _, sha := range shas {
+		if !known[sha] {
+			missing = append(missing, sha)
+		}
+	}
+
+	recorded := 0
+	if len(missing) > 0 {
+		made := committerTimes(repoRoot, missing)
+		installedAt, haveInstall := db.InstalledAt()
+		for _, sha := range missing {
+			at, ok := made[sha]
+			if !ok {
+				continue // git no longer has it
+			}
+			if haveInstall && at < installedAt.Unix() {
+				continue // made before posthook was on this machine
+			}
+			if err := GitCommit(repoRoot, sha); err != nil {
+				return recorded, err
+			}
+			recorded++
+		}
+		if recorded > 0 {
+			logx.Debugf("commit catch-up: recorded %d commit(s) in %s", recorded, repoRoot)
+		}
+	}
+
+	// Every commit in the list, new or not, is looked at once more. A commit
+	// recorded when it was made can since have been replaced (the push that
+	// queued this job may itself be the force-push of a rebase), and one
+	// recorded just now may sit before a commit that was attributed without
+	// it.
+	settleCommits(db, repoRoot, repoID, shas, recorded > 0)
+	return recorded, nil
+}
+
+// settleCommits re-attributes the listed commits where a newly recorded,
+// earlier commit can have changed their window, and retires the attribution
+// of commits they have replaced.
+func settleCommits(db *store.DB, repoRoot, repoID string, shas []string, reattribute bool) {
+	for _, sha := range shas {
+		var commitID string
+		if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&commitID); err != nil {
+			continue
+		}
+		if reattribute {
+			attributeAndNote(db, repoRoot, repoID, sha, commitID)
+		} else {
+			clearSuperseded(db, repoRoot, repoID, sha, commitID)
+		}
+	}
+}
+
+// clearSuperseded zeroes the attribution of recorded commits that touch the
+// same files as this one, are not in its history, and are on no branch any
+// more: the commits a rebase, an amend or a squash replaced. Their lines are
+// carried by the replacement now, and counting both would double them. A
+// commit that is still on a branch (a cherry-pick's original, work on another
+// branch) keeps its attribution.
+func clearSuperseded(db *store.DB, repoRoot, repoID, sha, commitID string) {
+	for _, strangerID := range strangersOf(db, repoRoot, repoID, sha, commitID) {
+		var strangerSHA string
+		if err := db.QueryRow(`SELECT sha FROM commits WHERE id = ?`, strangerID).Scan(&strangerSHA); err != nil {
+			continue
+		}
+		if onAnyBranch(repoRoot, strangerSHA) {
+			continue
+		}
+		if err := db.ClearCommitAttribution(strangerID); err != nil {
+			logx.Warnf("clearing superseded commit failed: %v", err)
+		} else if len(strangerSHA) >= 7 && len(sha) >= 7 {
+			logx.Debugf("commit %s is on no branch any more; its attribution is carried by %s", strangerSHA[:7], sha[:7])
+		}
+	}
+}
+
+// strangersOf is store.StrangerCommits for a recorded commit.
+func strangersOf(db *store.DB, repoRoot, repoID, sha, commitID string) []string {
+	var committedAt string
+	if err := db.QueryRow(`SELECT committed_at FROM commits WHERE id = ?`, commitID).Scan(&committedAt); err != nil {
+		return nil
+	}
+	return db.StrangerCommits(commitID, sha, repoID, committedAt, repoRoot)
+}
+
+// onAnyBranch reports whether a local or remote-tracking branch still holds
+// the commit. A commit git no longer has is on none.
+func onAnyBranch(repoRoot, sha string) bool {
+	return gitx.Run(repoRoot, "branch", "--all", "--contains", sha, "--format=%(refname)") != ""
+}
+
+// recordedSHAs returns which of shas the store holds, under any repository:
+// a commit recorded in one worktree is the same commit in another, and
+// recording it twice would only add a copy with nothing attributed.
+func recordedSHAs(db *store.DB, shas []string) (map[string]bool, error) {
+	known := map[string]bool{}
+	args := make([]any, 0, len(shas))
+	for _, sha := range shas {
+		args = append(args, sha)
+	}
+	rows, err := db.Query(`SELECT DISTINCT sha FROM commits WHERE sha IN (?`+
+		strings.Repeat(", ?", len(shas)-1)+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, err
+		}
+		known[sha] = true
+	}
+	return known, rows.Err()
+}
+
+// committerTimes returns each commit's committer time (unix seconds) in one
+// git call. A rebase, an amend and a cherry-pick all set it to when they ran,
+// which is what "made on this machine after posthook was installed" needs.
+func committerTimes(repoRoot string, shas []string) map[string]int64 {
+	args := append([]string{"log", "--no-walk=unsorted", "--format=%H %ct"}, shas...)
+	out, err := gitx.Output(repoRoot, args...)
+	if err != nil {
+		return nil
+	}
+	times := map[string]int64{}
+	for _, line := range nonEmptyLines(string(out)) {
+		sha, at, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		if n, err := strconv.ParseInt(at, 10, 64); err == nil {
+			times[sha] = n
+		}
+	}
+	return times
+}
+
+func nonEmptyLines(text string) []string {
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}

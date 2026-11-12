@@ -351,6 +351,12 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		}
 	}
 
+	// A turn just ended: record any commit made in the repositories this
+	// session worked in that posthook did not see being made (catchup.go).
+	if eventType == "Stop" && sessionID != "" {
+		catchUpSessionRepos(db, sessionID, repoRoot)
+	}
+
 	return nil
 }
 
@@ -486,26 +492,36 @@ func GitCommit(repoRoot, sha string) error {
 		}
 	}
 
-	attributedSessions, err := db.RefreshCommitAttributions(finalCommitID)
-	if err != nil {
-		logx.Warnf("refresh attributions failed: %v", err)
-	}
 	if len(sha) >= 7 {
 		logx.Debugf("ingested commit %s in %s (+%d/-%d)", sha[:7], repoName, added, removed)
+	}
+	attributeAndNote(db, repoRoot, repoID, sha, finalCommitID)
+	return nil
+}
+
+// attributeAndNote (re)computes one recorded commit's attribution, retires
+// the attribution of commits it has replaced, and writes its git note.
+func attributeAndNote(db *store.DB, repoRoot, repoID, sha, commitID string) {
+	attributedSessions, err := db.RefreshCommitAttributions(commitID)
+	if err != nil {
+		logx.Warnf("refresh attributions failed: %v", err)
 	}
 	if attributedSessions > 0 && len(sha) >= 7 {
 		logx.Debugf("attributed commit %s to %d session(s)", sha[:7], attributedSessions)
 	}
-
-	if err := writeNoteForCommit(db, repoRoot, repoID, sha, finalCommitID); err != nil {
+	clearSuperseded(db, repoRoot, repoID, sha, commitID)
+	if err := writeNoteForCommit(db, repoRoot, repoID, sha, commitID); err != nil {
 		if len(sha) >= 7 {
 			logx.Warnf("note write failed for %s: %v", sha[:7], err)
 		}
 	}
-	return nil
 }
 
 func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) error {
+	// The same window as attribution: only a commit in this commit's own
+	// history closes it (store.StrangerCommits).
+	notStranger, strangerArgs := store.NotInClause("c2.id", strangersOf(db, repoRoot, repoID, sha, commitID))
+	args := append([]any{commitID, repoID}, strangerArgs...)
 	rows, err := db.Query(`
 		SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
 		       e.ts AS event_ts, elr.start_line, elr.end_line
@@ -526,10 +542,10 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) er
 			WHERE c2.repo_id = c.repo_id
 			  AND cf2.file_path = cf.file_path
 			  AND datetime(c2.committed_at) >= datetime(e.ts)
-			  AND datetime(c2.committed_at) < datetime(c.committed_at)
+			  AND datetime(c2.committed_at) < datetime(c.committed_at)`+notStranger+`
 		  )
 		ORDER BY elr.rel_file_path, elr.start_line`,
-		commitID, repoID)
+		args...)
 	if err != nil {
 		return err
 	}
