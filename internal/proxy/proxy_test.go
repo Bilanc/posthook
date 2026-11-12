@@ -332,9 +332,21 @@ func TestPushQueuesTheCommitsNoRemoteHas(t *testing.T) {
 	if got := pushNotesRemote(realGit, "", []string{"origin", "main"}); got != "" {
 		t.Errorf("pushNotesRemote outside a repository = %q", got)
 	}
-	queueCatchUp(gotRoot, shas, pushNotesRemote(realGit, gotRoot, []string{"origin", "main"}))
+	release := queueCatchUp(gotRoot, shas, pushNotesRemote(realGit, gotRoot, []string{"origin", "main"}))
 
+	// The job is on disk, and held while the shadow sends its notes: a
+	// worker that is already running must not take it yet.
 	var jobs []spool.CommitJob
+	if _, err := spool.DrainCommitJobs(func(j spool.CommitJob) error { jobs = append(jobs, j); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("the job was taken before the shadow released it: %+v", jobs)
+	}
+	if n, _ := spool.PendingCommitJobs(); n != 1 {
+		t.Fatalf("pending jobs = %d, want the held one", n)
+	}
+	release()
 	if _, err := spool.DrainCommitJobs(func(j spool.CommitJob) error { jobs = append(jobs, j); return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -347,6 +359,14 @@ func TestPushQueuesTheCommitsNoRemoteHas(t *testing.T) {
 	resolved, _ := filepath.EvalSymlinks(repo)
 	if jobs[0].RepoRoot != resolved {
 		t.Errorf("job repo = %q, want %q", jobs[0].RepoRoot, resolved)
+	}
+
+	// A push that sends no notes has nothing to wait for: its job can be
+	// taken at once.
+	queueCatchUp(gotRoot, shas, "")()
+	var unheld int
+	if _, err := spool.DrainCommitJobs(func(spool.CommitJob) error { unheld++; return nil }); err != nil || unheld != 1 {
+		t.Errorf("a job with no notes to wait for: taken %d, err %v", unheld, err)
 	}
 
 	// Nothing unpushed, nothing listed: the usual push queues no job.

@@ -61,23 +61,25 @@ func Run(args []string) {
 		unpushed = unpushedBeforePush(realGit, pushRoot)
 	}
 	code := spawnPassthrough(realGit, args)
+	release := func() {}
 	if len(unpushed) > 0 {
 		// Whatever the push's exit code: the commits exist either way. The
 		// job is written before the notes go up, so it survives a push that
-		// is interrupted there.
+		// is interrupted there, and held until they are up, so a worker
+		// that is already running does not write and send notes while the
+		// shadow is merging and sending them.
 		notesRemote := ""
 		if interceptable && code == 0 {
 			notesRemote = pushNotesRemote(realGit, pushRoot, subcommandArgs)
 		}
-		queueCatchUp(pushRoot, unpushed, notesRemote)
+		release = queueCatchUp(pushRoot, unpushed, notesRemote)
 	}
 
 	if interceptable && code == 0 {
 		capture(realGit, subcommand, globals, subcommandArgs)
 	}
 	if len(unpushed) > 0 {
-		// After the notes transport above, so the worker does not write
-		// notes while they are being merged and pushed.
+		release()
 		kickWorker()
 	}
 	os.Exit(code)
@@ -178,7 +180,12 @@ func unpushedBeforePush(realGit, root string) (shas []string) {
 // notesRemote is where this push's notes go (pushNotesRemote), empty when
 // they go nowhere. The worker writes the notes of the commits it records
 // after the shadow has sent what it had, and sends them there itself.
-func queueCatchUp(root string, shas []string, notesRemote string) {
+//
+// When notes are about to go up, the job is held (spool.HoldCommitJob) and
+// the caller releases it with the returned function once they are. With no
+// notes to send there is nothing to wait for, and the function does nothing.
+func queueCatchUp(root string, shas []string, notesRemote string) (release func()) {
+	release = func() {}
 	defer func() {
 		if r := recover(); r != nil {
 			logx.Warnf("proxy: queueing commit catch-up panicked: %v", r)
@@ -186,8 +193,21 @@ func queueCatchUp(root string, shas []string, notesRemote string) {
 	}()
 	job := spool.CommitJob{RepoRoot: root, SHAs: shas, NotesRemote: notesRemote,
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	if err := spool.WriteCommitJob(job); err != nil {
+	if notesRemote == "" {
+		if err := spool.WriteCommitJob(job); err != nil {
+			logx.Warnf("proxy: queueing commit catch-up failed: %v", err)
+		}
+		return release
+	}
+	releaseJob, err := spool.HoldCommitJob(job)
+	if err != nil {
 		logx.Warnf("proxy: queueing commit catch-up failed: %v", err)
+		return release
+	}
+	return func() {
+		if err := releaseJob(); err != nil {
+			logx.Warnf("proxy: releasing commit catch-up failed: %v", err)
+		}
 	}
 }
 

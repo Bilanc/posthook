@@ -786,7 +786,16 @@ func (db *DB) InstalledAt() (time.Time, bool) {
 // The rows are kept at zero rather than deleted because the cloud landing
 // zone has no tombstones. It reports whether anything changed.
 func (db *DB) GiveUpAttribution(retiredID, replacementID string) (bool, error) {
-	res, err := db.Exec(`
+	// Both tables change together or not at all, and the per-session totals
+	// are brought in line with the file rows every time, not only when a
+	// file row changed in this call: totals left behind by an earlier call
+	// that was cut short would otherwise stay for good.
+	tx, err := db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(`
 		UPDATE commit_session_files SET lines_attributed = 0, synced_at = NULL
 		WHERE commit_id = ? AND lines_attributed != 0
 		  AND EXISTS (
@@ -799,10 +808,11 @@ func (db *DB) GiveUpAttribution(retiredID, replacementID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
+	files, err := res.RowsAffected()
+	if err != nil {
 		return false, err
 	}
-	_, err = db.Exec(`
+	res, err = tx.Exec(`
 		UPDATE commit_sessions SET
 		  lines_attributed = (
 			SELECT COALESCE(SUM(f.lines_attributed), 0) FROM commit_session_files f
@@ -813,8 +823,21 @@ func (db *DB) GiveUpAttribution(retiredID, replacementID string) (bool, error) {
 			  AND f.lines_attributed > 0),
 		  synced_at = NULL
 		WHERE commit_id = ?
+		  AND EXISTS (
+			SELECT 1 FROM commit_session_files f
+			WHERE f.commit_id = commit_sessions.commit_id AND f.session_id = commit_sessions.session_id)
 		  AND lines_attributed != (
 			SELECT COALESCE(SUM(f.lines_attributed), 0) FROM commit_session_files f
 			WHERE f.commit_id = commit_sessions.commit_id AND f.session_id = commit_sessions.session_id)`, retiredID)
-	return true, err
+	if err != nil {
+		return false, err
+	}
+	sessions, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return files > 0 || sessions > 0, nil
 }

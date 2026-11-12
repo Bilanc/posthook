@@ -353,3 +353,55 @@ func TestCarriedCommitIsCreditedOnlyWhenAttributedOnItsOwn(t *testing.T) {
 		t.Errorf("whole-database pass: original %d, amended %d lines, want 5 and 0", o, a)
 	}
 }
+
+// TestGiveUpAttributionBringsSessionTotalsInLine covers a retirement that was
+// cut short: the file rows are at zero already, the per-session total is not.
+// The next call has no file row left to change and still has to settle it.
+func TestGiveUpAttributionBringsSessionTotalsInLine(t *testing.T) {
+	db := newTestDB(t)
+	mustExec(t, db, `INSERT INTO repositories (id, name, root_path) VALUES ('repo1', 'r', '/nonexistent/path')`)
+	mustExec(t, db, `INSERT INTO sessions (id, agent_slug, repo_id, started_at)
+		VALUES ('sess1', 'claude-code', 'repo1', '2024-01-01T10:00:00Z')`)
+	for _, id := range []string{"retired", "replacement"} {
+		mustExec(t, db, `INSERT INTO commits (id, repo_id, sha, committed_at, lines_added) VALUES (?, 'repo1', ?, '2024-01-01T11:00:00Z', 5)`, id, id)
+	}
+	row := func(table, commitID string, lines int) {
+		cols, vals := "commit_id, session_id, first_event_ts, last_event_ts, lines_attributed", "?, 'sess1', 't', 't', ?"
+		if table == "commit_session_files" {
+			cols, vals = cols+", file_path", vals+", 'f.txt'"
+		} else {
+			cols, vals = cols+", agent_slug, files_touched", vals+", 'claude-code', 1"
+		}
+		mustExec(t, db, `INSERT INTO `+table+` (`+cols+`) VALUES (`+vals+`)`, commitID, lines)
+	}
+	row("commit_session_files", "replacement", 5)
+	row("commit_sessions", "replacement", 5)
+	row("commit_session_files", "retired", 0) // already given up
+	row("commit_sessions", "retired", 5)      // left behind
+	mustExec(t, db, `UPDATE commit_sessions SET synced_at = 'synced' WHERE commit_id = 'retired'`)
+
+	changed, err := db.GiveUpAttribution("retired", "replacement")
+	if err != nil {
+		t.Fatalf("GiveUpAttribution: %v", err)
+	}
+	if !changed {
+		t.Errorf("GiveUpAttribution reported no change")
+	}
+	var lines, files int
+	var synced sql.NullString
+	mustQueryRow(t, db, `SELECT lines_attributed, files_touched, synced_at FROM commit_sessions WHERE commit_id = 'retired'`, nil, &lines, &files, &synced)
+	if lines != 0 || files != 0 {
+		t.Errorf("retired commit's session total: %d lines in %d files, want 0 in 0", lines, files)
+	}
+	if synced.Valid {
+		t.Errorf("the corrected row is not marked for sync")
+	}
+	mustQueryRow(t, db, `SELECT lines_attributed FROM commit_sessions WHERE commit_id = 'replacement'`, nil, &lines)
+	if lines != 5 {
+		t.Errorf("replacement's session total changed to %d", lines)
+	}
+	// Nothing left to do: a further call changes nothing.
+	if changed, err := db.GiveUpAttribution("retired", "replacement"); err != nil || changed {
+		t.Errorf("a second call: changed %v, err %v", changed, err)
+	}
+}

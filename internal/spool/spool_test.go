@@ -2,7 +2,10 @@ package spool
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 // setHome points paths.PosthookDir() at a temp dir for the duration of a test.
@@ -124,5 +127,56 @@ func TestCommitJobStaysOnProcessError(t *testing.T) {
 	}
 	if left, _ := PendingCommitJobs(); left != 1 {
 		t.Fatalf("job should wait for the next pass, %d left", left)
+	}
+}
+
+func TestHeldCommitJobWaitsForItsRelease(t *testing.T) {
+	setHome(t)
+	drained := func() []CommitJob {
+		var jobs []CommitJob
+		if _, err := DrainCommitJobs(func(j CommitJob) error { jobs = append(jobs, j); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return jobs
+	}
+
+	release, err := HoldCommitJob(CommitJob{RepoRoot: "/r", SHAs: []string{"a"}, ReceivedAt: "2026-01-01T00:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs := drained(); len(jobs) != 0 {
+		t.Fatalf("a held job was taken: %+v", jobs)
+	}
+	// It counts as waiting, so a worker does not exit on it.
+	if n, _ := PendingCommitJobs(); n != 1 {
+		t.Errorf("pending = %d, want the held job", n)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	if jobs := drained(); len(jobs) != 1 || jobs[0].RepoRoot != "/r" {
+		t.Fatalf("after release: %+v", jobs)
+	}
+
+	// A job whose holder never came back is taken once it is old enough.
+	if _, err := HoldCommitJob(CommitJob{RepoRoot: "/abandoned", SHAs: []string{"b"}, ReceivedAt: "2026-01-01T00:00:01Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if jobs := drained(); len(jobs) != 0 {
+		t.Fatalf("a fresh held job was taken: %+v", jobs)
+	}
+	held, err := heldCommitJobs()
+	if err != nil || len(held) != 1 {
+		t.Fatalf("held jobs: %v, err %v", held, err)
+	}
+	old := time.Now().Add(-heldJobGrace - time.Second)
+	if err := os.Chtimes(filepath.Join(CommitJobsDir(), held[0].Name()), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if jobs := drained(); len(jobs) != 1 || jobs[0].RepoRoot != "/abandoned" {
+		t.Fatalf("an abandoned job was not taken: %+v", jobs)
+	}
+	if n, _ := PendingCommitJobs(); n != 0 {
+		t.Errorf("pending = %d after everything was taken", n)
 	}
 }
