@@ -602,10 +602,12 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 	count := 0
 	// The same edits as attribution reads (store.AttributionSources), in the
 	// same window: a commit this one carries does not close it
-	// (store.CarriedCommits), and neither does one that gave the file up.
+	// (store.CarriedCommits), and neither does one that gave the session's
+	// lines in the file up (store.ClosesWindow).
 	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
 	for _, src := range db.AttributionSources(repoID, committedAt, carried) {
 		args := append([]any{commitID, src.RepoID, src.Until, src.Until}, carriedArgs...)
+		args = append(args, commitID)
 		rows, err := db.Query(`
 			SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
 			       e.ts AS event_ts, elr.start_line, elr.end_line
@@ -625,7 +627,7 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 				  AND cf2.file_path = cf.file_path
 				  AND datetime(c2.committed_at) >= datetime(e.ts)
 				  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
-				  AND `+store.HoldsFile+`
+				  AND `+store.ClosesWindow+`
 			  )
 			ORDER BY elr.rel_file_path, elr.start_line`,
 			args...)

@@ -167,6 +167,7 @@ func TestCommitCatchUp(t *testing.T) {
 	t.Run("a cherry-pick from another clone leaves the original on its branch alone", func(t *testing.T) { testCherryPickFromAnotherClone(t, home) })
 	t.Run("a commit recorded in an unrelated repository is left alone", func(t *testing.T) { testCatchUpLeavesOtherRepositoriesAlone(t, home) })
 	t.Run("a second rewrite is carried after git has dropped the first original", func(t *testing.T) { testRewriteAfterOriginalIsPruned(t, home) })
+	t.Run("a second rewrite keeps one session's lines when the first dropped another's", func(t *testing.T) { testRewriteAfterPartialRetirement(t, home) })
 }
 
 func testCatchUpWorktrees(t *testing.T, home string) {
@@ -433,6 +434,52 @@ func testRewriteAfterOriginalIsPruned(t *testing.T, home string) {
 	db := openDB(t)
 	wantCommit(t, db, "the second rewrite", secondRewrite, 4)
 	wantCommit(t, db, "the first rewrite", firstRewrite, 0)
+}
+
+func testRewriteAfterPartialRetirement(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "partial")
+	path := filepath.Join(repo, "m.txt")
+	// Two sessions write to one file: the first creates it, the second adds
+	// three lines at its end.
+	first := numbered(5, "first session %d")
+	more := numbered(3, "second session %d")
+	agentWrites(t, "partial-a", repo, "m.txt", first)
+	writeFile(t, path, first+more)
+	deliver(t, "claude-code", repo, claudeEdit("partial-b", "Edit", path,
+		map[string]any{"old_string": "first session 5\n", "new_string": "first session 5\n" + more},
+		[]map[string]any{hunk(5, " first session 5", "+second session 1", "+second session 2", "+second session 3")},
+		map[string]any{"originalFile": first}))
+	original := commitAll(t, repo, "add m")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t)
+	wantCommit(t, db, "the commit with both sessions' lines", original, 8)
+
+	// The amend takes the second session's lines out again.
+	writeFile(t, path, first)
+	gitOut(t, repo, "add", "-A")
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add m, shorter")
+	firstRewrite := gitOut(t, repo, "rev-parse", "HEAD")
+	if err := GitCommit(repo, firstRewrite); err != nil {
+		t.Fatal(err)
+	}
+	wantCommit(t, db, "the first rewrite", firstRewrite, 5)
+	// The original gave up the first session's lines and keeps the second's,
+	// which no commit holds any more.
+	wantCommit(t, db, "the original after the first rewrite", original, 3)
+
+	gitOut(t, repo, "reflog", "expire", "--expire=now", "--all")
+	gitOut(t, repo, "gc", "-q", "--prune=now")
+	laterSecond()
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add m, shorter, reworded")
+	secondRewrite := gitOut(t, repo, "rev-parse", "HEAD")
+	if err := GitCommit(repo, secondRewrite); err != nil {
+		t.Fatal(err)
+	}
+	wantCommit(t, db, "the second rewrite", secondRewrite, 5)
+	wantCommit(t, db, "the first rewrite, replaced", firstRewrite, 0)
+	wantCommit(t, db, "the original, still holding the dropped lines", original, 3)
 }
 
 func testCatchUpOnStop(t *testing.T, home string) {

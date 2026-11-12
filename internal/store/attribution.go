@@ -214,7 +214,7 @@ func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string, c
 	for file, linesAdded := range files {
 		var cands []candRange
 		for _, src := range sources {
-			more, err := db.candidateRanges(src.RepoID, file, src.Until, carried)
+			more, err := db.candidateRanges(commitID, src.RepoID, file, src.Until, carried)
 			if err != nil {
 				return 0, err
 			}
@@ -348,11 +348,13 @@ func (db *DB) commitFilesWithAdds(commitID string) (map[string]int, error) {
 // carried are the recorded commits whose work this commit carries (see
 // CarriedCommits). They do not close the window: an edit that the original of
 // a rebase, an amend, a squash or a cherry-pick took is this commit's to take
-// too. Neither does a commit that has given the file up (HoldsFile).
-func (db *DB) candidateRanges(repoID, file, committedAt string, carried []string) ([]candRange, error) {
+// too. Neither does a commit that has given the session's lines in the file
+// up (ClosesWindow). commitID is the commit being attributed.
+func (db *DB) candidateRanges(commitID, repoID, file, committedAt string, carried []string) ([]candRange, error) {
 	notCarried, carriedArgs := NotInClause("c2.id", carried)
 	args := []any{repoID, file, committedAt, committedAt}
 	args = append(args, carriedArgs...)
+	args = append(args, commitID)
 	rows, err := db.Query(`
 		SELECT elr.event_id, e.session_id, e.agent_slug,
 		       COALESCE(s.model_slug, json_extract(e.payload, '$.model')) AS model_slug,
@@ -372,7 +374,7 @@ func (db *DB) candidateRanges(repoID, file, committedAt string, carried []string
 			  AND cf2.file_path = elr.rel_file_path
 			  AND datetime(c2.committed_at) >= datetime(e.ts)
 			  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
-			  AND `+HoldsFile+`
+			  AND `+ClosesWindow+`
 		  )
 		ORDER BY datetime(e.ts) ASC`,
 		args...)
@@ -443,30 +445,40 @@ const (
 // parents.
 const maxParentChain = 500
 
-// HoldsFile is the SQL test, on a commit c2 and its file row cf2, that the
-// commit still closes the attribution window for that file. One that has
-// given the file up (GiveUpAttribution: its rows for it are all at zero) does
-// not, once a later commit in the same checkout has attribution rows for the
-// file. That later commit is the replacement it gave its lines to, or a
-// rewrite of that replacement, and it closes the window in its place. When
-// the replacement is rewritten in turn, the next commit has to see past the
-// first original too, and by then it cannot be compared any more: git drops
-// a commit nothing refers to.
+// ClosesWindow is the SQL test, on an event e, a commit c2 and its file row
+// cf2, that the commit closes the attribution window for that event. Its one
+// argument is the id of the commit being attributed.
+//
+// An earlier commit on the file closes the window, except for a session
+// whose lines in that file it has given up (GiveUpAttribution: its row for
+// that session and file is at zero) once another commit in the same checkout
+// has attribution rows for that session and file. That other commit is the
+// replacement it gave the lines to, or a rewrite of that replacement, and it
+// closes the window in its place. When the replacement is rewritten in turn,
+// the next commit has to see past the first original too, and by then it
+// cannot be compared any more: git drops a commit nothing refers to.
+//
+// The test is per session because giving up is: a rewrite can keep one
+// session's lines in a file and drop another's, and the original then still
+// stands in front of the edits whose lines it kept.
 //
 // A retired commit whose replacement is recorded with another checkout (a
 // squash of commits from several worktrees) keeps closing the window in its
-// own. So does a commit with no attribution rows for the file: one made by
-// hand holds it like any other.
-const HoldsFile = `NOT (
-	COALESCE((
-		SELECT MAX(g.lines_attributed) FROM commit_session_files g
-		WHERE g.commit_id = c2.id AND g.file_path = cf2.file_path), 1) = 0
+// own. So does a commit with no attribution row for the session and file:
+// one made by hand closes the window like any other.
+const ClosesWindow = `NOT (
+	EXISTS (
+		SELECT 1 FROM commit_session_files g
+		WHERE g.commit_id = c2.id AND g.file_path = cf2.file_path
+		  AND g.session_id = e.session_id AND g.lines_attributed = 0)
 	AND EXISTS (
 		SELECT 1 FROM commits c3
 		JOIN commit_session_files g3 ON g3.commit_id = c3.id
 		WHERE c3.repo_id = c2.repo_id
 		  AND c3.id != c2.id
+		  AND c3.id != ?
 		  AND g3.file_path = cf2.file_path
+		  AND g3.session_id = e.session_id
 		  AND datetime(c3.committed_at) >= datetime(c2.committed_at)))`
 
 // EventSource is one place a commit's edits were captured: a repository row,
