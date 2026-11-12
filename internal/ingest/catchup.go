@@ -284,7 +284,7 @@ func retireCarried(db *store.DB, repoRoot, sha, commitID string, carried []strin
 			WHERE c.id = ?`, carriedID).Scan(&carriedSHA, &recordedAt); err != nil {
 			continue
 		}
-		if onAnyBranch(repoRoot, carriedSHA) {
+		if mayHold(repoRoot, carriedSHA) {
 			continue
 		}
 		// A commit recorded in another checkout can be on a branch only that
@@ -311,20 +311,38 @@ func carriedBy(db *store.DB, repoRoot, repoID, sha, commitID string) []string {
 	return db.CarriedCommits(commitID, sha, repoID, committedAt, repoRoot)
 }
 
-// onAnyBranch reports whether a local or remote-tracking branch still holds
-// the commit. A commit git no longer has is on none.
-func onAnyBranch(repoRoot, sha string) bool {
-	return gitx.Run(repoRoot, "branch", "--all", "--contains", sha, "--format=%(refname)") != ""
+// branchHolds reports whether a local or remote-tracking branch of the
+// checkout at root holds the commit, and whether that could be established.
+// A commit git no longer has is on no branch. Any other git failure (a lock,
+// a permission problem, not a repository just now) says nothing about the
+// branches.
+func branchHolds(root, sha string) (held, known bool) {
+	out, err := gitx.Output(root, "branch", "--all", "--contains", sha, "--format=%(refname)")
+	if err == nil {
+		return strings.TrimSpace(string(out)) != "", true
+	}
+	// git fails here for a commit it does not have too, so ask it that.
+	if have, err := gitx.HasObject(root, sha); err == nil && !have {
+		return false, true
+	}
+	return false, false
 }
 
-// checkoutMayHold reports whether a branch of the checkout at root holds the
-// commit, or may: a checkout that cannot be looked at is not taken to have
-// lost its branches. One that no longer exists holds nothing.
+// mayHold reports whether a branch of the checkout at root holds the commit,
+// or may. Giving a commit's lines up cannot be taken back, so it happens
+// only when git has said that no branch holds the commit.
+func mayHold(root, sha string) bool {
+	held, known := branchHolds(root, sha)
+	return held || !known
+}
+
+// checkoutMayHold is mayHold for a checkout that may be gone: one that no
+// longer exists holds nothing.
 func checkoutMayHold(root, sha string) bool {
 	if _, err := os.Stat(root); err != nil {
 		return !os.IsNotExist(err)
 	}
-	return onAnyBranch(root, sha)
+	return mayHold(root, sha)
 }
 
 // recordedSHAs returns which of shas the store holds, under any repository:

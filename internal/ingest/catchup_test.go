@@ -165,6 +165,7 @@ func TestCommitCatchUp(t *testing.T) {
 	t.Run("a rewrite reported twice from another checkout is recorded once", func(t *testing.T) { testRewriteReportedTwice(t, home) })
 	t.Run("a squash of commits from two worktrees carries both", func(t *testing.T) { testSquashAcrossWorktrees(t, home) })
 	t.Run("a cherry-pick from another clone leaves the original on its branch alone", func(t *testing.T) { testCherryPickFromAnotherClone(t, home) })
+	t.Run("an original is not retired when its clone cannot be looked at", func(t *testing.T) { testCherryPickWhenOriginalCloneCannotBeRead(t, home) })
 	t.Run("a commit recorded in an unrelated repository is left alone", func(t *testing.T) { testCatchUpLeavesOtherRepositoriesAlone(t, home) })
 	t.Run("a second rewrite is carried after git has dropped the first original", func(t *testing.T) { testRewriteAfterOriginalIsPruned(t, home) })
 	t.Run("a second rewrite keeps one session's lines when the first dropped another's", func(t *testing.T) { testRewriteAfterPartialRetirement(t, home) })
@@ -369,6 +370,36 @@ func testCherryPickFromAnotherClone(t *testing.T, home string) {
 	db := openDB(t)
 	wantCommit(t, db, "the cherry-pick", picked, 4)
 	wantCommit(t, db, "the original, still on its branch in the first clone", original, 4)
+}
+
+func testCherryPickWhenOriginalCloneCannotBeRead(t *testing.T, home string) {
+	repo, remote := repoWithRemote(t, home, "blind")
+	other := filepath.Join(home, "blind-other")
+	gitOut(t, home, "clone", "-q", remote, other)
+	gitOut(t, other, "config", "user.email", "mate@example.com")
+	gitOut(t, other, "config", "user.name", "Mate")
+	gitOut(t, repo, "checkout", "-q", "-b", "topic")
+	agentWrites(t, "blind-1", repo, "v.txt", numbered(4, "v %d"))
+	original := commitAll(t, repo, "add v")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, other, "fetch", "-q", repo, "topic")
+	gitOut(t, other, "cherry-pick", "FETCH_HEAD")
+	picked := gitOut(t, other, "rev-parse", "HEAD")
+
+	// git fails in the first clone for now. Its directory is there, so its
+	// branches cannot be taken to be gone.
+	gitDir, away := filepath.Join(repo, ".git"), filepath.Join(repo, ".git-away")
+	if err := os.Rename(gitDir, away); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Rename(away, gitDir) })
+
+	sweep(t, other)
+	db := openDB(t)
+	wantCommit(t, db, "the cherry-pick", picked, 4)
+	wantCommit(t, db, "the original, in a clone that cannot be looked at", original, 4)
 }
 
 func testCatchUpLeavesOtherRepositoriesAlone(t *testing.T, home string) {

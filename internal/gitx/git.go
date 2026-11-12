@@ -123,6 +123,23 @@ func IsAncestor(cwd, ancestor, descendant string) (bool, error) {
 	return false, err
 }
 
+// HasObject reports whether the repository at cwd has the object. An error
+// means git could not say (not a repository, a lock, a permission problem).
+func HasObject(cwd, sha string) (bool, error) {
+	cmd := exec.Command("git", "cat-file", "-e", sha)
+	cmd.Dir = cwd
+	cmd.Env = BypassEnv()
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // Exec runs `git <args>` in cwd with POSTHOOK_BYPASS=1 and returns an error
 // carrying git's combined output when it exits non-zero. For commands that
 // print nothing on success (config --unset, update-ref -d), where Run's empty
