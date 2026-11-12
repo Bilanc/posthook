@@ -279,3 +279,74 @@ func TestCarries(t *testing.T) {
 		}
 	}
 }
+
+// TestCarriedCommitIsCreditedOnlyWhenAttributedOnItsOwn covers the two ways a
+// commit is attributed. On its own, an amended commit carries its original
+// and is credited with the session's lines. In the whole-database pass every
+// earlier commit closes the window, so the lines are counted once, on the
+// original.
+func TestCarriedCommitIsCreditedOnlyWhenAttributedOnItsOwn(t *testing.T) {
+	repoDir := t.TempDir()
+	const file = "f.txt"
+	original := initGitRepo(t, repoDir, file, "alpha\nbravo\ncharlie\ndelta\necho\n")
+	amend := exec.Command("git", "commit", "-q", "--amend", "-m", "reworded")
+	amend.Dir = repoDir
+	amend.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com")
+	if out, err := amend.CombinedOutput(); err != nil {
+		t.Fatalf("git commit --amend: %v\n%s", err, out)
+	}
+	head := exec.Command("git", "rev-parse", "HEAD")
+	head.Dir = repoDir
+	out, err := head.Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	amended := string(out[:40])
+	if amended == original {
+		t.Fatal("test setup: the amend did not rewrite the commit")
+	}
+
+	db := newTestDB(t)
+	mustExec(t, db, `INSERT INTO repositories (id, name, root_path) VALUES ('repo1', 'r', ?)`, repoDir)
+	mustExec(t, db, `INSERT INTO sessions (id, agent_slug, repo_id, started_at)
+		VALUES ('sess1', 'claude-code', 'repo1', '2024-01-01T10:00:00Z')`)
+	for _, c := range []struct{ id, sha, at string }{
+		{"original", original, "2024-01-01T11:00:00Z"},
+		{"amended", amended, "2024-01-01T11:05:00Z"},
+	} {
+		mustExec(t, db, `INSERT INTO commits (id, repo_id, sha, committed_at, lines_added) VALUES (?, 'repo1', ?, ?, 5)`, c.id, c.sha, c.at)
+		mustExec(t, db, `INSERT INTO commit_files (commit_id, file_path, lines_added) VALUES (?, ?, 5)`, c.id, file)
+	}
+	mustExec(t, db, `INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, payload)
+		VALUES ('e1', 'sess1', '2024-01-01T10:10:00Z', 'PostToolUse', 'claude-code', 'repo1', ?, '{}')`, file)
+	mustExec(t, db, `INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, blob_sha_after, start_line, end_line, new_text_lines)
+		VALUES ('lr1', 'e1', ?, ?, 'sha', 1, 5, 5)`, file, file)
+
+	lines := func(commitID string) int {
+		var n int
+		mustQueryRow(t, db, `SELECT COALESCE(SUM(lines_attributed), 0) FROM commit_sessions WHERE commit_id = ?`, []any{commitID}, &n)
+		return n
+	}
+
+	if carried := db.CarriedCommits("amended", amended, "repo1", "2024-01-01T11:05:00Z", repoDir); len(carried) != 1 || carried[0] != "original" {
+		t.Fatalf("the amended commit carries %v, want [original]", carried)
+	}
+	if carried := db.CarriedCommits("original", original, "repo1", "2024-01-01T11:00:00Z", repoDir); len(carried) != 0 {
+		t.Errorf("the original carries %v, want nothing: the amend came after it", carried)
+	}
+	if _, err := db.RefreshCommitAttributions("amended"); err != nil {
+		t.Fatalf("RefreshCommitAttributions: %v", err)
+	}
+	if got := lines("amended"); got != 5 {
+		t.Errorf("the amended commit, attributed on its own: %d lines, want 5", got)
+	}
+
+	if _, err := db.RefreshCommitAttributions(""); err != nil {
+		t.Fatalf("RefreshCommitAttributions (all): %v", err)
+	}
+	if o, a := lines("original"), lines("amended"); o != 5 || a != 0 {
+		t.Errorf("whole-database pass: original %d, amended %d lines, want 5 and 0", o, a)
+	}
+}

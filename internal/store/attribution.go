@@ -30,6 +30,13 @@ import (
 // the working copy moved), we fall back to capping the per-file churn sum at the
 // commit's recorded lines_added so the bound still holds.
 func (db *DB) RefreshCommitAttributions(commitID string) (int, error) {
+	if commitID == "" {
+		// The whole-database pass (the one-time repair of a database from
+		// before schema v12) judges "previous commit" by time alone, as it
+		// always has. It has no step that retires a replaced commit, so
+		// crediting a replacement here would count its lines twice.
+		return db.refreshCommitAttributions("", []string{})
+	}
 	return db.refreshCommitAttributions(commitID, nil)
 }
 
