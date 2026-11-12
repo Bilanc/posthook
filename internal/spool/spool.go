@@ -136,11 +136,14 @@ func Pending() (int, error) {
 // CommitJob asks the worker to record commits the git shadow saw were about
 // to be pushed and that posthook may never have seen being made: made by a
 // git that does not go through the shadow, or by a rebase, a merge or a
-// cherry-pick. SHAs are oldest first.
+// cherry-pick. SHAs are oldest first. NotesRemote is the remote the shadow
+// sent attribution notes to after that push, empty when it sent none: the
+// worker sends them there again if recording the commits changes them.
 type CommitJob struct {
-	RepoRoot   string   `json:"repo_root"`
-	SHAs       []string `json:"shas"`
-	ReceivedAt string   `json:"received_at"`
+	RepoRoot    string   `json:"repo_root"`
+	SHAs        []string `json:"shas"`
+	NotesRemote string   `json:"notes_remote,omitempty"`
+	ReceivedAt  string   `json:"received_at"`
 }
 
 // CommitJobsDir is where commit jobs wait (~/.posthook/spool/commits). A

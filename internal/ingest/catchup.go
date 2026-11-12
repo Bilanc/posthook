@@ -8,6 +8,8 @@ import (
 
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/logx"
+	"github.com/bilanc/posthook/internal/notes"
+	"github.com/bilanc/posthook/internal/paths"
 	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 )
@@ -44,6 +46,11 @@ import (
 //
 // What this cannot see: a commit made and pushed by a git that never goes
 // through the shadow, with no agent turn ending in between.
+//
+// A commit found this way is often the result of a rewrite (a rebase, an
+// amend, a squash, a cherry-pick) whose original was recorded when it was
+// made. store.CarriedCommits says how the two are told to be the same work,
+// and retireCarried what the original then gives up.
 
 // maxCatchUpCommits bounds one look at a repository.
 const maxCatchUpCommits = 200
@@ -71,9 +78,44 @@ func UnpushedCommitsArgs() []string {
 }
 
 // ProcessCommitJob handles one job the git shadow queued at a push.
+//
+// The shadow sent the notes it had right after the push, before this job
+// could write the ones for the commits it records. When the job changes the
+// notes, they are sent to the same remote again, so a teammate who fetches
+// the pushed commits gets their notes without waiting for the next push.
+// Best-effort, like all notes transport: a failure leaves them for that next
+// push.
 func ProcessCommitJob(job spool.CommitJob) error {
+	before := notesTip(job.RepoRoot)
 	_, err := RecordMissingCommits(job.RepoRoot, job.SHAs)
+	if job.NotesRemote != "" && notes.Enabled() {
+		if after := notesTip(job.RepoRoot); after != "" && after != before {
+			if perr := notes.Push(job.RepoRoot, job.NotesRemote); perr != nil {
+				logx.Debugf("commit catch-up: sending notes to %s failed: %v", job.NotesRemote, perr)
+			}
+		}
+	}
 	return err
+}
+
+// notesTip is what the local notes ref points at, empty when there is none.
+func notesTip(repoRoot string) string {
+	if repoRoot == "" {
+		return ""
+	}
+	return gitx.Run(repoRoot, "rev-parse", "--verify", "--quiet", paths.NotesRef)
+}
+
+// notedCommits returns the commits that have a posthook note in this
+// repository.
+func notedCommits(repoRoot string) map[string]bool {
+	noted := map[string]bool{}
+	for _, line := range nonEmptyLines(gitx.Run(repoRoot, "notes", "--ref="+paths.NotesRef, "list")) {
+		if _, commit, ok := strings.Cut(line, " "); ok {
+			noted[strings.TrimSpace(commit)] = true
+		}
+	}
+	return noted
 }
 
 // catchUpSessionRepos looks for missed commits in the repositories a session
@@ -136,8 +178,8 @@ func CatchUpRepo(root string) (int, error) {
 // does not hold and that were made after posthook was installed, and returns
 // how many it recorded. Then it settles what the new commits change: a later
 // commit on the same files may have taken edits that belong to an earlier
-// one that was only just recorded, and a commit that no branch holds any
-// more has been replaced.
+// one that was only just recorded, and a commit whose work one of these
+// carries may be on no branch any more.
 func RecordMissingCommits(repoRoot string, shas []string) (int, error) {
 	if repoRoot == "" || len(shas) == 0 {
 		return 0, nil
@@ -204,49 +246,53 @@ func RecordMissingCommits(repoRoot string, shas []string) (int, error) {
 // earlier commit can have changed their window, and retires the attribution
 // of commits they have replaced.
 func settleCommits(db *store.DB, repoRoot, repoID string, shas []string, reattribute bool) {
+	var noted map[string]bool
+	if reattribute {
+		noted = notedCommits(repoRoot)
+	}
 	for _, sha := range shas {
 		var commitID string
 		if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&commitID); err != nil {
 			continue
 		}
 		if reattribute {
-			attributeAndNote(db, repoRoot, repoID, sha, commitID)
+			attributeAndNote(db, repoRoot, repoID, sha, commitID, noted[sha])
 		} else {
-			clearSuperseded(db, repoRoot, repoID, sha, commitID)
+			retireCarried(db, repoRoot, sha, commitID, carriedBy(db, repoRoot, repoID, sha, commitID))
 		}
 	}
 }
 
-// clearSuperseded zeroes the attribution of recorded commits that touch the
-// same files as this one, are not in its history, and are on no branch any
-// more: the commits a rebase, an amend or a squash replaced. Their lines are
-// carried by the replacement now, and counting both would double them. A
-// commit that is still on a branch (a cherry-pick's original, work on another
-// branch) keeps its attribution.
-func clearSuperseded(db *store.DB, repoRoot, repoID, sha, commitID string) {
-	for _, strangerID := range strangersOf(db, repoRoot, repoID, sha, commitID) {
-		var strangerSHA string
-		if err := db.QueryRow(`SELECT sha FROM commits WHERE id = ?`, strangerID).Scan(&strangerSHA); err != nil {
+// retireCarried has the commits this one carries (store.CarriedCommits) give
+// up the lines it is attributed too, once no branch holds them any more: the
+// commits a rebase, an amend or a squash replaced. Counting both would double
+// the lines. A carried commit that is still on a branch (a cherry-pick's
+// original) keeps its attribution.
+func retireCarried(db *store.DB, repoRoot, sha, commitID string, carried []string) {
+	for _, carriedID := range carried {
+		var carriedSHA string
+		if err := db.QueryRow(`SELECT sha FROM commits WHERE id = ?`, carriedID).Scan(&carriedSHA); err != nil {
 			continue
 		}
-		if onAnyBranch(repoRoot, strangerSHA) {
+		if onAnyBranch(repoRoot, carriedSHA) {
 			continue
 		}
-		if err := db.ClearCommitAttribution(strangerID); err != nil {
-			logx.Warnf("clearing superseded commit failed: %v", err)
-		} else if len(strangerSHA) >= 7 && len(sha) >= 7 {
-			logx.Debugf("commit %s is on no branch any more; its attribution is carried by %s", strangerSHA[:7], sha[:7])
+		changed, err := db.GiveUpAttribution(carriedID, commitID)
+		if err != nil {
+			logx.Warnf("retiring a replaced commit failed: %v", err)
+		} else if changed && len(carriedSHA) >= 7 && len(sha) >= 7 {
+			logx.Debugf("commit %s is on no branch any more; %s carries its lines", carriedSHA[:7], sha[:7])
 		}
 	}
 }
 
-// strangersOf is store.StrangerCommits for a recorded commit.
-func strangersOf(db *store.DB, repoRoot, repoID, sha, commitID string) []string {
+// carriedBy is store.CarriedCommits for a recorded commit.
+func carriedBy(db *store.DB, repoRoot, repoID, sha, commitID string) []string {
 	var committedAt string
 	if err := db.QueryRow(`SELECT committed_at FROM commits WHERE id = ?`, commitID).Scan(&committedAt); err != nil {
 		return nil
 	}
-	return db.StrangerCommits(commitID, sha, repoID, committedAt, repoRoot)
+	return db.CarriedCommits(commitID, sha, repoID, committedAt, repoRoot)
 }
 
 // onAnyBranch reports whether a local or remote-tracking branch still holds

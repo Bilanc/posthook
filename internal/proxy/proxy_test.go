@@ -313,7 +313,26 @@ func TestPushQueuesTheCommitsNoRemoteHas(t *testing.T) {
 	if len(shas) != 2 || shas[0] != first || shas[1] != second {
 		t.Fatalf("unpushed = %v, want [%s %s] oldest first", shas, first, second)
 	}
-	queueCatchUp(gotRoot, shas)
+	// The job names the remote the push's notes go to, so the worker can send
+	// the notes it writes there too: the remote the push names, else the one
+	// git picks, and none for a push that carries no notes.
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"origin", "main"}, "origin"},
+		{nil, "origin"},
+		{[]string{"--dry-run", "origin", "main"}, ""},
+		{[]string{"origin", "refs/notes/posthook"}, ""},
+	} {
+		if got := pushNotesRemote(realGit, gotRoot, c.args); got != c.want {
+			t.Errorf("pushNotesRemote(%v) = %q, want %q", c.args, got, c.want)
+		}
+	}
+	if got := pushNotesRemote(realGit, "", []string{"origin", "main"}); got != "" {
+		t.Errorf("pushNotesRemote outside a repository = %q", got)
+	}
+	queueCatchUp(gotRoot, shas, pushNotesRemote(realGit, gotRoot, []string{"origin", "main"}))
 
 	var jobs []spool.CommitJob
 	if _, err := spool.DrainCommitJobs(func(j spool.CommitJob) error { jobs = append(jobs, j); return nil }); err != nil {
@@ -321,6 +340,9 @@ func TestPushQueuesTheCommitsNoRemoteHas(t *testing.T) {
 	}
 	if len(jobs) != 1 || len(jobs[0].SHAs) != 2 || jobs[0].SHAs[0] != first {
 		t.Fatalf("queued jobs = %+v", jobs)
+	}
+	if jobs[0].NotesRemote != "origin" {
+		t.Errorf("job notes remote = %q, want origin", jobs[0].NotesRemote)
 	}
 	resolved, _ := filepath.EvalSymlinks(repo)
 	if jobs[0].RepoRoot != resolved {

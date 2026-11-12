@@ -227,3 +227,55 @@ func mustQueryRow(t *testing.T, db *DB, query string, args []any, dest ...any) {
 		t.Fatalf("queryrow %q: %v", query, err)
 	}
 }
+
+func TestAddedLinesByCommit(t *testing.T) {
+	// `git log --format=%x00%H -p --unified=0` for two commits. The first
+	// adds a line that itself starts with "++ ", a line of punctuation and a
+	// blank one; a file header follows a hunk.
+	out := "\x00aaa\n\n" +
+		"diff --git a/f.go b/f.go\nindex 1..2 100644\n--- a/f.go\n+++ b/f.go\n" +
+		"@@ -2,0 +3,5 @@ func f() {\n+\tx := load()\n+++ odd\n+\n+}\n+\tx := load()\n" +
+		"@@ -9 +14 @@\n-old\n+new line\r\n" +
+		"diff --git a/g.go b/g.go\nnew file mode 100644\n--- /dev/null\n+++ b/g.go\n@@ -0,0 +1 @@\n+package g\n" +
+		"\x00bbb\n\n" +
+		"diff --git a/f.go b/f.go\n--- a/f.go\n+++ b/f.go\n@@ -1,0 +2 @@\n+x := load()\n"
+	got := addedLinesByCommit([]byte(out))
+	want := map[string]map[string]int{
+		"aaa": {"x := load()": 2, "++ odd": 1, "new line": 1, "package g": 1},
+		"bbb": {"x := load()": 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("commits = %v, want %v", got, want)
+	}
+	for sha, lines := range want {
+		if len(got[sha]) != len(lines) {
+			t.Errorf("%s: lines = %v, want %v", sha, got[sha], lines)
+			continue
+		}
+		for text, n := range lines {
+			if got[sha][text] != n {
+				t.Errorf("%s: %q counted %d times, want %d", sha, text, got[sha][text], n)
+			}
+		}
+	}
+}
+
+func TestCarries(t *testing.T) {
+	mine := map[string]int{"a := 1": 1, "b := 2": 2, "return a": 1}
+	for _, c := range []struct {
+		name   string
+		theirs map[string]int
+		want   bool
+	}{
+		{"the same lines", map[string]int{"a := 1": 1, "b := 2": 2}, true},
+		{"more than half", map[string]int{"a := 1": 1, "b := 2": 1, "c := 3": 1}, true},
+		{"exactly half", map[string]int{"a := 1": 1, "c := 3": 1}, false},
+		{"a repeated line counts as often as both have it", map[string]int{"a := 1": 3}, false},
+		{"other lines", map[string]int{"c := 3": 4}, false},
+		{"nothing to compare", map[string]int{}, false},
+	} {
+		if got := carries(mine, c.theirs); got != c.want {
+			t.Errorf("%s: carries = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bilanc/posthook/internal/gitx"
 )
@@ -29,6 +30,24 @@ import (
 // the working copy moved), we fall back to capping the per-file churn sum at the
 // commit's recorded lines_added so the bound still holds.
 func (db *DB) RefreshCommitAttributions(commitID string) (int, error) {
+	return db.refreshCommitAttributions(commitID, nil)
+}
+
+// RefreshCommitAttributionCarrying is RefreshCommitAttributions for one commit
+// whose carried commits (see CarriedCommits) the caller has already worked
+// out, so the git calls behind that list are made once per commit.
+func (db *DB) RefreshCommitAttributionCarrying(commitID string, carried []string) (int, error) {
+	if commitID == "" {
+		return 0, nil
+	}
+	if carried == nil {
+		carried = []string{}
+	}
+	return db.refreshCommitAttributions(commitID, carried)
+}
+
+// carried is nil when it has to be worked out per commit.
+func (db *DB) refreshCommitAttributions(commitID string, carried []string) (int, error) {
 	var commitArg any
 	if commitID != "" {
 		if _, err := db.Exec(`DELETE FROM commit_sessions WHERE commit_id = ?`, commitID); err != nil {
@@ -76,7 +95,7 @@ func (db *DB) RefreshCommitAttributions(commitID string) (int, error) {
 
 	total := 0
 	for _, c := range commits {
-		n, err := db.attributeCommit(c.id, c.sha, c.repoID, c.committedAt, c.root)
+		n, err := db.attributeCommit(c.id, c.sha, c.repoID, c.committedAt, c.root, carried)
 		if err != nil {
 			return total, err
 		}
@@ -129,7 +148,7 @@ type sessionMeta struct {
 // attributeCommit computes accurate per-session AI attribution for one commit
 // and writes commit_session_files + commit_sessions rows. Returns the number of
 // commit_sessions rows written.
-func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string) (int, error) {
+func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string, carried []string) (int, error) {
 	files, err := db.commitFilesWithAdds(commitID)
 	if err != nil {
 		return 0, err
@@ -137,7 +156,9 @@ func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string) (
 	if len(files) == 0 {
 		return 0, nil
 	}
-	strangers := db.StrangerCommits(commitID, sha, repoID, committedAt, root)
+	if carried == nil {
+		carried = db.CarriedCommits(commitID, sha, repoID, committedAt, root)
+	}
 
 	// sessionID -> file -> agg
 	perSessionFile := map[string]map[string]*fileAgg{}
@@ -174,7 +195,7 @@ func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string) (
 	}
 
 	for file, linesAdded := range files {
-		cands, err := db.candidateRanges(repoID, file, committedAt, strangers)
+		cands, err := db.candidateRanges(repoID, file, committedAt, carried)
 		if err != nil {
 			return 0, err
 		}
@@ -298,14 +319,14 @@ func (db *DB) commitFilesWithAdds(commitID string) (map[string]int, error) {
 // commit, with no intervening commit touching the file (the next-file-commit
 // boundary). Ordered ts-ascending so latest-edit-wins de-dup works downstream.
 //
-// strangers are recorded commits that are not in this commit's history (see
-// StrangerCommits). They do not close the window: an edit that a commit on
-// another branch, or a commit since rewritten away, already took is still
-// this commit's to take.
-func (db *DB) candidateRanges(repoID, file, committedAt string, strangers []string) ([]candRange, error) {
-	notStranger, strangerArgs := NotInClause("c2.id", strangers)
+// carried are the recorded commits whose work this commit carries (see
+// CarriedCommits). They do not close the window: an edit that the original of
+// a rebase, an amend, a squash or a cherry-pick took is this commit's to take
+// too.
+func (db *DB) candidateRanges(repoID, file, committedAt string, carried []string) ([]candRange, error) {
+	notCarried, carriedArgs := NotInClause("c2.id", carried)
 	args := []any{repoID, file, committedAt, committedAt}
-	args = append(args, strangerArgs...)
+	args = append(args, carriedArgs...)
 	rows, err := db.Query(`
 		SELECT elr.event_id, e.session_id, e.agent_slug,
 		       COALESCE(s.model_slug, json_extract(e.payload, '$.model')) AS model_slug,
@@ -324,7 +345,7 @@ func (db *DB) candidateRanges(repoID, file, committedAt string, strangers []stri
 			WHERE c2.repo_id = e.repo_id
 			  AND cf2.file_path = elr.rel_file_path
 			  AND datetime(c2.committed_at) >= datetime(e.ts)
-			  AND datetime(c2.committed_at) < datetime(?)`+notStranger+`
+			  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
 		  )
 		ORDER BY datetime(e.ts) ASC`,
 		args...)
@@ -383,49 +404,82 @@ func addedLineSet(root, sha, file string) (map[int]bool, bool) {
 	return set, true
 }
 
-// StrangerCommits returns the ids of recorded commits in the same repository
-// that touch a file this commit added lines to, were committed before it, and
-// are not among its ancestors.
+// maxCarriedCandidates and maxCarriedLines bound the one diff CarriedCommits
+// reads: the newest commits that could be carried, and the lines they and the
+// commit itself add to the files in question.
+const (
+	maxCarriedCandidates = 50
+	maxCarriedLines      = 100000
+)
+
+// maxParentChain is how far back CarriedCommits follows a commit's recorded
+// parents.
+const maxParentChain = 500
+
+// CarriedCommits returns the ids of recorded commits whose work this commit
+// carries: the originals of a rebase, an amend, a squash or a cherry-pick.
 //
-// The attribution window for a file closes at the previous commit that
-// touched it. "Previous" has to mean previous in this commit's own history.
-// Judged by time alone, a commit on another branch closes the window for
-// this one, and so does a commit that a rebase, an amend or a squash has
-// since replaced: the replacement then finds every edit already taken and
-// is attributed nothing. A cherry-pick has the same problem in reverse.
+// The attribution window for a file closes at the previous recorded commit
+// that touched it, judged by time. For a rewritten commit that is wrong: the
+// commit it replaced closes the window, and the replacement finds every edit
+// already taken and is attributed nothing. A carried commit therefore does
+// not close the window, and once no branch holds it any more it gives its
+// attribution up to this commit (GiveUpAttribution).
 //
-// One `git rev-list` is run, and only when the store holds such a commit at
-// all. With no access to the repository the answer is none, which is the old
-// behaviour.
-func (db *DB) StrangerCommits(commitID, sha, repoID, committedAt, root string) []string {
+// A recorded commit is carried when all of these hold:
+//
+//   - it is in the same repository, was committed no later than this commit,
+//     and adds lines to a file this commit adds lines to;
+//   - it is not one of this commit's ancestors;
+//   - more than half of the lines it adds to those files are lines this
+//     commit adds too. Lines are compared as text without their surrounding
+//     whitespace, and a line with no letter or digit in it is not counted.
+//
+// The last test is what tells a rewrite from a commit that only touches the
+// same file: work on another branch, a branch merged by squash on the server
+// and then deleted, a branch that was abandoned. Those close the window as
+// any earlier commit does, and nothing of theirs is given up.
+//
+// In a history posthook recorded as it was made, the earlier commits on the
+// same files are this commit's recorded parents, and the store alone settles
+// that: no git call. Only earlier commits that are not on that chain cost
+// one `git log -p`, and each one whose lines match costs a `git merge-base`.
+// With no access to the repository the answer is none: every earlier commit
+// closes the window.
+func (db *DB) CarriedCommits(commitID, sha, repoID, committedAt, root string) []string {
 	if root == "" || sha == "" {
 		return nil
 	}
+	// "No later than", not "earlier than": a commit's time has one-second
+	// resolution, and an amend often lands in the second of its original.
 	rows, err := db.Query(`
-		SELECT DISTINCT c2.id, c2.sha, CAST(strftime('%s', c2.committed_at) AS INTEGER)
+		SELECT c2.id, c2.sha, CAST(strftime('%s', c2.committed_at) AS INTEGER),
+		       SUM(cf2.lines_added)
 		FROM commits c2
 		JOIN commit_files cf2 ON cf2.commit_id = c2.id
 		WHERE c2.repo_id = ?
 		  AND c2.id != ?
-		  AND datetime(c2.committed_at) < datetime(?)
+		  AND datetime(c2.committed_at) <= datetime(?)
+		  AND cf2.lines_added > 0
 		  AND cf2.file_path IN (
 			SELECT file_path FROM commit_files WHERE commit_id = ? AND lines_added > 0
-		  )`, repoID, commitID, committedAt, commitID)
+		  )
+		GROUP BY c2.id, c2.sha, c2.committed_at
+		ORDER BY 3 DESC`, repoID, commitID, committedAt, commitID)
 	if err != nil {
 		return nil
 	}
-	type earlier struct{ id, sha string }
+	type earlier struct {
+		id, sha string
+		adds    int
+	}
 	var earlierCommits []earlier
-	oldest := int64(0)
 	for rows.Next() {
 		var e earlier
 		var at sql.NullInt64
-		if err := rows.Scan(&e.id, &e.sha, &at); err != nil {
+		if err := rows.Scan(&e.id, &e.sha, &at, &e.adds); err != nil {
 			rows.Close()
 			return nil
-		}
-		if at.Valid && (oldest == 0 || at.Int64 < oldest) {
-			oldest = at.Int64
 		}
 		earlierCommits = append(earlierCommits, e)
 	}
@@ -434,29 +488,144 @@ func (db *DB) StrangerCommits(commitID, sha, repoID, committedAt, root string) [
 		return nil
 	}
 
-	// The commit's ancestors back to the oldest of those commits, with a day
-	// of slack for clocks: committer dates need not be in order.
-	args := []string{"rev-list", sha}
-	if oldest > 0 {
-		args = append(args, "--since="+strconv.FormatInt(oldest-86400, 10))
-	}
-	out, err := gitx.Output(root, args...)
+	// This commit's recorded first-parent chain. Whatever is on it is an
+	// ancestor for certain; what is not may still be one (through a merge, or
+	// behind a commit that was never recorded), which git settles below for
+	// the few that get that far.
+	onChain := map[string]bool{}
+	rows, err = db.Query(`
+		WITH RECURSIVE chain(sha, depth) AS (
+			SELECT parent_sha, 1 FROM commits WHERE id = ?
+			UNION ALL
+			SELECT c.parent_sha, chain.depth + 1
+			FROM chain JOIN commits c ON c.repo_id = ? AND c.sha = chain.sha
+			WHERE chain.depth < ?
+		)
+		SELECT sha FROM chain WHERE sha IS NOT NULL`, commitID, repoID, maxParentChain)
 	if err != nil {
 		return nil
 	}
-	ancestors := map[string]bool{}
-	for _, line := range strings.Split(string(out), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			ancestors[line] = true
+	for rows.Next() {
+		var parent string
+		if err := rows.Scan(&parent); err != nil {
+			rows.Close()
+			return nil
+		}
+		onChain[parent] = true
+	}
+	rows.Close()
+
+	files, err := db.commitFilesWithAdds(commitID)
+	if err != nil {
+		return nil
+	}
+	budget := maxCarriedLines
+	var paths []string
+	for path, adds := range files {
+		budget -= adds
+		// A path git printed as a rename ("a => b") or with a newline in it
+		// cannot be named to git here; such a file is left out of the
+		// comparison.
+		if !strings.Contains(path, " => ") && !strings.ContainsAny(path, "\n\x00") {
+			paths = append(paths, path)
 		}
 	}
-	var strangers []string
+	// Off the chain, newest first, as many as the line budget allows.
+	var candidates []earlier
 	for _, e := range earlierCommits {
-		if !ancestors[e.sha] {
-			strangers = append(strangers, e.id)
+		if onChain[e.sha] {
+			continue
+		}
+		if budget -= e.adds; budget < 0 || len(candidates) == maxCarriedCandidates {
+			break
+		}
+		candidates = append(candidates, e)
+	}
+	if len(candidates) == 0 || len(paths) == 0 {
+		return nil
+	}
+
+	// One diff of this commit and the candidates, limited to this commit's
+	// files. Revisions and paths go in on stdin so their number is not
+	// limited by the command line.
+	var stdin strings.Builder
+	stdin.WriteString(sha + "\n")
+	for _, e := range candidates {
+		stdin.WriteString(e.sha + "\n")
+	}
+	stdin.WriteString("--\n")
+	for _, path := range paths {
+		stdin.WriteString(path + "\n")
+	}
+	out, err := gitx.OutputWithInput(root, stdin.String(),
+		"--literal-pathspecs", "log", "--no-walk=unsorted", "--format=%x00%H",
+		"-p", "--unified=0", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+		"--stdin")
+	if err != nil {
+		return nil
+	}
+	added := addedLinesByCommit(out)
+	mine := added[sha]
+	var carried []string
+	for _, e := range candidates {
+		if !carries(mine, added[e.sha]) {
+			continue
+		}
+		// An ancestor whose lines this commit adds again (a revert that was
+		// reverted) is history, not an original. If git cannot say, it is
+		// left as any earlier commit.
+		if ancestor, err := gitx.IsAncestor(root, e.sha, sha); err != nil || ancestor {
+			continue
+		}
+		carried = append(carried, e.id)
+	}
+	return carried
+}
+
+// addedLinesByCommit reads the output of `git log --format=%x00%H -p
+// --unified=0` and returns, per commit, the lines it adds and how often:
+// trimmed of surrounding whitespace, and without the lines that have no
+// letter or digit in them (a lone brace, a blank line), which say nothing
+// about whose work a commit carries.
+func addedLinesByCommit(out []byte) map[string]map[string]int {
+	added := map[string]map[string]int{}
+	var current map[string]int
+	inHunk := false
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "\x00"):
+			current = map[string]int{}
+			added[strings.TrimSpace(line[1:])] = current
+			inHunk = false
+		case strings.HasPrefix(line, "diff --git "):
+			// Inside a hunk every line starts with "+", "-" or "\", so this
+			// is the next file's header and not content.
+			inHunk = false
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case inHunk && current != nil && strings.HasPrefix(line, "+"):
+			text := strings.TrimSpace(line[1:])
+			if strings.IndexFunc(text, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0 {
+				current[text]++
+			}
 		}
 	}
-	return strangers
+	return added
+}
+
+// carries reports whether more than half of the lines theirs adds are among
+// the lines mine adds, each line counted as often as it occurs.
+func carries(mine, theirs map[string]int) bool {
+	total, shared := 0, 0
+	for text, n := range theirs {
+		total += n
+		if m := mine[text]; m < n {
+			shared += m
+		} else {
+			shared += n
+		}
+	}
+	return total > 0 && shared*2 > total
 }
 
 // NotInClause renders " AND <column> NOT IN (?, ?, …)" and its arguments, or
@@ -487,17 +656,49 @@ func (db *DB) InstalledAt() (time.Time, bool) {
 	return t.UTC(), true
 }
 
-// ClearCommitAttribution zeroes a commit's attributed lines and marks the rows
-// for re-sync. Used for a commit that no branch holds any more: its
-// replacement carries the lines now, and counting both would double them.
+// GiveUpAttribution takes from a retired commit the lines its replacement is
+// attributed too: for every session and file the replacement holds lines for,
+// the retired commit's count goes to zero, and its per-session totals follow.
+// Used for a carried commit (CarriedCommits) that no branch holds any more;
+// counting both would double the lines.
+//
+// Nothing else is taken. Lines the replacement was not attributed (a file the
+// rewrite dropped, lines it moved to where attribution by position does not
+// find them) stay on the retired commit, so no line is ever dropped without
+// another commit holding it.
+//
 // The rows are kept at zero rather than deleted because the cloud landing
-// zone has no tombstones.
-func (db *DB) ClearCommitAttribution(commitID string) error {
-	if _, err := db.Exec(`UPDATE commit_session_files SET lines_attributed = 0, synced_at = NULL
-		WHERE commit_id = ? AND lines_attributed != 0`, commitID); err != nil {
-		return err
+// zone has no tombstones. It reports whether anything changed.
+func (db *DB) GiveUpAttribution(retiredID, replacementID string) (bool, error) {
+	res, err := db.Exec(`
+		UPDATE commit_session_files SET lines_attributed = 0, synced_at = NULL
+		WHERE commit_id = ? AND lines_attributed != 0
+		  AND EXISTS (
+			SELECT 1 FROM commit_session_files n
+			WHERE n.commit_id = ?
+			  AND n.session_id = commit_session_files.session_id
+			  AND n.file_path = commit_session_files.file_path
+			  AND n.lines_attributed > 0
+		  )`, retiredID, replacementID)
+	if err != nil {
+		return false, err
 	}
-	_, err := db.Exec(`UPDATE commit_sessions SET lines_attributed = 0, files_touched = 0, synced_at = NULL
-		WHERE commit_id = ? AND lines_attributed != 0`, commitID)
-	return err
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	_, err = db.Exec(`
+		UPDATE commit_sessions SET
+		  lines_attributed = (
+			SELECT COALESCE(SUM(f.lines_attributed), 0) FROM commit_session_files f
+			WHERE f.commit_id = commit_sessions.commit_id AND f.session_id = commit_sessions.session_id),
+		  files_touched = (
+			SELECT COUNT(*) FROM commit_session_files f
+			WHERE f.commit_id = commit_sessions.commit_id AND f.session_id = commit_sessions.session_id
+			  AND f.lines_attributed > 0),
+		  synced_at = NULL
+		WHERE commit_id = ?
+		  AND lines_attributed != (
+			SELECT COALESCE(SUM(f.lines_attributed), 0) FROM commit_session_files f
+			WHERE f.commit_id = commit_sessions.commit_id AND f.session_id = commit_sessions.session_id)`, retiredID)
+	return true, err
 }

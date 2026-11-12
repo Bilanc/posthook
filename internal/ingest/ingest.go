@@ -495,33 +495,38 @@ func GitCommit(repoRoot, sha string) error {
 	if len(sha) >= 7 {
 		logx.Debugf("ingested commit %s in %s (+%d/-%d)", sha[:7], repoName, added, removed)
 	}
-	attributeAndNote(db, repoRoot, repoID, sha, finalCommitID)
+	// A commit recorded as it is made has no note of ours yet.
+	attributeAndNote(db, repoRoot, repoID, sha, finalCommitID, false)
 	return nil
 }
 
 // attributeAndNote (re)computes one recorded commit's attribution, retires
 // the attribution of commits it has replaced, and writes its git note.
-func attributeAndNote(db *store.DB, repoRoot, repoID, sha, commitID string) {
-	attributedSessions, err := db.RefreshCommitAttributions(commitID)
+// hadNote says the commit already has a note from an earlier pass, which is
+// removed when this pass leaves it nothing to say.
+func attributeAndNote(db *store.DB, repoRoot, repoID, sha, commitID string, hadNote bool) {
+	// Worked out once: it costs git calls, and all three steps need it.
+	carried := carriedBy(db, repoRoot, repoID, sha, commitID)
+	attributedSessions, err := db.RefreshCommitAttributionCarrying(commitID, carried)
 	if err != nil {
 		logx.Warnf("refresh attributions failed: %v", err)
 	}
 	if attributedSessions > 0 && len(sha) >= 7 {
 		logx.Debugf("attributed commit %s to %d session(s)", sha[:7], attributedSessions)
 	}
-	clearSuperseded(db, repoRoot, repoID, sha, commitID)
-	if err := writeNoteForCommit(db, repoRoot, repoID, sha, commitID); err != nil {
+	retireCarried(db, repoRoot, sha, commitID, carried)
+	if err := writeNoteForCommit(db, repoRoot, repoID, sha, commitID, carried, hadNote); err != nil {
 		if len(sha) >= 7 {
 			logx.Warnf("note write failed for %s: %v", sha[:7], err)
 		}
 	}
 }
 
-func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) error {
-	// The same window as attribution: only a commit in this commit's own
-	// history closes it (store.StrangerCommits).
-	notStranger, strangerArgs := store.NotInClause("c2.id", strangersOf(db, repoRoot, repoID, sha, commitID))
-	args := append([]any{commitID, repoID}, strangerArgs...)
+func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, carried []string, hadNote bool) error {
+	// The same window as attribution: a commit this one carries does not
+	// close it (store.CarriedCommits).
+	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
+	args := append([]any{commitID, repoID}, carriedArgs...)
 	rows, err := db.Query(`
 		SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
 		       e.ts AS event_ts, elr.start_line, elr.end_line
@@ -542,7 +547,7 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) er
 			WHERE c2.repo_id = c.repo_id
 			  AND cf2.file_path = cf.file_path
 			  AND datetime(c2.committed_at) >= datetime(e.ts)
-			  AND datetime(c2.committed_at) < datetime(c.committed_at)`+notStranger+`
+			  AND datetime(c2.committed_at) < datetime(c.committed_at)`+notCarried+`
 		  )
 		ORDER BY elr.rel_file_path, elr.start_line`,
 		args...)
@@ -584,6 +589,18 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) er
 		return err
 	}
 	if count == 0 {
+		if hadNote {
+			// The note was written when this commit was attributed without an
+			// earlier commit that has since been recorded. The ranges are
+			// that commit's now, and a note left here would still claim them.
+			if err := gitx.Exec(repoRoot, "notes", "--ref="+paths.NotesRef, "remove", "--ignore-missing", sha); err != nil {
+				return err
+			}
+			if len(sha) >= 7 {
+				logx.Debugf("note: no AI ranges left for %s, removed its note", sha[:7])
+			}
+			return nil
+		}
 		if len(sha) >= 7 {
 			logx.Debugf("note: no AI ranges for %s, skipping", sha[:7])
 		}

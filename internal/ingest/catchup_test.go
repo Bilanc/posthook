@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bilanc/posthook/internal/paths"
 	"github.com/bilanc/posthook/internal/spool"
 	"github.com/bilanc/posthook/internal/store"
 )
@@ -109,10 +110,32 @@ func sweep(t *testing.T, repo string) int {
 	return n
 }
 
-// laterSecond waits until the clock's second has changed: a commit's time
-// has one-second resolution, and "the commit before this one" needs the two
-// to differ, as they always do outside a test.
+// laterSecond waits until the clock's second has changed. A commit's time
+// has one-second resolution, and an earlier commit closes a later one's
+// window only when their times differ, as the times of unrelated commits do
+// outside a test. The rewrites below do not wait: an amend or a rebase in the
+// second of its original is the usual case.
 func laterSecond() { time.Sleep(1100 * time.Millisecond) }
+
+// gitAt runs git with the committer and author clocks set to when.
+func gitAt(t *testing.T, dir string, when time.Time, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	stamp := when.UTC().Format(time.RFC3339)
+	cmd.Env = append(os.Environ(), "GIT_COMMITTER_DATE="+stamp, "GIT_AUTHOR_DATE="+stamp)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+}
+
+// hasNote reports whether a commit has a posthook note in the repository at
+// dir (a working tree or a bare remote).
+func hasNote(dir, sha string) bool {
+	cmd := exec.Command("git", "notes", "--ref="+paths.NotesRef, "show", sha)
+	cmd.Dir = dir
+	return cmd.Run() == nil
+}
 
 func TestCommitCatchUp(t *testing.T) {
 	_ = store.Close()
@@ -128,7 +151,12 @@ func TestCommitCatchUp(t *testing.T) {
 	t.Run("an amended commit gets its lines and the original gives them up", func(t *testing.T) { testCatchUpAmend(t, home) })
 	t.Run("a cherry-pick is attributed and the original keeps its lines", func(t *testing.T) { testCatchUpCherryPick(t, home) })
 	t.Run("a squash of two commits carries both", func(t *testing.T) { testCatchUpSquash(t, home) })
-	t.Run("a push job records commits that are on the remote by the time it runs", func(t *testing.T) { testCatchUpPushJob(t, home) })
+	t.Run("an amend in the second of its original retires the original", func(t *testing.T) { testAmendInTheSameSecond(t, home) })
+	t.Run("a replaced commit keeps the lines its replacement does not hold", func(t *testing.T) { testAmendThatDropsAFile(t, home) })
+	t.Run("a commit on a deleted branch keeps its lines when a later commit only touches the same file", func(t *testing.T) { testCatchUpDeletedBranch(t, home) })
+	t.Run("an ancestor whose lines a commit adds again is not carried", func(t *testing.T) { testCatchUpRevertOfRevert(t, home) })
+	t.Run("a note whose ranges belong to a commit recorded later is removed", func(t *testing.T) { testCatchUpRemovesStaleNote(t, home) })
+	t.Run("a push job records commits that are on the remote by the time it runs, and sends their notes", func(t *testing.T) { testCatchUpPushJob(t, home) })
 	t.Run("a force-pushed rebase retires the original it replaced on the remote", func(t *testing.T) { testCatchUpForcePush(t, home) })
 	t.Run("one repository is looked at once a minute on Stop", func(t *testing.T) { testCatchUpThrottle(t, home) })
 	t.Run("a commit is recorded from the worktree it was made in, and only once", func(t *testing.T) { testCatchUpWorktrees(t, home) })
@@ -254,7 +282,6 @@ func testCatchUpRebase(t *testing.T, home string) {
 	gitOut(t, repo, "checkout", "-q", "main")
 	writeFile(t, filepath.Join(repo, "other.txt"), "other\n")
 	commitAll(t, repo, "main moves")
-	laterSecond()
 	gitOut(t, repo, "checkout", "-q", "feature")
 	gitOut(t, repo, "rebase", "-q", "main")
 	rebased := gitOut(t, repo, "rev-parse", "HEAD")
@@ -274,7 +301,6 @@ func testCatchUpAmend(t *testing.T, home string) {
 	if err := GitCommit(repo, original); err != nil {
 		t.Fatal(err)
 	}
-	laterSecond()
 	// The engineer adds a line by hand and amends.
 	writeFile(t, filepath.Join(repo, "g.txt"), numbered(4, "g %d")+"by hand\n")
 	gitOut(t, repo, "add", "-A")
@@ -295,7 +321,6 @@ func testCatchUpCherryPick(t *testing.T, home string) {
 	if err := GitCommit(repo, original); err != nil {
 		t.Fatal(err)
 	}
-	laterSecond()
 	gitOut(t, repo, "checkout", "-q", "main")
 	gitOut(t, repo, "cherry-pick", original)
 	picked := gitOut(t, repo, "rev-parse", "HEAD")
@@ -319,7 +344,6 @@ func testCatchUpSquash(t *testing.T, home string) {
 	if err := GitCommit(repo, second); err != nil {
 		t.Fatal(err)
 	}
-	laterSecond()
 	// Both commits become one before the push.
 	gitOut(t, repo, "reset", "-q", "--soft", "main")
 	squashed := commitAll(t, repo, "one and two")
@@ -332,7 +356,7 @@ func testCatchUpSquash(t *testing.T, home string) {
 }
 
 func testCatchUpPushJob(t *testing.T, home string) {
-	repo, _ := repoWithRemote(t, home, "push")
+	repo, remote := repoWithRemote(t, home, "push")
 	agentWrites(t, "push-1", repo, "p.txt", numbered(6, "p %d"))
 	sha := commitAll(t, repo, "add p")
 
@@ -342,7 +366,8 @@ func testCatchUpPushJob(t *testing.T, home string) {
 		t.Fatalf("unpushed before the push: %v, want [%s]", listed, sha)
 	}
 	gitOut(t, repo, "push", "-q", "origin", "main")
-	if err := spool.WriteCommitJob(spool.CommitJob{RepoRoot: repo, SHAs: listed, ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
+	if err := spool.WriteCommitJob(spool.CommitJob{RepoRoot: repo, SHAs: listed, NotesRemote: "origin",
+		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -361,6 +386,153 @@ func testCatchUpPushJob(t *testing.T, home string) {
 	if left, _ := spool.PendingCommitJobs(); left != 0 {
 		t.Errorf("%d job(s) left in the spool", left)
 	}
+	// The shadow sent its notes before this commit had one. The job wrote
+	// the note and sent it after them, to the remote the push went to.
+	if !hasNote(remote, sha) {
+		t.Errorf("the remote has no note for the pushed commit")
+	}
+}
+
+func testAmendInTheSameSecond(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "quick")
+	agentWrites(t, "quick-1", repo, "k.txt", numbered(4, "k %d"))
+	// Both commits are made through the shadow, which records each as it is
+	// made, and both carry the same time to the second.
+	now := time.Now()
+	gitOut(t, repo, "add", "-A")
+	gitAt(t, repo, now, "commit", "-q", "-m", "add k")
+	original := gitOut(t, repo, "rev-parse", "HEAD")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, repo, now, "commit", "-q", "--amend", "-m", "add k, reworded")
+	amended := gitOut(t, repo, "rev-parse", "HEAD")
+	if amended == original {
+		t.Fatal("test setup: the amend did not rewrite the commit")
+	}
+	if a, b := gitOut(t, repo, "log", "-1", "--format=%ct", original), gitOut(t, repo, "log", "-1", "--format=%ct", amended); a != b {
+		t.Fatalf("test setup: commit times differ (%s, %s)", a, b)
+	}
+	if err := GitCommit(repo, amended); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openDB(t)
+	wantCommit(t, db, "the amended commit", amended, 4)
+	wantCommit(t, db, "the commit it replaced in the same second", original, 0)
+}
+
+func testAmendThatDropsAFile(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "drop")
+	agentWrites(t, "drop-1", repo, "kept.txt", numbered(3, "kept %d"))
+	agentWrites(t, "drop-1", repo, "dropped.txt", numbered(2, "dropped %d"))
+	original := commitAll(t, repo, "add two files")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+	// The amend takes one of the files out of the commit again.
+	gitOut(t, repo, "rm", "-q", "--cached", "dropped.txt")
+	gitOut(t, repo, "commit", "-q", "--amend", "-m", "add one file")
+	amended := gitOut(t, repo, "rev-parse", "HEAD")
+	if err := GitCommit(repo, amended); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openDB(t)
+	wantCommit(t, db, "the amended commit", amended, 3)
+	// Only what the replacement holds is given up. The other file's lines
+	// are in no commit on a branch, and stay where they were recorded.
+	wantCommit(t, db, "the commit it replaced", original, 2)
+}
+
+func testCatchUpDeletedBranch(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "gone")
+	gitOut(t, repo, "checkout", "-q", "-b", "feature")
+	agentWrites(t, "gone-1", repo, "c.txt", numbered(3, "from the agent %d"))
+	onBranch := commitAll(t, repo, "add c on the branch")
+	if err := GitCommit(repo, onBranch); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t)
+	wantCommit(t, db, "the commit on the branch", onBranch, 3)
+
+	// The branch goes away: merged by squash on the server and deleted, or
+	// abandoned. No branch holds its commit any more.
+	gitOut(t, repo, "checkout", "-q", "main")
+	gitOut(t, repo, "branch", "-q", "-D", "feature")
+	laterSecond()
+	// Later someone writes the same file by hand on main, on the same line
+	// numbers. This commit does not carry the other's work.
+	writeFile(t, filepath.Join(repo, "c.txt"), numbered(3, "typed by hand %d"))
+	byHand := commitAll(t, repo, "add c by hand")
+
+	sweep(t, repo)
+	wantCommit(t, db, "the later commit, typed by hand", byHand, 0)
+	wantCommit(t, db, "the commit on the deleted branch", onBranch, 3)
+}
+
+func testCatchUpRevertOfRevert(t *testing.T, home string) {
+	repo, remote := repoWithRemote(t, home, "again")
+	agentWrites(t, "again-1", repo, "r.txt", numbered(4, "r %d"))
+	first := commitAll(t, repo, "add r")
+	if err := GitCommit(repo, first); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, repo, "push", "-q", "origin", "main")
+
+	// A teammate reverts it. Their commit arrives by a pull and is never
+	// recorded here, so the store does not know the commit after it descends
+	// from the first.
+	mate := filepath.Join(home, "again-mate")
+	gitOut(t, home, "clone", "-q", remote, mate)
+	gitOut(t, mate, "config", "user.email", "mate@example.com")
+	gitOut(t, mate, "config", "user.name", "Mate")
+	gitOut(t, mate, "revert", "--no-edit", first)
+	gitOut(t, mate, "push", "-q", "origin", "HEAD:main")
+	gitOut(t, repo, "pull", "-q", "--ff-only", "origin", "main")
+	laterSecond()
+	// The lines are put back, by a git posthook does not see.
+	gitOut(t, repo, "revert", "--no-edit", "HEAD")
+	again := gitOut(t, repo, "rev-parse", "HEAD")
+
+	sweep(t, repo)
+	db := openDB(t)
+	// The same lines, added twice in one history. The first commit is an
+	// ancestor, not an original this one replaces: it keeps its lines and
+	// they are not counted a second time.
+	wantCommit(t, db, "the commit that first added the lines", first, 4)
+	wantCommit(t, db, "the commit that adds them again", again, 0)
+}
+
+func testCatchUpRemovesStaleNote(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "note")
+	agentWrites(t, "note-1", repo, "n.txt", numbered(5, "n %d"))
+	// The commit with the agent's lines is made by a git posthook does not
+	// see...
+	first := commitAll(t, repo, "add n")
+	laterSecond()
+	// ...and the next one, a line typed by hand, by one it does.
+	writeFile(t, filepath.Join(repo, "n.txt"), numbered(5, "n %d")+"by hand\n")
+	second := commitAll(t, repo, "one more line")
+	if err := GitCommit(repo, second); err != nil {
+		t.Fatal(err)
+	}
+	// Recorded alone, the second commit is the first one posthook knows on
+	// this file, and its note claims the agent's ranges.
+	if !hasNote(repo, second) {
+		t.Fatal("test setup: the second commit has no note before the first is recorded")
+	}
+
+	sweep(t, repo)
+	db := openDB(t)
+	wantCommit(t, db, "the commit with the agent's lines", first, 5)
+	wantCommit(t, db, "the commit after it", second, 0)
+	if !hasNote(repo, first) {
+		t.Errorf("the commit with the agent's lines has no note")
+	}
+	if hasNote(repo, second) {
+		t.Errorf("the later commit still has the note that claims the earlier commit's ranges")
+	}
 }
 
 func testCatchUpForcePush(t *testing.T, home string) {
@@ -376,7 +548,6 @@ func testCatchUpForcePush(t *testing.T, home string) {
 	gitOut(t, repo, "checkout", "-q", "main")
 	writeFile(t, filepath.Join(repo, "other.txt"), "other\n")
 	commitAll(t, repo, "main moves")
-	laterSecond()
 	gitOut(t, repo, "checkout", "-q", "feature")
 	gitOut(t, repo, "rebase", "-q", "main")
 	rebased := gitOut(t, repo, "rev-parse", "HEAD")

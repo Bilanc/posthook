@@ -62,33 +62,49 @@ func Run(args []string) {
 	}
 	code := spawnPassthrough(realGit, args)
 	if len(unpushed) > 0 {
-		// Whatever the push's exit code: the commits exist either way.
-		queueCatchUp(pushRoot, unpushed)
+		// Whatever the push's exit code: the commits exist either way. The
+		// job is written before the notes go up, so it survives a push that
+		// is interrupted there.
+		notesRemote := ""
+		if interceptable && code == 0 {
+			notesRemote = pushNotesRemote(realGit, pushRoot, subcommandArgs)
+		}
+		queueCatchUp(pushRoot, unpushed, notesRemote)
 	}
 
 	if interceptable && code == 0 {
-		defer func() {
-			// Never let capture failures affect git's exit code.
-			if r := recover(); r != nil {
-				logx.Warnf("proxy capture panicked for %s: %v", subcommand, r)
-			}
-		}()
-		var err error
-		switch subcommand {
-		case "commit":
-			err = handleCommit(realGit, globals)
-		case "clone":
-			err = handleClone(realGit, subcommandArgs)
-		case "push":
-			err = handlePush(realGit, globals, subcommandArgs)
-		case "fetch", "pull":
-			err = handleFetch(realGit, globals, subcommandArgs)
-		}
-		if err != nil {
-			logx.Warnf("proxy capture failed for %s: %v", subcommand, err)
-		}
+		capture(realGit, subcommand, globals, subcommandArgs)
+	}
+	if len(unpushed) > 0 {
+		// After the notes transport above, so the worker does not write
+		// notes while they are being merged and pushed.
+		kickWorker()
 	}
 	os.Exit(code)
+}
+
+// capture runs what posthook does after an intercepted git command has
+// succeeded. Neither a failure nor a panic in it may affect git's exit code.
+func capture(realGit, subcommand string, globals, subcommandArgs []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Warnf("proxy capture panicked for %s: %v", subcommand, r)
+		}
+	}()
+	var err error
+	switch subcommand {
+	case "commit":
+		err = handleCommit(realGit, globals)
+	case "clone":
+		err = handleClone(realGit, subcommandArgs)
+	case "push":
+		err = handlePush(realGit, globals, subcommandArgs)
+	case "fetch", "pull":
+		err = handleFetch(realGit, globals, subcommandArgs)
+	}
+	if err != nil {
+		logx.Warnf("proxy capture failed for %s: %v", subcommand, err)
+	}
 }
 
 // preflight runs before the real git for push, fetch and pull. It is the
@@ -158,18 +174,21 @@ func unpushedBeforePush(realGit, root string) (shas []string) {
 // the ones posthook has not seen. The shadow itself does not open the store:
 // a push must not wait on it. Almost always every commit is already recorded
 // and the worker has nothing to do.
-func queueCatchUp(root string, shas []string) {
+//
+// notesRemote is where this push's notes go (pushNotesRemote), empty when
+// they go nowhere. The worker writes the notes of the commits it records
+// after the shadow has sent what it had, and sends them there itself.
+func queueCatchUp(root string, shas []string, notesRemote string) {
 	defer func() {
 		if r := recover(); r != nil {
 			logx.Warnf("proxy: queueing commit catch-up panicked: %v", r)
 		}
 	}()
-	job := spool.CommitJob{RepoRoot: root, SHAs: shas, ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	job := spool.CommitJob{RepoRoot: root, SHAs: shas, NotesRemote: notesRemote,
+		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	if err := spool.WriteCommitJob(job); err != nil {
 		logx.Warnf("proxy: queueing commit catch-up failed: %v", err)
-		return
 	}
-	kickWorker()
 }
 
 // kickWorker starts `posthook worker` detached so a queued job is handled
@@ -177,6 +196,7 @@ func queueCatchUp(root string, shas []string) {
 // that finds another running exits at once. Only the installed binary is
 // started, never a test binary or a build under another name.
 func kickWorker() {
+	defer func() { _ = recover() }()
 	exe, err := os.Executable()
 	if err != nil {
 		return
@@ -355,17 +375,8 @@ func handleClone(realGit string, args []string) error {
 // remote already has into ours, then pushes refs/notes/posthook so
 // teammates can `posthook blame` the commits that just went up.
 func handlePush(realGit string, globals, args []string) error {
-	if pushSkipsNotes(args) {
-		return nil
-	}
 	root := repoRoot(realGit, globals)
-	if root == "" {
-		return nil
-	}
-	remote := remoteFromArgs(args, pushFlagsWithValues)
-	if remote == "" {
-		remote = defaultPushRemote(realGit, root)
-	}
+	remote := pushNotesRemote(realGit, root, args)
 	if remote == "" {
 		return nil
 	}
@@ -375,6 +386,20 @@ func handlePush(realGit string, globals, args []string) error {
 	}
 	logx.Debugf("proxy: pushed attribution notes to %s", remote)
 	return nil
+}
+
+// pushNotesRemote is the remote a successful push's notes go to: the one the
+// push named, else the one git picks for a bare `git push`. Empty when the
+// push carries no notes (pushSkipsNotes), outside a repository, and when
+// there is no remote to send them to.
+func pushNotesRemote(realGit, root string, args []string) string {
+	if root == "" || pushSkipsNotes(args) {
+		return ""
+	}
+	if remote := remoteFromArgs(args, pushFlagsWithValues); remote != "" {
+		return remote
+	}
+	return defaultPushRemote(realGit, root)
 }
 
 // handleFetch runs after a successful `git fetch` / `git pull`.

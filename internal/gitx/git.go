@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -92,6 +93,34 @@ func Output(cwd string, args ...string) ([]byte, error) {
 	cmd.Dir = cwd
 	cmd.Env = BypassEnv()
 	return cmd.Output()
+}
+
+// OutputWithInput is Output with stdin fed to git, for commands that read
+// revisions or paths from standard input (`--stdin`), where a command line
+// would limit how many can be named.
+func OutputWithInput(cwd, stdin string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = cwd
+	cmd.Env = BypassEnv()
+	cmd.Stdin = strings.NewReader(stdin)
+	return cmd.Output()
+}
+
+// IsAncestor reports whether ancestor is reachable from descendant. An error
+// means git could not say (an object it does not have, not a repository).
+func IsAncestor(cwd, ancestor, descendant string) (bool, error) {
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd.Dir = cwd
+	cmd.Env = BypassEnv()
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, err
 }
 
 // Exec runs `git <args>` in cwd with POSTHOOK_BYPASS=1 and returns an error
