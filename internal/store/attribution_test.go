@@ -227,3 +227,181 @@ func mustQueryRow(t *testing.T, db *DB, query string, args []any, dest ...any) {
 		t.Fatalf("queryrow %q: %v", query, err)
 	}
 }
+
+func TestAddedLinesByCommit(t *testing.T) {
+	// `git log --format=%x00%H -p --unified=0` for two commits. The first
+	// adds a line that itself starts with "++ ", a line of punctuation and a
+	// blank one; a file header follows a hunk.
+	out := "\x00aaa\n\n" +
+		"diff --git a/f.go b/f.go\nindex 1..2 100644\n--- a/f.go\n+++ b/f.go\n" +
+		"@@ -2,0 +3,5 @@ func f() {\n+\tx := load()\n+++ odd\n+\n+}\n+\tx := load()\n" +
+		"@@ -9 +14 @@\n-old\n+new line\r\n" +
+		"diff --git a/g.go b/g.go\nnew file mode 100644\n--- /dev/null\n+++ b/g.go\n@@ -0,0 +1,2 @@\n+package g\n+x := load()\n" +
+		"\x00bbb\n\n" +
+		"diff --git a/f.go b/f.go\n--- a/f.go\n+++ b/f.go\n@@ -1,0 +2 @@\n+x := load()\n"
+	got := addedLinesByCommit([]byte(out))
+	const f, g = "a/f.go b/f.go", "a/g.go b/g.go"
+	want := map[string]map[addedLine]int{
+		"aaa": {{f, "x := load()"}: 2, {f, "++ odd"}: 1, {f, "new line"}: 1, {g, "package g"}: 1, {g, "x := load()"}: 1},
+		"bbb": {{f, "x := load()"}: 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("commits = %v, want %v", got, want)
+	}
+	for sha, lines := range want {
+		if len(got[sha]) != len(lines) {
+			t.Errorf("%s: lines = %v, want %v", sha, got[sha], lines)
+			continue
+		}
+		for line, n := range lines {
+			if got[sha][line] != n {
+				t.Errorf("%s: %v counted %d times, want %d", sha, line, got[sha][line], n)
+			}
+		}
+	}
+}
+
+func TestCarries(t *testing.T) {
+	const f, g = "a/f.go b/f.go", "a/g.go b/g.go"
+	mine := map[addedLine]int{{f, "a := 1"}: 1, {f, "b := 2"}: 2, {f, "return a"}: 1, {g, "c := 3"}: 2}
+	for _, c := range []struct {
+		name   string
+		theirs map[addedLine]int
+		want   bool
+	}{
+		{"the same lines", map[addedLine]int{{f, "a := 1"}: 1, {f, "b := 2"}: 2}, true},
+		{"more than half", map[addedLine]int{{f, "a := 1"}: 1, {f, "b := 2"}: 1, {f, "d := 4"}: 1}, true},
+		{"exactly half", map[addedLine]int{{f, "a := 1"}: 1, {f, "d := 4"}: 1}, false},
+		{"a repeated line counts as often as both have it", map[addedLine]int{{f, "a := 1"}: 3}, false},
+		{"the same text in another file", map[addedLine]int{{f, "c := 3"}: 2}, false},
+		{"other lines", map[addedLine]int{{f, "d := 4"}: 4}, false},
+		{"nothing to compare", map[addedLine]int{}, false},
+	} {
+		if got := carries(mine, c.theirs); got != c.want {
+			t.Errorf("%s: carries = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestCarriedCommitIsCreditedOnlyWhenAttributedOnItsOwn covers the two ways a
+// commit is attributed. On its own, an amended commit carries its original
+// and is credited with the session's lines. In the whole-database pass every
+// earlier commit closes the window, so the lines are counted once, on the
+// original.
+func TestCarriedCommitIsCreditedOnlyWhenAttributedOnItsOwn(t *testing.T) {
+	repoDir := t.TempDir()
+	const file = "f.txt"
+	original := initGitRepo(t, repoDir, file, "alpha\nbravo\ncharlie\ndelta\necho\n")
+	amend := exec.Command("git", "commit", "-q", "--amend", "-m", "reworded")
+	amend.Dir = repoDir
+	amend.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com")
+	if out, err := amend.CombinedOutput(); err != nil {
+		t.Fatalf("git commit --amend: %v\n%s", err, out)
+	}
+	head := exec.Command("git", "rev-parse", "HEAD")
+	head.Dir = repoDir
+	out, err := head.Output()
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	amended := string(out[:40])
+	if amended == original {
+		t.Fatal("test setup: the amend did not rewrite the commit")
+	}
+
+	db := newTestDB(t)
+	mustExec(t, db, `INSERT INTO repositories (id, name, root_path) VALUES ('repo1', 'r', ?)`, repoDir)
+	mustExec(t, db, `INSERT INTO sessions (id, agent_slug, repo_id, started_at)
+		VALUES ('sess1', 'claude-code', 'repo1', '2024-01-01T10:00:00Z')`)
+	for _, c := range []struct{ id, sha, at string }{
+		{"original", original, "2024-01-01T11:00:00Z"},
+		{"amended", amended, "2024-01-01T11:05:00Z"},
+	} {
+		mustExec(t, db, `INSERT INTO commits (id, repo_id, sha, committed_at, lines_added) VALUES (?, 'repo1', ?, ?, 5)`, c.id, c.sha, c.at)
+		mustExec(t, db, `INSERT INTO commit_files (commit_id, file_path, lines_added) VALUES (?, ?, 5)`, c.id, file)
+	}
+	mustExec(t, db, `INSERT INTO events (id, session_id, ts, event_type, agent_slug, repo_id, rel_file_path, payload)
+		VALUES ('e1', 'sess1', '2024-01-01T10:10:00Z', 'PostToolUse', 'claude-code', 'repo1', ?, '{}')`, file)
+	mustExec(t, db, `INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, blob_sha_after, start_line, end_line, new_text_lines)
+		VALUES ('lr1', 'e1', ?, ?, 'sha', 1, 5, 5)`, file, file)
+
+	lines := func(commitID string) int {
+		var n int
+		mustQueryRow(t, db, `SELECT COALESCE(SUM(lines_attributed), 0) FROM commit_sessions WHERE commit_id = ?`, []any{commitID}, &n)
+		return n
+	}
+
+	if carried := db.CarriedCommits("amended", amended, "repo1", "2024-01-01T11:05:00Z", repoDir); len(carried) != 1 || carried[0] != "original" {
+		t.Fatalf("the amended commit carries %v, want [original]", carried)
+	}
+	if carried := db.CarriedCommits("original", original, "repo1", "2024-01-01T11:00:00Z", repoDir); len(carried) != 0 {
+		t.Errorf("the original carries %v, want nothing: the amend came after it", carried)
+	}
+	if _, err := db.RefreshCommitAttributions("amended"); err != nil {
+		t.Fatalf("RefreshCommitAttributions: %v", err)
+	}
+	if got := lines("amended"); got != 5 {
+		t.Errorf("the amended commit, attributed on its own: %d lines, want 5", got)
+	}
+
+	if _, err := db.RefreshCommitAttributions(""); err != nil {
+		t.Fatalf("RefreshCommitAttributions (all): %v", err)
+	}
+	if o, a := lines("original"), lines("amended"); o != 5 || a != 0 {
+		t.Errorf("whole-database pass: original %d, amended %d lines, want 5 and 0", o, a)
+	}
+}
+
+// TestGiveUpAttributionBringsSessionTotalsInLine covers a retirement that was
+// cut short: the file rows are at zero already, the per-session total is not.
+// The next call has no file row left to change and still has to settle it.
+func TestGiveUpAttributionBringsSessionTotalsInLine(t *testing.T) {
+	db := newTestDB(t)
+	mustExec(t, db, `INSERT INTO repositories (id, name, root_path) VALUES ('repo1', 'r', '/nonexistent/path')`)
+	mustExec(t, db, `INSERT INTO sessions (id, agent_slug, repo_id, started_at)
+		VALUES ('sess1', 'claude-code', 'repo1', '2024-01-01T10:00:00Z')`)
+	for _, id := range []string{"retired", "replacement"} {
+		mustExec(t, db, `INSERT INTO commits (id, repo_id, sha, committed_at, lines_added) VALUES (?, 'repo1', ?, '2024-01-01T11:00:00Z', 5)`, id, id)
+	}
+	row := func(table, commitID string, lines int) {
+		cols, vals := "commit_id, session_id, first_event_ts, last_event_ts, lines_attributed", "?, 'sess1', 't', 't', ?"
+		if table == "commit_session_files" {
+			cols, vals = cols+", file_path", vals+", 'f.txt'"
+		} else {
+			cols, vals = cols+", agent_slug, files_touched", vals+", 'claude-code', 1"
+		}
+		mustExec(t, db, `INSERT INTO `+table+` (`+cols+`) VALUES (`+vals+`)`, commitID, lines)
+	}
+	row("commit_session_files", "replacement", 5)
+	row("commit_sessions", "replacement", 5)
+	row("commit_session_files", "retired", 0) // already given up
+	row("commit_sessions", "retired", 5)      // left behind
+	mustExec(t, db, `UPDATE commit_sessions SET synced_at = 'synced' WHERE commit_id = 'retired'`)
+
+	changed, err := db.GiveUpAttribution("retired", "replacement")
+	if err != nil {
+		t.Fatalf("GiveUpAttribution: %v", err)
+	}
+	if !changed {
+		t.Errorf("GiveUpAttribution reported no change")
+	}
+	var lines, files int
+	var synced sql.NullString
+	mustQueryRow(t, db, `SELECT lines_attributed, files_touched, synced_at FROM commit_sessions WHERE commit_id = 'retired'`, nil, &lines, &files, &synced)
+	if lines != 0 || files != 0 {
+		t.Errorf("retired commit's session total: %d lines in %d files, want 0 in 0", lines, files)
+	}
+	if synced.Valid {
+		t.Errorf("the corrected row is not marked for sync")
+	}
+	mustQueryRow(t, db, `SELECT lines_attributed FROM commit_sessions WHERE commit_id = 'replacement'`, nil, &lines)
+	if lines != 5 {
+		t.Errorf("replacement's session total changed to %d", lines)
+	}
+	// Nothing left to do: a further call changes nothing.
+	if changed, err := db.GiveUpAttribution("retired", "replacement"); err != nil || changed {
+		t.Errorf("a second call: changed %v, err %v", changed, err)
+	}
+}

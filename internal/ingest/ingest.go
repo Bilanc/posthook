@@ -351,6 +351,12 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		}
 	}
 
+	// A turn just ended: record any commit made in the repositories this
+	// session worked in that posthook did not see being made (catchup.go).
+	if eventType == "Stop" && sessionID != "" {
+		catchUpSessionRepos(db, sessionID, repoRoot)
+	}
+
 	return nil
 }
 
@@ -456,24 +462,32 @@ func GitCommit(repoRoot, sha string) error {
 	if committedAt == "" {
 		committedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	_, err = db.Exec(`
-		INSERT INTO commits (
-			id, org_id, repo_id, sha, parent_sha, author_email, author_name,
-			committed_at, branch, message, lines_added, lines_removed, files_changed
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(repo_id, sha) DO NOTHING`,
-		commitID, store.LocalOrgID, repoID, sha, nullableString(parentSha),
-		nullableString(email), nullableString(name), committedAt,
-		nullableString(branch), nullableString(subject),
-		added, removed, filesChanged)
-	if err != nil {
-		logx.Warnf("commit insert failed: %v", err)
-		return nil
-	}
-
-	var finalCommitID string
-	if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&finalCommitID); err != nil {
-		finalCommitID = commitID
+	// A commit is recorded once per repository, whichever of its checkouts
+	// reports it. A rewrite is kept with the checkout of its original
+	// (homeRepository); when it is reported again from the checkout it was
+	// made in (the post-commit hook and the shadow both report a commit),
+	// that record is the one to use, not a second one under this checkout.
+	finalCommitID, recordedIn, known := recordedCommit(db, repoID, sha)
+	if known {
+		repoID = recordedIn
+	} else {
+		_, err = db.Exec(`
+			INSERT INTO commits (
+				id, org_id, repo_id, sha, parent_sha, author_email, author_name,
+				committed_at, branch, message, lines_added, lines_removed, files_changed
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(repo_id, sha) DO NOTHING`,
+			commitID, store.LocalOrgID, repoID, sha, nullableString(parentSha),
+			nullableString(email), nullableString(name), committedAt,
+			nullableString(branch), nullableString(subject),
+			added, removed, filesChanged)
+		if err != nil {
+			logx.Warnf("commit insert failed: %v", err)
+			return nil
+		}
+		if err := db.QueryRow(`SELECT id FROM commits WHERE repo_id = ? AND sha = ?`, repoID, sha).Scan(&finalCommitID); err != nil {
+			finalCommitID = commitID
+		}
 	}
 
 	for _, f := range perFile {
@@ -486,55 +500,97 @@ func GitCommit(repoRoot, sha string) error {
 		}
 	}
 
-	attributedSessions, err := db.RefreshCommitAttributions(finalCommitID)
-	if err != nil {
-		logx.Warnf("refresh attributions failed: %v", err)
-	}
 	if len(sha) >= 7 {
 		logx.Debugf("ingested commit %s in %s (+%d/-%d)", sha[:7], repoName, added, removed)
+	}
+	carried := carriedBy(db, repoRoot, repoID, sha, finalCommitID)
+	repoID = homeRepository(db, repoID, finalCommitID, carried)
+	// A commit recorded as it is made has no note of ours yet.
+	attributeCarrying(db, repoRoot, repoID, sha, finalCommitID, carried, false)
+	return nil
+}
+
+// homeRepository moves a commit to the repository row whose edits it carries
+// and returns the row it is in afterwards.
+//
+// Every working tree is a repository row of its own, with its own edits. A
+// rewrite made in another checkout (a worktree's branch amended or rebased
+// from the main checkout, a commit cherry-picked from one worktree into
+// another) has its edits where its original was recorded. Left under the
+// checkout it was made in, it would be attributed against that checkout's
+// edits and get nothing, and the merge request it lands in would count with
+// 0 AI lines. carried is newest first; a commit that carries one of its own
+// row's commits stays where it is. A commit that carries commits from
+// several other rows goes with the newest, and its attribution reads the
+// edits of the others as well (store.AttributionSources).
+func homeRepository(db *store.DB, repoID, commitID string, carried []string) string {
+	home := ""
+	for _, carriedID := range carried {
+		var row string
+		if err := db.QueryRow(`SELECT repo_id FROM commits WHERE id = ?`, carriedID).Scan(&row); err != nil {
+			continue
+		}
+		if row == repoID {
+			return repoID
+		}
+		if home == "" {
+			home = row
+		}
+	}
+	if home == "" {
+		return repoID
+	}
+	if _, err := db.Exec(`UPDATE commits SET repo_id = ?, synced_at = NULL WHERE id = ?`, home, commitID); err != nil {
+		logx.Warnf("moving a commit to the checkout of its original failed: %v", err)
+		return repoID
+	}
+	return home
+}
+
+// recordedCommit finds the record of a commit in the repository that repoID
+// is a checkout of: under that row, else under another checkout of the same
+// repository. A commit with the same SHA in an unrelated repository (a fork
+// with its own remote) is not this repository's record.
+func recordedCommit(db *store.DB, repoID, sha string) (commitID, recordedIn string, ok bool) {
+	err := db.QueryRow(`
+		SELECT id, repo_id FROM commits
+		WHERE sha = ? AND repo_id IN `+store.CheckoutsOf+`
+		ORDER BY (repo_id = ?) DESC LIMIT 1`, sha, repoID, repoID, repoID).Scan(&commitID, &recordedIn)
+	return commitID, recordedIn, err == nil
+}
+
+// attributeAndNote (re)computes one recorded commit's attribution, retires
+// the attribution of commits it has replaced, and writes its git note.
+// hadNote says the commit already has a note from an earlier pass, which is
+// removed when this pass leaves it nothing to say. repoRoot is the working
+// tree to ask git in, repoID the row the commit is recorded under.
+func attributeAndNote(db *store.DB, repoRoot, repoID, sha, commitID string, hadNote bool) {
+	attributeCarrying(db, repoRoot, repoID, sha, commitID, carriedBy(db, repoRoot, repoID, sha, commitID), hadNote)
+}
+
+// attributeCarrying is attributeAndNote with the carried commits already
+// worked out: they cost git calls, and all three steps need them.
+func attributeCarrying(db *store.DB, repoRoot, repoID, sha, commitID string, carried []string, hadNote bool) {
+	attributedSessions, err := db.RefreshCommitAttributionCarrying(commitID, repoRoot, carried)
+	if err != nil {
+		logx.Warnf("refresh attributions failed: %v", err)
 	}
 	if attributedSessions > 0 && len(sha) >= 7 {
 		logx.Debugf("attributed commit %s to %d session(s)", sha[:7], attributedSessions)
 	}
-
-	if err := writeNoteForCommit(db, repoRoot, repoID, sha, finalCommitID); err != nil {
+	retireCarried(db, repoRoot, sha, commitID, carried)
+	if err := writeNoteForCommit(db, repoRoot, repoID, sha, commitID, carried, hadNote); err != nil {
 		if len(sha) >= 7 {
 			logx.Warnf("note write failed for %s: %v", sha[:7], err)
 		}
 	}
-	return nil
 }
 
-func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) error {
-	rows, err := db.Query(`
-		SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
-		       e.ts AS event_ts, elr.start_line, elr.end_line
-		FROM commits c
-		JOIN commit_files cf ON cf.commit_id = c.id
-		JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
-		JOIN events e ON e.id = elr.event_id
-		LEFT JOIN sessions s ON s.id = e.session_id
-		WHERE c.id = ?
-		  AND c.repo_id = ?
-		  AND e.repo_id = c.repo_id
-		  AND elr.rel_file_path IS NOT NULL
-		  AND datetime(c.committed_at) >= datetime(e.ts)
-		  AND NOT EXISTS (
-			SELECT 1
-			FROM commits c2
-			JOIN commit_files cf2 ON cf2.commit_id = c2.id
-			WHERE c2.repo_id = c.repo_id
-			  AND cf2.file_path = cf.file_path
-			  AND datetime(c2.committed_at) >= datetime(e.ts)
-			  AND datetime(c2.committed_at) < datetime(c.committed_at)
-		  )
-		ORDER BY elr.rel_file_path, elr.start_line`,
-		commitID, repoID)
-	if err != nil {
+func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, carried []string, hadNote bool) error {
+	var committedAt string
+	if err := db.QueryRow(`SELECT committed_at FROM commits WHERE id = ?`, commitID).Scan(&committedAt); err != nil {
 		return err
 	}
-	defer rows.Close()
-
 	type entry struct {
 		Lines   string `json:"lines"`
 		Agent   string `json:"agent"`
@@ -544,30 +600,80 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string) er
 	}
 	files := map[string][]entry{}
 	count := 0
-	for rows.Next() {
-		var rel, agent, ts string
-		var session, model sql.NullString
-		var start, end int
-		if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
+	// The same edits as attribution reads (store.AttributionSources), in the
+	// same window: a commit this one carries does not close it
+	// (store.CarriedCommits), and neither does one that gave the session's
+	// lines in the file up (store.ClosesWindow).
+	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
+	for _, src := range db.AttributionSources(repoID, committedAt, carried) {
+		args := append([]any{commitID, src.RepoID, src.Until, src.Until}, carriedArgs...)
+		args = append(args, commitID)
+		rows, err := db.Query(`
+			SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
+			       e.ts AS event_ts, elr.start_line, elr.end_line
+			FROM commit_files cf
+			JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
+			JOIN events e ON e.id = elr.event_id
+			LEFT JOIN sessions s ON s.id = e.session_id
+			WHERE cf.commit_id = ?
+			  AND e.repo_id = ?
+			  AND elr.rel_file_path IS NOT NULL
+			  AND datetime(?) >= datetime(e.ts)
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM commits c2
+				JOIN commit_files cf2 ON cf2.commit_id = c2.id
+				WHERE c2.repo_id = e.repo_id
+				  AND cf2.file_path = cf.file_path
+				  AND datetime(c2.committed_at) >= datetime(e.ts)
+				  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
+				  AND `+store.ClosesWindow+`
+			  )
+			ORDER BY elr.rel_file_path, elr.start_line`,
+			args...)
+		if err != nil {
 			return err
 		}
-		lineRange := fmt.Sprintf("%d", start)
-		if start != end {
-			lineRange = fmt.Sprintf("%d-%d", start, end)
+		for rows.Next() {
+			var rel, agent, ts string
+			var session, model sql.NullString
+			var start, end int
+			if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
+				rows.Close()
+				return err
+			}
+			lineRange := fmt.Sprintf("%d", start)
+			if start != end {
+				lineRange = fmt.Sprintf("%d-%d", start, end)
+			}
+			files[rel] = append(files[rel], entry{
+				Lines:   lineRange,
+				Agent:   agent,
+				Session: session.String,
+				Model:   model.String,
+				TS:      ts,
+			})
+			count++
 		}
-		files[rel] = append(files[rel], entry{
-			Lines:   lineRange,
-			Agent:   agent,
-			Session: session.String,
-			Model:   model.String,
-			TS:      ts,
-		})
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return err
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
 	}
 	if count == 0 {
+		if hadNote {
+			// The note was written when this commit was attributed without an
+			// earlier commit that has since been recorded. The ranges are
+			// that commit's now, and a note left here would still claim them.
+			if err := gitx.Exec(repoRoot, "notes", "--ref="+paths.NotesRef, "remove", "--ignore-missing", sha); err != nil {
+				return err
+			}
+			if len(sha) >= 7 {
+				logx.Debugf("note: no AI ranges left for %s, removed its note", sha[:7])
+			}
+			return nil
+		}
 		if len(sha) >= 7 {
 			logx.Debugf("note: no AI ranges for %s, skipping", sha[:7])
 		}

@@ -114,12 +114,25 @@ func runWorker(managed bool) error {
 			lastWork = time.Now()
 			logx.Debugf("worker: drained %d event(s)", n)
 		}
+		// Commits the git shadow saw being pushed that were never recorded
+		// (see ingest/catchup.go). After the events, so a commit is
+		// attributed with every edit that led up to it already in the store.
+		jobs, err := spool.DrainCommitJobs(ingest.ProcessCommitJob)
+		if err != nil {
+			logx.Warnf("worker: commit catch-up error: %v", err)
+		}
+		if jobs > 0 {
+			lastWork = time.Now()
+			logx.Debugf("worker: handled %d commit catch-up job(s)", jobs)
+		}
 
 		if !managed && time.Since(lastWork) > workerIdleTimeout {
 			// Guard against exiting just as an event lands: if anything is
 			// still queued, keep going rather than strand it until the next
 			// hook fire.
-			if p, _ := spool.Pending(); p > 0 {
+			p, _ := spool.Pending()
+			j, _ := spool.PendingCommitJobs()
+			if p+j > 0 {
 				lastWork = time.Now()
 				continue
 			}

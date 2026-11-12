@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/bilanc/posthook/internal/atomicfs"
 	"github.com/bilanc/posthook/internal/paths"
@@ -131,4 +132,161 @@ func Pending() (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// CommitJob asks the worker to record commits the git shadow saw were about
+// to be pushed and that posthook may never have seen being made: made by a
+// git that does not go through the shadow, or by a rebase, a merge or a
+// cherry-pick. SHAs are oldest first. NotesRemote is the remote the shadow
+// sent attribution notes to after that push, empty when it sent none: the
+// worker sends them there again if recording the commits changes them.
+type CommitJob struct {
+	RepoRoot    string   `json:"repo_root"`
+	SHAs        []string `json:"shas"`
+	NotesRemote string   `json:"notes_remote,omitempty"`
+	ReceivedAt  string   `json:"received_at"`
+}
+
+// CommitJobsDir is where commit jobs wait (~/.posthook/spool/commits). A
+// directory of their own, not another kind of Envelope: Drain skips
+// directories, so a worker from an older binary that is still running never
+// picks one up and stores it as an agent event.
+func CommitJobsDir() string { return filepath.Join(Dir(), "commits") }
+
+// WriteCommitJob atomically drops one job into the commit spool.
+func WriteCommitJob(job CommitJob) error {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	return atomicfs.Write(filepath.Join(CommitJobsDir(), commitJobName(job)), data, 0o644)
+}
+
+func commitJobName(job CommitJob) string {
+	return strings.ReplaceAll(job.ReceivedAt+"-"+uuid.NewString()+".json", ":", "")
+}
+
+// heldSuffix marks a commit job that is written but not released yet.
+const heldSuffix = ".held"
+
+// heldJobGrace is how long a held job waits for its release before a worker
+// takes it anyway: whoever held it was interrupted. Well above the time the
+// notes transport it waits for can take.
+const heldJobGrace = 2 * time.Minute
+
+// HoldCommitJob writes a job that no worker takes until release is called.
+//
+// The git shadow sends attribution notes right after a push, and the worker
+// writes notes for the commits a job records and sends them too. A worker is
+// usually running already and looks at the spool every second, so a job
+// written before the shadow's notes transport would have the two merging and
+// pushing the same notes ref at once. The job still has to be on disk before
+// that transport starts, or a push interrupted there would lose it. A job
+// that is never released is taken after heldJobGrace.
+func HoldCommitJob(job CommitJob) (release func() error, err error) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(CommitJobsDir(), commitJobName(job))
+	if err := atomicfs.Write(path+heldSuffix, data, 0o644); err != nil {
+		return nil, err
+	}
+	return func() error { return os.Rename(path+heldSuffix, path) }, nil
+}
+
+// heldCommitJobs lists the held jobs in the commit spool.
+func heldCommitJobs() ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(CommitJobsDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var held []os.DirEntry
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json"+heldSuffix) {
+			held = append(held, e)
+		}
+	}
+	return held, nil
+}
+
+// releaseAbandonedJobs releases the held jobs nobody released in time.
+func releaseAbandonedJobs() {
+	held, _ := heldCommitJobs()
+	for _, e := range held {
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < heldJobGrace {
+			continue
+		}
+		path := filepath.Join(CommitJobsDir(), e.Name())
+		_ = os.Rename(path, strings.TrimSuffix(path, heldSuffix))
+	}
+}
+
+// DrainCommitJobs processes every job in the commit spool, oldest first, with
+// the same rules as Drain: a job is removed once process returns nil, left
+// for the next pass on an error, and dropped if it cannot be parsed. A held
+// job is left alone until it is released.
+func DrainCommitJobs(process func(CommitJob) error) (int, error) {
+	releaseAbandonedJobs()
+	names, err := jsonFiles(CommitJobsDir())
+	if err != nil {
+		return 0, err
+	}
+	handled := 0
+	for _, n := range names {
+		path := filepath.Join(CommitJobsDir(), n)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return handled, err
+		}
+		var job CommitJob
+		if err := json.Unmarshal(data, &job); err != nil {
+			_ = os.Remove(path)
+			continue
+		}
+		if err := process(job); err != nil {
+			return handled, err
+		}
+		_ = os.Remove(path)
+		handled++
+	}
+	return handled, nil
+}
+
+// PendingCommitJobs reports how many commit jobs are waiting, held ones
+// included: a worker that would otherwise exit stays for them.
+func PendingCommitJobs() (int, error) {
+	names, err := jsonFiles(CommitJobsDir())
+	if err != nil {
+		return 0, err
+	}
+	held, err := heldCommitJobs()
+	return len(names) + len(held), err
+}
+
+// jsonFiles lists the complete records in a spool directory, sorted by name
+// (arrival order). A missing directory is an empty spool.
+func jsonFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
