@@ -13,10 +13,13 @@ import (
 const claudeAgentSlug = "claude-code"
 
 // claudeHookTypes are the events posthook actually needs: PostToolUse carries
-// the file edits we attribute, Stop carries the transcript (model + tokens).
+// the file edits we attribute, Stop carries the transcript (model + tokens),
+// and UserPromptSubmit marks the start of a turn: what changed in the
+// repository before it was changed by a person, not by the agent's next
+// shell command. It fires once per prompt and its prompt text is not stored.
 // PreToolUse and SessionStart fired on every tool call / session with no data
 // we keep, doubling hook spawns for nothing — they're now stripped on install.
-var claudeHookTypes = []string{"PostToolUse", "Stop"}
+var claudeHookTypes = []string{"PostToolUse", "Stop", "UserPromptSubmit"}
 
 // claudeDeprecatedHookTypes are events posthook used to register but no longer
 // does. On (re)install we remove our command from these so upgraded users stop

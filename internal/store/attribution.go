@@ -711,6 +711,7 @@ func (db *DB) candidateRanges(commitID, repoID, file, committedAt string, carrie
 		LEFT JOIN sessions s ON s.id = e.session_id
 		WHERE e.repo_id = ?
 		  AND elr.rel_file_path = ?
+		  AND `+NamesLines+`
 		  AND e.session_id IS NOT NULL
 		  AND datetime(e.ts) <= datetime(?)
 		  AND NOT EXISTS (

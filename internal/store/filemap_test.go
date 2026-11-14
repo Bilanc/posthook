@@ -361,3 +361,42 @@ func TestLocalTablesAreNotSynced(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrationFromV17AddsTheLookTables(t *testing.T) {
+	// A database as v17 left it: no pending_looks, no repo_looks, and no
+	// index on the commit id that blame looks a commit up by. v18 adds them
+	// as whole tables and an index, which the schema itself creates on an
+	// upgrade (migrate applies it before the column guards).
+	db := openBareDB(t, schemaSQL)
+	mustExec(t, db, `DROP TABLE pending_looks`)
+	mustExec(t, db, `DROP TABLE repo_looks`)
+	mustExec(t, db, `DROP INDEX idx_commits_sha`)
+	mustExec(t, db, `INSERT INTO schema_version (version, applied_at) VALUES (17, '2026-11-13 09:00:00')`)
+
+	if err := db.migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if v := db.currentSchemaVersion(); v != schemaVersion {
+		t.Fatalf("schema version %d, want %d", v, schemaVersion)
+	}
+	fired := time.Now().Add(-time.Second)
+	if err := db.AddPendingLook(PendingLook{Kind: LookShell, EventID: "e1", Root: "/repo", FiredAt: fired}); err != nil {
+		t.Fatalf("queue a look after migration: %v", err)
+	}
+	if n := db.CountPendingLooks(); n != 1 {
+		t.Errorf("%d pending look(s), want 1", n)
+	}
+	if err := db.SaveRepoLook("/repo", RepoLook{Head: "abc", LookedAt: fired, Partial: true}); err != nil {
+		t.Fatalf("record a look after migration: %v", err)
+	}
+	if look, ok := db.RepoLook("/repo"); !ok || look.Head != "abc" || !look.Partial {
+		t.Errorf("the recorded look reads back as %+v (found %v)", look, ok)
+	}
+	var indexes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_commits_sha'`).Scan(&indexes); err != nil || indexes != 1 {
+		t.Errorf("idx_commits_sha: %d index(es), err %v", indexes, err)
+	}
+	if err := db.applyMigrations(); err != nil {
+		t.Fatalf("second applyMigrations: %v", err)
+	}
+}

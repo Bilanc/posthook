@@ -41,6 +41,11 @@ type LineAuthor struct {
 	SessionID string `json:"s"`
 	Agent     string `json:"a,omitempty"`
 	TS        string `json:"t,omitempty"`
+	// Held marks a line that is kept for a shell tool call whose look at the
+	// working tree is still due (looks.go): the line appeared after the
+	// command ran and before posthook looked. Until that look confirms it,
+	// the line counts as nobody's.
+	Held bool `json:"h,omitempty"`
 }
 
 // FileMap is one file's authorship map.
@@ -72,12 +77,40 @@ type FileMap struct {
 // row written before v17, whatever its lines.
 func (m FileMap) HasAuthors() bool { return m.Owner != nil }
 
-// AuthorOf returns the author of line i (0-based).
+// AuthorOf returns the author of line i (0-based). A line that is only held
+// for a look that is still due has none.
 func (m FileMap) AuthorOf(i int) (LineAuthor, bool) {
+	a, ok := m.authorEntry(i)
+	if !ok || a.Held {
+		return LineAuthor{}, false
+	}
+	return a, true
+}
+
+// HeldFor returns the event line i (0-based) is held for, if it is.
+func (m FileMap) HeldFor(i int) (LineAuthor, bool) {
+	a, ok := m.authorEntry(i)
+	if !ok || !a.Held {
+		return LineAuthor{}, false
+	}
+	return a, true
+}
+
+func (m FileMap) authorEntry(i int) (LineAuthor, bool) {
 	if i < 0 || i >= len(m.Owner) || m.Owner[i] <= 0 || m.Owner[i] > len(m.Authors) {
 		return LineAuthor{}, false
 	}
 	return m.Authors[m.Owner[i]-1], true
+}
+
+// ClearAuthor leaves line i (0-based) with no author.
+func (m *FileMap) ClearAuthor(i int) {
+	if i >= 0 && i < len(m.Owner) {
+		m.Owner[i] = 0
+		if i < len(m.Commit) {
+			m.Commit[i] = 0
+		}
+	}
 }
 
 // CommitOf returns the sha of the commit line i (0-based) was last counted
@@ -97,7 +130,7 @@ func (m *FileMap) SetAuthor(i int, author LineAuthor) {
 	}
 	at := -1
 	for k, a := range m.Authors {
-		if a.EventID == author.EventID {
+		if a.EventID == author.EventID && a.Held == author.Held {
 			at = k
 			break
 		}
