@@ -58,17 +58,23 @@ func (db *DB) RefreshCommitAttributionCarrying(commitID, root string, carried []
 	return db.refreshCommitAttributions(commitID, root, carried)
 }
 
+// commitRow is one recorded commit as attribution needs it.
+type commitRow struct {
+	id, sha, repoID, committedAt string
+	// root is the working tree to ask git in. rowRoot is the checkout the
+	// commit is recorded with, where the edits behind it were captured and
+	// where the authorship map of its files is kept. They differ when a
+	// commit is recorded from another checkout of its repository.
+	root, rowRoot string
+}
+
 // carried is nil when it has to be worked out per commit; root is empty to
 // use each commit's own repository row.
 func (db *DB) refreshCommitAttributions(commitID, root string, carried []string) (int, error) {
 	var commitArg any
 	if commitID != "" {
-		if _, err := db.Exec(`DELETE FROM commit_sessions WHERE commit_id = ?`, commitID); err != nil {
-			return 0, err
-		}
-		if _, err := db.Exec(`DELETE FROM commit_session_files WHERE commit_id = ?`, commitID); err != nil {
-			return 0, err
-		}
+		// What one commit is credited with is replaced in a single step
+		// when its new attribution is written (writeAttribution).
 		commitArg = commitID
 	} else {
 		if _, err := db.Exec(`DELETE FROM commit_sessions`); err != nil {
@@ -89,13 +95,10 @@ func (db *DB) refreshCommitAttributions(commitID, root string, carried []string)
 	if err != nil {
 		return 0, err
 	}
-	type commitRow struct {
-		id, sha, repoID, committedAt, root string
-	}
 	var commits []commitRow
 	for rows.Next() {
 		var c commitRow
-		if err := rows.Scan(&c.id, &c.sha, &c.repoID, &c.committedAt, &c.root); err != nil {
+		if err := rows.Scan(&c.id, &c.sha, &c.repoID, &c.committedAt, &c.rowRoot); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -108,10 +111,11 @@ func (db *DB) refreshCommitAttributions(commitID, root string, carried []string)
 
 	total := 0
 	for _, c := range commits {
+		c.root = c.rowRoot
 		if root != "" {
 			c.root = root
 		}
-		n, err := db.attributeCommit(c.id, c.sha, c.repoID, c.committedAt, c.root, carried)
+		n, err := db.attributeCommit(c, carried, commitID != "")
 		if err != nil {
 			return total, err
 		}
@@ -138,13 +142,25 @@ type fileAgg struct {
 	eventIDs map[string]bool
 	firstTS  string
 	lastTS   string
+	// numbers and norms are the attributed lines themselves, in the commit's
+	// line numbers, when they are known (commit_ai_lines). inherited is the
+	// event count that came with lines inherited from a commit this one
+	// replaces.
+	numbers   []int
+	norms     []uint64
+	inherited int
 }
 
 func (f *fileAgg) touch(eventID, ts string) {
-	if f.eventIDs == nil {
-		f.eventIDs = map[string]bool{}
+	if eventID != "" {
+		if f.eventIDs == nil {
+			f.eventIDs = map[string]bool{}
+		}
+		f.eventIDs[eventID] = true
 	}
-	f.eventIDs[eventID] = true
+	if ts == "" {
+		return
+	}
 	if f.firstTS == "" || ts < f.firstTS {
 		f.firstTS = ts
 	}
@@ -159,162 +175,493 @@ type sessionMeta struct {
 	firstTS      string
 	lastTS       string
 	usedFallback bool
+	// byContent: at least one of the session's lines was matched by content.
+	byContent bool
 }
 
-// attributeCommit computes accurate per-session AI attribution for one commit
-// and writes commit_session_files + commit_sessions rows. Returns the number of
-// commit_sessions rows written.
-func (db *DB) attributeCommit(commitID, sha, repoID, committedAt, root string, carried []string) (int, error) {
-	files, err := db.commitFilesWithAdds(commitID)
+// attribution collects what one commit is credited with, by session and
+// file, whichever way each file was matched.
+type attribution struct {
+	perSessionFile map[string]map[string]*fileAgg
+	meta           map[string]*sessionMeta
+	// byContent are the files matched by content in this pass. excluded are
+	// the lines of those files that an ancestor commit has already counted.
+	byContent map[string]bool
+	excluded  map[string]map[int]bool
+}
+
+func newAttribution() *attribution {
+	return &attribution{
+		perSessionFile: map[string]map[string]*fileAgg{}, meta: map[string]*sessionMeta{},
+		byContent: map[string]bool{}, excluded: map[string]map[int]bool{},
+	}
+}
+
+// exclude notes that a line of file was counted in an ancestor commit.
+func (a *attribution) exclude(file string, number int) {
+	if a.excluded[file] == nil {
+		a.excluded[file] = map[int]bool{}
+	}
+	a.excluded[file][number] = true
+}
+
+func (a *attribution) agg(sessionID, file string) *fileAgg {
+	m := a.perSessionFile[sessionID]
+	if m == nil {
+		m = map[string]*fileAgg{}
+		a.perSessionFile[sessionID] = m
+	}
+	fa := m[file]
+	if fa == nil {
+		fa = &fileAgg{}
+		m[file] = fa
+	}
+	return fa
+}
+
+// session returns the session's entry, creating it and widening its time
+// span to include ts.
+func (a *attribution) session(sessionID, agent string, model sql.NullString, ts string) *sessionMeta {
+	sm := a.meta[sessionID]
+	if sm == nil {
+		sm = &sessionMeta{agent: agent, model: model, firstTS: ts, lastTS: ts}
+		a.meta[sessionID] = sm
+	}
+	if sm.agent == "" {
+		sm.agent = agent
+	}
+	if !sm.model.Valid && model.Valid {
+		sm.model = model
+	}
+	if ts != "" {
+		if sm.firstTS == "" || ts < sm.firstTS {
+			sm.firstTS = ts
+		}
+		if ts > sm.lastTS {
+			sm.lastTS = ts
+		}
+	}
+	return sm
+}
+
+// attributeCommit computes per-session AI attribution for one commit and
+// writes commit_session_files, commit_sessions and commit_ai_lines rows.
+// Returns the number of commit_sessions rows written.
+//
+// Each file the commit adds lines to is matched by content when it can be
+// (contentattribution.go): the file has an authorship map, or a commit this
+// one replaces has its attributed lines on record. Otherwise it is matched
+// by line position, as every file was before schema v17: the file was last
+// edited before the upgrade, or is too large to keep a map for.
+func (db *DB) attributeCommit(c commitRow, carried []string, merge bool) (int, error) {
+	files, err := db.commitFilesWithAdds(c.id)
 	if err != nil {
 		return 0, err
 	}
+	att := newAttribution()
 	if len(files) == 0 {
-		return 0, nil
+		return db.writeAttribution(c.id, att, merge)
 	}
 	if carried == nil {
-		carried = db.CarriedCommits(commitID, sha, repoID, committedAt, root)
+		carried = db.CarriedCommits(c.id, c.sha, c.repoID, c.committedAt, c.root)
 	}
 
-	// sessionID -> file -> agg
-	perSessionFile := map[string]map[string]*fileAgg{}
-	meta := map[string]*sessionMeta{}
-
-	getAgg := func(sessionID, file string) *fileAgg {
-		m := perSessionFile[sessionID]
-		if m == nil {
-			m = map[string]*fileAgg{}
-			perSessionFile[sessionID] = m
-		}
-		fa := m[file]
-		if fa == nil {
-			fa = &fileAgg{}
-			m[file] = fa
-		}
-		return fa
+	// One read of the commit's diff serves every file that can be matched by
+	// content. nil when there is none, when git cannot be asked, or for a
+	// commit from before content matching.
+	var adds map[string]*addedFile
+	if c.root != "" && db.matchesByContent(c.committedAt) {
+		adds = commitAdds(c.root, c.sha, db.contentFiles(c, files, carried))
 	}
-	recordMeta := func(c candRange) {
-		sm := meta[c.sessionID]
-		if sm == nil {
-			sm = &sessionMeta{agent: c.agentSlug, model: c.modelSlug, firstTS: c.ts, lastTS: c.ts}
-			meta[c.sessionID] = sm
-		}
-		if !sm.model.Valid && c.modelSlug.Valid {
-			sm.model = c.modelSlug
-		}
-		if c.ts < sm.firstTS {
-			sm.firstTS = c.ts
-		}
-		if c.ts > sm.lastTS {
-			sm.lastTS = c.ts
-		}
-	}
-
-	sources := db.AttributionSources(repoID, committedAt, carried)
+	content := &contentMatcher{db: db, c: c, carried: carried, ancestors: map[string]bool{}}
+	var sources []EventSource
 	for file, linesAdded := range files {
-		var cands []candRange
-		for _, src := range sources {
-			more, err := db.candidateRanges(commitID, src.RepoID, file, src.Until, carried)
-			if err != nil {
-				return 0, err
-			}
-			cands = append(cands, more...)
-		}
-		if len(sources) > 1 {
-			// Latest edit wins per line, so the edits of several checkouts
-			// have to be in one order of time.
-			sort.SliceStable(cands, func(i, j int) bool { return eventTime(cands[i].ts).Before(eventTime(cands[j].ts)) })
-		}
-		if len(cands) == 0 {
+		af := adds[file]
+		if af != nil && content.attributeFile(file, af, att) {
+			att.byContent[file] = true
 			continue
 		}
-		for _, c := range cands {
-			recordMeta(c)
+		if sources == nil {
+			sources = db.AttributionSources(c.repoID, c.committedAt, carried)
 		}
+		if err := db.attributeFileByPosition(c, file, linesAdded, af, sources, carried, att); err != nil {
+			return 0, err
+		}
+	}
+	return db.writeAttribution(c.id, att, merge)
+}
 
-		added, haveHunks := addedLineSet(root, sha, file)
-		if haveHunks {
-			// Intersect AI ranges with the lines C actually added, de-duping
-			// per line with latest-edit-wins (candidates arrive ts-ascending).
-			owner := map[int]candRange{}
-			for _, c := range cands {
-				for ln := c.start; ln <= c.end; ln++ {
-					if added[ln] {
-						owner[ln] = c
-					}
+// attributeFileByPosition is attribution as it was before the authorship
+// map: an AI line range counts where the line number it covers is one the
+// commit added, latest edit winning per line.
+func (db *DB) attributeFileByPosition(c commitRow, file string, linesAdded int, af *addedFile, sources []EventSource, carried []string, att *attribution) error {
+	var cands []candRange
+	for _, src := range sources {
+		more, err := db.candidateRanges(c.id, src.RepoID, file, src.Until, carried)
+		if err != nil {
+			return err
+		}
+		cands = append(cands, more...)
+	}
+	if len(sources) > 1 {
+		// Latest edit wins per line, so the edits of several checkouts
+		// have to be in one order of time.
+		sort.SliceStable(cands, func(i, j int) bool { return eventTime(cands[i].ts).Before(eventTime(cands[j].ts)) })
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+	for _, cand := range cands {
+		att.session(cand.sessionID, cand.agentSlug, cand.modelSlug, cand.ts)
+	}
+
+	var added map[int]bool
+	haveHunks := false
+	normAt := map[int]uint64{}
+	if af != nil {
+		added, haveHunks = make(map[int]bool, len(af.numbers)), true
+		for k, n := range af.numbers {
+			added[n] = true
+			normAt[n] = af.norms[k]
+		}
+	} else {
+		added, haveHunks = addedLineSet(c.root, c.sha, file)
+	}
+	if haveHunks {
+		// Intersect AI ranges with the lines C actually added, de-duping
+		// per line with latest-edit-wins (candidates arrive ts-ascending).
+		owner := map[int]candRange{}
+		for _, cand := range cands {
+			for ln := cand.start; ln <= cand.end; ln++ {
+				if added[ln] {
+					owner[ln] = cand
 				}
 			}
-			for _, c := range owner {
-				fa := getAgg(c.sessionID, file)
-				fa.lines++
-				fa.touch(c.eventID, c.ts)
+		}
+		lines := make([]int, 0, len(owner))
+		for ln := range owner {
+			lines = append(lines, ln)
+		}
+		sort.Ints(lines)
+		for _, ln := range lines {
+			cand := owner[ln]
+			fa := att.agg(cand.sessionID, file)
+			fa.lines++
+			fa.touch(cand.eventID, cand.ts)
+			if norm, known := normAt[ln]; known {
+				fa.numbers = append(fa.numbers, ln)
+				fa.norms = append(fa.norms, norm)
 			}
-		} else {
-			// Fallback: no git access for hunks. Cap the per-file churn sum at
-			// the recorded additions, split proportionally across sessions.
-			raw := map[string]int{}
-			rawTotal := 0
-			for _, c := range cands {
-				raw[c.sessionID] += c.newLines
-				rawTotal += c.newLines
-			}
-			for _, c := range cands {
-				fa := getAgg(c.sessionID, file)
-				fa.touch(c.eventID, c.ts)
-			}
-			for sessionID, r := range raw {
-				n := r
-				if rawTotal > linesAdded && rawTotal > 0 {
-					n = r * linesAdded / rawTotal
-				}
-				perSessionFile[sessionID][file].lines = n
-				meta[sessionID].usedFallback = true
+		}
+		return nil
+	}
+	// Fallback: no git access for hunks. Cap the per-file churn sum at
+	// the recorded additions, split proportionally across sessions.
+	raw := map[string]int{}
+	rawTotal := 0
+	for _, cand := range cands {
+		raw[cand.sessionID] += cand.newLines
+		rawTotal += cand.newLines
+	}
+	for _, cand := range cands {
+		att.agg(cand.sessionID, file).touch(cand.eventID, cand.ts)
+	}
+	for sessionID, r := range raw {
+		n := r
+		if rawTotal > linesAdded && rawTotal > 0 {
+			n = r * linesAdded / rawTotal
+		}
+		att.perSessionFile[sessionID][file].lines = n
+		att.meta[sessionID].usedFallback = true
+	}
+	return nil
+}
+
+// contentConfidence is commit_sessions.confidence for a session whose lines
+// in the commit were matched by content.
+const contentConfidence = "line_content_match"
+
+// previousSession is a session a commit was credited to before it is
+// attributed again.
+type previousSession struct {
+	id, agent        string
+	model            sql.NullString
+	firstTS, lastTS  string
+	source, confided string
+}
+
+// previousFile is one session's row for one file of a commit, as it stood.
+type previousFile struct {
+	firstTS, lastTS string
+	events, lines   int
+}
+
+// queryer is what reading inside or outside a transaction have in common.
+type queryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// writeAttribution stores what a commit is credited with, replacing what was
+// there in one transaction. Two processes attribute commits: the git shadow,
+// the moment a commit is made, and the worker, when it learns something new
+// about a recent one. Whichever writes last must not leave half of each.
+//
+// With merge, what the commit was credited before is carried over where this
+// pass has nothing to say against it. A commit's content does not change,
+// and neither does who wrote its lines; but the authorship map this pass
+// read is the file as it is now, which may no longer hold lines the commit
+// was rightly credited with when it was made (the agent has rewritten them
+// since, the map has expired). So in a file matched by content, a line on
+// record for the commit stays credited unless this pass credited that line
+// itself or found it counted in an ancestor. It also means a pass that read
+// the map a moment too early cannot undo one that read it later.
+//
+// Every session that was looked at gets a commit_sessions row, not just
+// those that netted lines, and so does every session the commit was credited
+// to before. The cloud landing zone is append-only with no tombstones:
+// without a fresh row at zero, the earlier row would stay the latest one
+// upstream.
+func (db *DB) writeAttribution(commitID string, att *attribution, merge bool) (int, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var previous []previousSession
+	if merge {
+		// A write first, so the transaction holds the write lock before it
+		// reads what it is about to replace.
+		if _, err := tx.Exec(`UPDATE commits SET id = id WHERE id = ?`, commitID); err != nil {
+			return 0, err
+		}
+		if previous, err = previousSessions(tx, commitID); err != nil {
+			return 0, err
+		}
+		if err := carryRecordedLines(tx, commitID, att, previous); err != nil {
+			return 0, err
+		}
+		for _, table := range []string{"commit_sessions", "commit_session_files", "commit_ai_lines"} {
+			if _, err := tx.Exec(`DELETE FROM `+table+` WHERE commit_id = ?`, commitID); err != nil {
+				return 0, err
 			}
 		}
 	}
 
-	// Drive the write off every session that had in-window candidates — not just
-	// those that netted lines. Sessions that now attribute to zero still get a
-	// 0-line commit_sessions row: the cloud landing zone is append-only with no
-	// tombstones, so without a fresh row the previous (inflated) blob would stay
-	// "latest" in the dbt dedup. A 0-line row re-syncs and overwrites it.
+	recorded := map[string][]CommitLines{}
 	written := 0
-	for sessionID, sm := range meta {
-		fileMap := perSessionFile[sessionID]
+	for sessionID, sm := range att.meta {
+		fileMap := att.perSessionFile[sessionID]
 		var totalLines, eventCount, filesTouched int
 		firstTS, lastTS := sm.firstTS, sm.lastTS
 		for file, fa := range fileMap {
 			if fa.lines <= 0 {
 				continue
 			}
-			if _, err := db.Exec(`
+			events := len(fa.eventIDs) + fa.inherited
+			if _, err := tx.Exec(`
 				INSERT INTO commit_session_files (
 					commit_id, session_id, file_path, first_event_ts, last_event_ts,
 					event_count, lines_attributed
 				) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				commitID, sessionID, file, fa.firstTS, fa.lastTS, len(fa.eventIDs), fa.lines); err != nil {
+				commitID, sessionID, file, fa.firstTS, fa.lastTS, events, fa.lines); err != nil {
 				return written, err
 			}
+			if len(fa.numbers) == fa.lines {
+				sortLines(fa)
+				recorded[file] = append(recorded[file], CommitLines{SessionID: sessionID, Numbers: fa.numbers, Norms: fa.norms})
+			}
 			totalLines += fa.lines
-			eventCount += len(fa.eventIDs)
+			eventCount += events
 			filesTouched++
 		}
-		confidence := "line_range_committed_intersect"
-		if sm.usedFallback {
+		source, confidence := "committed_diff", "line_range_committed_intersect"
+		switch {
+		case sm.usedFallback:
 			confidence = "fallback_capped"
+		case sm.byContent:
+			source, confidence = "committed_content", contentConfidence
 		}
-		if _, err := db.Exec(`
+		if _, err := tx.Exec(`
 			INSERT INTO commit_sessions (
 				commit_id, session_id, agent_slug, model_slug, first_event_ts, last_event_ts,
 				event_count, files_touched, lines_attributed, attribution_source, confidence
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			commitID, sessionID, sm.agent, sm.model, firstTS, lastTS,
-			eventCount, filesTouched, totalLines, "committed_diff", confidence); err != nil {
+			eventCount, filesTouched, totalLines, source, confidence); err != nil {
 			return written, err
 		}
 		written++
 	}
+	for _, p := range previous {
+		if att.meta[p.id] != nil {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO commit_sessions (
+				commit_id, session_id, agent_slug, model_slug, first_event_ts, last_event_ts,
+				event_count, files_touched, lines_attributed, attribution_source, confidence
+			) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)`,
+			commitID, p.id, p.agent, p.model, p.firstTS, p.lastTS, p.source, p.confided); err != nil {
+			return written, err
+		}
+		written++
+	}
+	for file, rows := range recorded {
+		for _, r := range rows {
+			if _, err := tx.Exec(`
+				INSERT INTO commit_ai_lines (commit_id, file_path, session_id, lines, line_norms)
+				VALUES (?, ?, ?, ?, ?)`,
+				commitID, file, r.SessionID, FormatLineNumbers(r.Numbers), encodeHashes(r.Norms)); err != nil {
+				return written, err
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return written, nil
+}
+
+func previousSessions(q queryer, commitID string) ([]previousSession, error) {
+	rows, err := q.Query(`
+		SELECT session_id, agent_slug, model_slug, first_event_ts, last_event_ts, attribution_source, confidence
+		FROM commit_sessions WHERE commit_id = ?`, commitID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []previousSession
+	for rows.Next() {
+		var p previousSession
+		if err := rows.Scan(&p.id, &p.agent, &p.model, &p.firstTS, &p.lastTS, &p.source, &p.confided); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// carryRecordedLines adds to att the lines the commit has on record that
+// this pass neither credited nor found counted in an ancestor. Lines the
+// commit gave up to a commit that replaced it (GiveUpAttribution, its file
+// row at zero) are not carried.
+func carryRecordedLines(q queryer, commitID string, att *attribution, previous []previousSession) error {
+	sessions := map[string]previousSession{}
+	for _, p := range previous {
+		sessions[p.id] = p
+	}
+	files := map[[2]string]previousFile{}
+	rows, err := q.Query(`
+		SELECT session_id, file_path, first_event_ts, last_event_ts, event_count, lines_attributed
+		FROM commit_session_files WHERE commit_id = ?`, commitID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var session, file string
+		var f previousFile
+		if err := rows.Scan(&session, &file, &f.firstTS, &f.lastTS, &f.events, &f.lines); err != nil {
+			rows.Close()
+			return err
+		}
+		files[[2]string{session, file}] = f
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// The lines this pass credited, per file, whoever to.
+	credited := map[string]map[int]bool{}
+	for _, fileMap := range att.perSessionFile {
+		for file, fa := range fileMap {
+			if credited[file] == nil {
+				credited[file] = map[int]bool{}
+			}
+			for _, n := range fa.numbers {
+				credited[file][n] = true
+			}
+		}
+	}
+
+	type record struct {
+		file, session string
+		numbers       []int
+		norms         []uint64
+	}
+	var records []record
+	rows, err = q.Query(`SELECT file_path, session_id, lines, line_norms FROM commit_ai_lines WHERE commit_id = ?`, commitID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var r record
+		var lines string
+		var norms []byte
+		if err := rows.Scan(&r.file, &r.session, &lines, &norms); err != nil {
+			rows.Close()
+			return err
+		}
+		r.numbers, r.norms = ParseLineNumbers(lines), decodeHashes(norms)
+		if len(r.numbers) == len(r.norms) {
+			records = append(records, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// In a file this pass could only match by position, a record that came
+	// from a match by content stands as it is, in place of what the
+	// positions say: the pass ran without the file's map (the git shadow, a
+	// moment ahead of the worker, or the map has expired), and positions are
+	// the weaker evidence. A record that itself came from positions is
+	// recomputed, as it always was.
+	carried := func(r record) (previousFile, bool) {
+		was, known := files[[2]string{r.session, r.file}]
+		if !known || was.lines <= 0 {
+			return was, false
+		}
+		return was, att.byContent[r.file] || sessions[r.session].confided == contentConfidence
+	}
+	for _, r := range records {
+		if _, ok := carried(r); ok && !att.byContent[r.file] {
+			for _, fileMap := range att.perSessionFile {
+				delete(fileMap, r.file)
+			}
+			delete(credited, r.file)
+		}
+	}
+	for _, r := range records {
+		was, ok := carried(r)
+		if !ok {
+			continue
+		}
+		var fa *fileAgg
+		for i, n := range r.numbers {
+			if credited[r.file][n] || att.excluded[r.file][n] {
+				continue
+			}
+			if fa == nil {
+				p := sessions[r.session]
+				sm := att.session(r.session, p.agent, p.model, was.firstTS)
+				att.session(r.session, p.agent, p.model, was.lastTS)
+				sm.byContent = true
+				fa = att.agg(r.session, r.file)
+				if fa.lines == 0 {
+					fa.inherited += max(was.events, 1)
+				}
+				fa.touch("", was.firstTS)
+				fa.touch("", was.lastTS)
+			}
+			fa.lines++
+			fa.numbers = append(fa.numbers, n)
+			fa.norms = append(fa.norms, r.norms[i])
+		}
+	}
+	return nil
 }
 
 // commitFilesWithAdds returns file_path -> lines_added for files the commit
@@ -400,6 +747,9 @@ func (db *DB) candidateRanges(commitID, repoID, file, committedAt string, carrie
 }
 
 var hunkHeaderRE = regexp.MustCompile(`@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+// hunkHeaderCountsRE also captures the old side's line count.
+var hunkHeaderCountsRE = regexp.MustCompile(`^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
 
 // addedLineSet returns the set of line numbers (in the commit's coordinates)
 // that the commit added to the file, parsed from `git show --unified=0`. The
@@ -822,6 +1172,21 @@ func (db *DB) GiveUpAttribution(retiredID, replacementID string) (bool, error) {
 	}
 	files, err := res.RowsAffected()
 	if err != nil {
+		return false, err
+	}
+	// The lines it has on record there go with them: they are the
+	// replacement's now, and attributing this commit again must not bring
+	// them back (writeAttribution).
+	if _, err := tx.Exec(`
+		DELETE FROM commit_ai_lines
+		WHERE commit_id = ?
+		  AND EXISTS (
+			SELECT 1 FROM commit_session_files f
+			WHERE f.commit_id = commit_ai_lines.commit_id
+			  AND f.session_id = commit_ai_lines.session_id
+			  AND f.file_path = commit_ai_lines.file_path
+			  AND f.lines_attributed = 0
+		  )`, retiredID); err != nil {
 		return false, err
 	}
 	res, err = tx.Exec(`

@@ -16,7 +16,8 @@ import (
 //   - file_snapshots: each file as the last agent edit left it, as one
 //     fingerprint per line. A tool that overwrites a whole file reports only
 //     the new content; diffing it against the snapshot is what turns "the
-//     file is 300 lines" into "this write changed 4".
+//     file is 300 lines" into "this write changed 4". The same row is the
+//     file's authorship map (filemap.go): who wrote each of those lines.
 //   - session_file_lines: for each session and file, the lines that session
 //     has written and not since removed. When a later edit of the same
 //     session removes one of them, that line is rework, not new output.
@@ -62,14 +63,11 @@ func (db *DB) FileSnapshot(path string) (hashes []uint64, asOf time.Time, ok boo
 	return decodeHashes(blob), asOf, true
 }
 
-// SaveFileSnapshot records hashes as the state of path at asOf. An empty
-// list is a valid snapshot of an empty file.
+// SaveFileSnapshot records hashes as the state of path at asOf, with no
+// authorship: the row reads as one written before the authorship map
+// (filemap.go). An empty list is a valid snapshot of an empty file.
 func (db *DB) SaveFileSnapshot(path string, hashes []uint64, asOf time.Time) error {
-	_, err := db.Exec(`
-		INSERT INTO file_snapshots (file_path, line_hashes, updated_at) VALUES (?, ?, ?)
-		ON CONFLICT(file_path) DO UPDATE SET line_hashes = excluded.line_hashes, updated_at = excluded.updated_at`,
-		path, encodeHashes(hashes), asOf.UTC().Format(time.RFC3339Nano))
-	return err
+	return db.SaveFileMap(path, FileMap{Hashes: hashes, AsOf: asOf})
 }
 
 // DropFileSnapshot forgets the snapshot of path. Used when the file has
