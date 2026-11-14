@@ -287,7 +287,7 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 
 	// Line ranges and capture state. Fail-soft: never block ingest on these.
 	if capture != nil {
-		if err := capture.store(db, id, sessionID); err != nil {
+		if err := capture.store(db, store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
 	}

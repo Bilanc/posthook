@@ -46,14 +46,27 @@ const LocalOrgID = "local"
 // migrated again. The old rows are discarded, not converted: they are
 // working state, and the next whole-file write of such a file is diffed
 // against HEAD (or counted whole) once.
-const schemaVersion = 16
+//
+// v17 is content-based attribution (see editstate.go and
+// contentattribution.go). file_snapshots gains an author per line, a second
+// fingerprint per line that ignores whitespace, and the git blob id of the
+// content, which turns the snapshot into the authorship map commits are
+// matched against. commit_ai_lines records, per commit, file and session,
+// which committed lines were attributed. Both stay on the machine. Nothing
+// already recorded is recomputed: a commit made before this version was
+// applied is always attributed by line position, as it was.
+const schemaVersion = 17
+
+// contentAttributionVersion is the schema version from which commits are
+// matched by content. ContentAttributionSince reads when it was applied.
+const contentAttributionVersion = 17
 
 // SyncableTables lists every table the cloud sync flush replicates upstream,
 // in FK-safe insert order. Keep this in lockstep with the synced_at columns
 // declared in schemaSQL and the v7 migration in applyMigrations.
 //
-// file_snapshots and session_file_lines are deliberately absent: they are
-// fingerprints of file content and stay on the machine.
+// file_snapshots, session_file_lines and commit_ai_lines are deliberately
+// absent: they are fingerprints of file content and stay on the machine.
 var SyncableTables = []string{
 	"repositories",
 	"sessions",
@@ -68,12 +81,21 @@ var SyncableTables = []string{
 
 // fileSnapshotsDDL is shared with the v16 migration, which recreates the
 // table. updated_at is the instant the snapshot's content was true; a NULL
-// or empty line_hashes is an empty file.
+// or empty line_hashes is an empty file. The v17 columns (fileSnapshotV17Columns)
+// are NULL on a row written before them.
 const fileSnapshotsDDL = `CREATE TABLE IF NOT EXISTS file_snapshots (
   file_path TEXT PRIMARY KEY,
   line_hashes BLOB,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  line_norms BLOB,
+  line_owners BLOB,
+  owners TEXT,
+  blob_sha TEXT
 );`
+
+// fileSnapshotV17Columns are the columns v17 adds to file_snapshots, for a
+// table created by an earlier version.
+var fileSnapshotV17Columns = []string{"line_norms BLOB", "line_owners BLOB", "owners TEXT", "blob_sha TEXT"}
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -234,8 +256,9 @@ CREATE TABLE IF NOT EXISTS session_prompts (
 CREATE INDEX IF NOT EXISTS idx_session_prompts_session ON session_prompts(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_prompts_synced ON session_prompts(synced_at);
 
--- Local working state for exact edit capture (editstate.go). Never synced.
--- Both hold 8-byte line fingerprints, no file content.
+-- Local working state for exact edit capture and for the authorship map
+-- (editstate.go). Never synced. Both hold 8-byte line fingerprints, no file
+-- content.
 ` + fileSnapshotsDDL + `
 CREATE TABLE IF NOT EXISTS session_file_lines (
   session_id TEXT NOT NULL,
@@ -243,6 +266,18 @@ CREATE TABLE IF NOT EXISTS session_file_lines (
   line_hashes BLOB NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (session_id, file_path)
+);
+
+-- Which committed lines were attributed, per commit, file and session, in
+-- the commit's own line numbers, with the whitespace-insensitive fingerprint
+-- of each (commitlines.go). Never synced.
+CREATE TABLE IF NOT EXISTS commit_ai_lines (
+  commit_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  lines TEXT NOT NULL,
+  line_norms BLOB NOT NULL,
+  PRIMARY KEY (commit_id, file_path, session_id)
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
