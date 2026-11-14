@@ -114,6 +114,24 @@ func runWorker(managed bool) error {
 			lastWork = time.Now()
 			logx.Debugf("worker: drained %d event(s)", n)
 		}
+		// Looks at the working tree that shell tool calls and prompts call
+		// for (see ingest/looks.go). With the queue empty, every look that
+		// has settled: an edit that had already fired has then claimed its
+		// own lines. With events still arriving, only looks that have waited
+		// too long, so a steady stream of events cannot hold them off for
+		// good.
+		due := time.Now()
+		if queued, _ := spool.Pending(); queued > 0 {
+			due = due.Add(-ingest.LookBacklog)
+		}
+		looks, err := ingest.RunLooks(due)
+		if err != nil {
+			logx.Warnf("worker: look error: %v", err)
+		}
+		if looks > 0 {
+			lastWork = time.Now()
+			logx.Debugf("worker: looked at %d working tree(s)", looks)
+		}
 		// Commits the git shadow saw being pushed that were never recorded
 		// (see ingest/catchup.go). After the events, so a commit is
 		// attributed with every edit that led up to it already in the store.
@@ -132,7 +150,7 @@ func runWorker(managed bool) error {
 			// hook fire.
 			p, _ := spool.Pending()
 			j, _ := spool.PendingCommitJobs()
-			if p+j > 0 {
+			if p+j+ingest.PendingLooks() > 0 {
 				lastWork = time.Now()
 				continue
 			}

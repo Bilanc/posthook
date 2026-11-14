@@ -38,6 +38,14 @@ var editTools = map[string]bool{
 	"Edit": true, "Write": true, "MultiEdit": true,
 }
 
+// promptsFromTranscript are the agents that send a prompt-submit hook and
+// whose typed prompts are read from their transcript when a turn ends. The
+// hook from one of them marks the start of a turn and nothing more: its
+// prompt text is dropped at ingest. Storing it as well would number the
+// session's prompts twice, once by arrival and once by position in the
+// transcript.
+var promptsFromTranscript = map[string]bool{"claude-code": true}
+
 // Devin's tool names are lowercase but carry the same tool_input shape as
 // Claude Code's, so they map straight onto the canonical line-range tools.
 var devinEditTools = map[string]string{
@@ -265,6 +273,20 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		capture.score(db, sessionID)
 	}
 
+	// A prompt-submit event from an agent whose prompts are read from its
+	// transcript is kept as a marker only: when a turn began. The prompt it
+	// carries is not stored here, so registering the hook creates no second
+	// place where prompt text lives (the transcript copy lands in
+	// session_prompts at Stop, as it always has).
+	if eventType == "UserPromptSubmit" && promptsFromTranscript[agentSlug] {
+		if _, has := payload["prompt"]; has {
+			delete(payload, "prompt")
+			if without, err := json.Marshal(payload); err == nil {
+				raw = without
+			}
+		}
+	}
+
 	// Store the trimmed payload: tool output (file contents, command output,
 	// images) is dropped and oversized strings are capped. Everything the
 	// prompt and transcript extraction below needs is read from the full
@@ -287,16 +309,41 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	logx.Debugf("ingested %s event %s (session=%s, payload %d bytes, dropped %d)", agentSlug, eventType, sessionID, len(stored), droppedBytes)
 
 	// Line ranges and capture state. Fail-soft: never block ingest on these.
+	author := store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}
+	lookRoots := []string{repoRoot}
+	if cwd != "" {
+		lookRoots = append(lookRoots, gitx.FindRepoRoot(cwd))
+	}
 	if capture != nil {
-		if err := capture.store(db, store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}); err != nil {
+		if err := capture.store(db, author, firedAt); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
+		// A commit made after this edit and before the worker got to it was
+		// attributed without it.
+		edited := map[string]map[string]bool{}
+		for i := range capture.files {
+			fc := &capture.files[i]
+			if !fc.countable || !fc.rel.Valid {
+				continue
+			}
+			lookRoots = append(lookRoots, fc.root)
+			if edited[fc.root] == nil {
+				edited[fc.root] = map[string]bool{}
+			}
+			edited[fc.root][fc.rel.String] = true
+		}
+		for root, rels := range edited {
+			reattributeRecentCommits(db, root, rels, firedAt)
+		}
 	}
+	// Edits no payload describes are found by looking at the repository
+	// once the worker has caught up (looks.go).
+	queueLooks(db, eventType, agentSlug, payload, author, lookRoots, firedAt)
 
 	// Cursor's beforeSubmitPrompt and Devin's UserPromptSubmit hooks carry the
 	// typed prompt directly — neither exposes a readable transcript on Stop, so
 	// this is the only moment the prompt is available.
-	if (eventType == "beforeSubmitPrompt" || eventType == "UserPromptSubmit") && sessionID != "" {
+	if (eventType == "beforeSubmitPrompt" || eventType == "UserPromptSubmit") && sessionID != "" && !promptsFromTranscript[agentSlug] {
 		if promptText := pickString(payload, "prompt"); promptText != "" {
 			if err := db.AppendHookPrompt(sessionID, agentSlug, ts, promptText); err != nil {
 				logx.Warnf("prompt capture failed: %v", err)

@@ -543,8 +543,9 @@ func (c *editCapture) score(db *store.DB, sessionID string) {
 }
 
 // store writes the ranges and the working state for an event already
-// inserted, named by author. Fail-soft: the caller logs and carries on.
-func (c *editCapture) store(db *store.DB, author store.LineAuthor) error {
+// inserted, named by author, whose hook fired at firedAt. Fail-soft: the
+// caller logs and carries on.
+func (c *editCapture) store(db *store.DB, author store.LineAuthor, firedAt time.Time) error {
 	eventID, sessionID := author.EventID, author.SessionID
 	for i := range c.files {
 		fc := &c.files[i]
@@ -567,7 +568,7 @@ func (c *editCapture) store(db *store.DB, author store.LineAuthor) error {
 				// later write is not diffed against a stale one.
 				err = db.DropFileSnapshot(fc.path)
 			} else {
-				err = fc.updateAuthorship(db, author)
+				err = fc.updateAuthorship(db, author, firedAt)
 			}
 			if err != nil {
 				return err
