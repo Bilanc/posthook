@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -586,24 +587,153 @@ func attributeCarrying(db *store.DB, repoRoot, repoID, sha, commitID string, car
 	}
 }
 
+// noteEntry is one run of AI-written lines in a git note.
+type noteEntry struct {
+	Lines   string `json:"lines"`
+	Agent   string `json:"agent"`
+	Session string `json:"session,omitempty"`
+	Model   string `json:"model,omitempty"`
+	TS      string `json:"ts"`
+}
+
+// noteV2 marks a note whose every line range is exact: the lines the commit
+// is credited with, in the commit's own line numbers. A v1 note lists the
+// ranges agent edits were recorded at before the commit, which are where the
+// lines were when they were written. Both have the same shape, and a reader
+// matches both the same way, by a line's number in the commit that
+// introduced it; a v2 note is simply right where a v1 note can be off.
+const (
+	noteV1 = 1
+	noteV2 = 2
+)
+
+// writeNoteForCommit writes the commit's git note from what it has just been
+// attributed.
+//
+// A file whose attributed lines are on record (commit_ai_lines) is written
+// from that record, one entry per run of consecutive lines. A file that was
+// matched by position with no record is written, as before, from the line
+// ranges of the edits in the commit's window.
 func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, carried []string, hadNote bool) error {
 	var committedAt string
 	if err := db.QueryRow(`SELECT committed_at FROM commits WHERE id = ?`, commitID).Scan(&committedAt); err != nil {
 		return err
 	}
-	type entry struct {
-		Lines   string `json:"lines"`
-		Agent   string `json:"agent"`
-		Session string `json:"session,omitempty"`
-		Model   string `json:"model,omitempty"`
-		TS      string `json:"ts"`
-	}
-	files := map[string][]entry{}
+	files := map[string][]noteEntry{}
 	count := 0
-	// The same edits as attribution reads (store.AttributionSources), in the
-	// same window: a commit this one carries does not close it
-	// (store.CarriedCommits), and neither does one that gave the session's
-	// lines in the file up (store.ClosesWindow).
+	version := noteV2
+	for _, r := range db.CommitLineRecords(commitID) {
+		for _, run := range store.LineRuns(r.Numbers) {
+			lines := strconv.Itoa(run[0])
+			if run[1] != run[0] {
+				lines += "-" + strconv.Itoa(run[1])
+			}
+			files[r.File] = append(files[r.File], noteEntry{Lines: lines, Agent: r.Agent, Session: r.SessionID, Model: r.Model, TS: r.TS})
+			count++
+		}
+	}
+	for file, entries := range files {
+		sort.SliceStable(entries, func(i, j int) bool { return firstLine(entries[i].Lines) < firstLine(entries[j].Lines) })
+		files[file] = entries
+	}
+	byPosition, err := positionMatchedFiles(db, commitID, files)
+	if err != nil {
+		return err
+	}
+	if len(byPosition) > 0 {
+		ranged, n, err := rangeNoteEntries(db, repoID, commitID, committedAt, carried, byPosition)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			version = noteV1
+			count += n
+			for file, entries := range ranged {
+				files[file] = entries
+			}
+		}
+	}
+	if count == 0 {
+		if hadNote {
+			// The note was written when this commit was attributed without an
+			// earlier commit that has since been recorded. The ranges are
+			// that commit's now, and a note left here would still claim them.
+			if err := gitx.Exec(repoRoot, "notes", "--ref="+paths.NotesRef, "remove", "--ignore-missing", sha); err != nil {
+				return err
+			}
+			if len(sha) >= 7 {
+				logx.Debugf("note: no AI ranges left for %s, removed its note", sha[:7])
+			}
+			return nil
+		}
+		if len(sha) >= 7 {
+			logx.Debugf("note: no AI ranges for %s, skipping", sha[:7])
+		}
+		return nil
+	}
+
+	note := struct {
+		V      int                    `json:"v"`
+		Commit string                 `json:"commit"`
+		Files  map[string][]noteEntry `json:"files"`
+	}{V: version, Commit: sha, Files: files}
+	encoded, err := json.Marshal(note)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("git", "notes", "--ref="+paths.NotesRef, "add", "-f", "-F", "-", sha)
+	cmd.Dir = repoRoot
+	cmd.Env = gitx.BypassEnv()
+	cmd.Stdin = strings.NewReader(string(encoded))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git notes: %v: %s", err, string(out))
+	}
+	if len(sha) >= 7 {
+		logx.Debugf("note: wrote %d range(s) for %s", count, sha[:7])
+	}
+	return nil
+}
+
+// firstLine is the first line of a note entry's "a-b" or "a".
+func firstLine(lines string) int {
+	first, _, _ := strings.Cut(lines, "-")
+	n, _ := strconv.Atoi(first)
+	return n
+}
+
+// positionMatchedFiles returns the files a commit is credited lines in that
+// are not among recorded: those matched by position with no lines on record.
+func positionMatchedFiles(db *store.DB, commitID string, recorded map[string][]noteEntry) (map[string]bool, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT file_path FROM commit_session_files
+		WHERE commit_id = ? AND lines_attributed > 0`, commitID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var file string
+		if err := rows.Scan(&file); err != nil {
+			return nil, err
+		}
+		if _, ok := recorded[file]; !ok {
+			out[file] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// rangeNoteEntries returns the note entries of the named files from the line
+// ranges of the edits in the commit's window, as every note was written
+// before commit_ai_lines: the same edits attribution by position reads
+// (store.AttributionSources), in the same window. A commit this one carries
+// does not close it (store.CarriedCommits), and neither does one that gave
+// the session's lines in the file up (store.ClosesWindow).
+func rangeNoteEntries(db *store.DB, repoID, commitID, committedAt string, carried []string, only map[string]bool) (map[string][]noteEntry, int, error) {
+	files := map[string][]noteEntry{}
+	count := 0
 	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
 	for _, src := range db.AttributionSources(repoID, committedAt, carried) {
 		args := append([]any{commitID, src.RepoID, src.Until, src.Until}, carriedArgs...)
@@ -632,7 +762,7 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 			ORDER BY elr.rel_file_path, elr.start_line`,
 			args...)
 		if err != nil {
-			return err
+			return nil, 0, err
 		}
 		for rows.Next() {
 			var rel, agent, ts string
@@ -640,13 +770,16 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 			var start, end int
 			if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
 				rows.Close()
-				return err
+				return nil, 0, err
+			}
+			if !only[rel] {
+				continue
 			}
 			lineRange := fmt.Sprintf("%d", start)
 			if start != end {
 				lineRange = fmt.Sprintf("%d-%d", start, end)
 			}
-			files[rel] = append(files[rel], entry{
+			files[rel] = append(files[rel], noteEntry{
 				Lines:   lineRange,
 				Agent:   agent,
 				Session: session.String,
@@ -658,49 +791,10 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return err
+			return nil, 0, err
 		}
 	}
-	if count == 0 {
-		if hadNote {
-			// The note was written when this commit was attributed without an
-			// earlier commit that has since been recorded. The ranges are
-			// that commit's now, and a note left here would still claim them.
-			if err := gitx.Exec(repoRoot, "notes", "--ref="+paths.NotesRef, "remove", "--ignore-missing", sha); err != nil {
-				return err
-			}
-			if len(sha) >= 7 {
-				logx.Debugf("note: no AI ranges left for %s, removed its note", sha[:7])
-			}
-			return nil
-		}
-		if len(sha) >= 7 {
-			logx.Debugf("note: no AI ranges for %s, skipping", sha[:7])
-		}
-		return nil
-	}
-
-	note := struct {
-		V      int                `json:"v"`
-		Commit string             `json:"commit"`
-		Files  map[string][]entry `json:"files"`
-	}{V: 1, Commit: sha, Files: files}
-	encoded, err := json.Marshal(note)
-	if err != nil {
-		return err
-	}
-
-	cmd := exec.Command("git", "notes", "--ref="+paths.NotesRef, "add", "-f", "-F", "-", sha)
-	cmd.Dir = repoRoot
-	cmd.Env = gitx.BypassEnv()
-	cmd.Stdin = strings.NewReader(string(encoded))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git notes: %v: %s", err, string(out))
-	}
-	if len(sha) >= 7 {
-		logx.Debugf("note: wrote %d range(s) for %s", count, sha[:7])
-	}
-	return nil
+	return files, count, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

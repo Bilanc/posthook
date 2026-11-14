@@ -322,22 +322,49 @@ func lookupRanges(repoRoot, relPath string, lines []blameLine) (map[int]matchedR
 		queryRows.Close()
 	}
 
-	// Note-fallback for commits without local ranges (e.g. teammate ran
-	// blame after cloning).
-	local := map[string]bool{}
-	for _, r := range rows {
-		if r.commitSHA.Valid {
-			local[r.commitSHA.String] = true
-		}
-	}
 	uniqueCommits := map[string]bool{}
 	for _, l := range lines {
 		if l.sha != zeroSha {
 			uniqueCommits[l.sha] = true
 		}
 	}
+
+	// A commit whose credited lines are on record is settled by that record:
+	// those lines are the agent's, in the commit's own line numbers, and no
+	// other line of the commit is. The ranges of the edits before it, which
+	// say where the lines were when they were written, are not consulted.
+	settled := map[string]bool{}
+	var exact []rangeRow
 	for sha := range uniqueCommits {
-		if local[sha] {
+		recorded, known := recordedRanges(db, repoID.String, sha, relPath)
+		if !known {
+			continue
+		}
+		settled[sha] = true
+		exact = append(exact, recorded...)
+	}
+	if len(settled) > 0 {
+		kept := rows[:0]
+		for _, r := range rows {
+			if !r.commitSHA.Valid || !settled[r.commitSHA.String] {
+				kept = append(kept, r)
+			}
+		}
+		rows = append(kept, exact...)
+	}
+
+	// Note-fallback for commits without local ranges (e.g. teammate ran
+	// blame after cloning). A note's ranges are matched like any other, by
+	// the line's number in the commit that introduced it: exact for a v2
+	// note, the edit-time position for a v1 note.
+	local := map[string]bool{}
+	for _, r := range rows {
+		if r.commitSHA.Valid {
+			local[r.commitSHA.String] = true
+		}
+	}
+	for sha := range uniqueCommits {
+		if local[sha] || settled[sha] {
 			continue
 		}
 		note := readNoteForCommit(repoRoot, sha)
@@ -418,7 +445,116 @@ func lookupRanges(repoRoot, relPath string, lines []blameLine) (map[int]matchedR
 			}
 		}
 	}
+	applyFileMap(db, repoRoot, relPath, lines, matches)
 	return matches, nil
+}
+
+// recordedRanges returns the lines of file a locally recorded commit is
+// credited with, as ranges in the commit's line numbers. known is false when
+// the record cannot settle the file: the commit is not recorded here, or its
+// lines in the file were matched by position with nothing on record.
+//
+// repoID is the row of the checkout being blamed, empty when it has none. A
+// commit is looked for under that row and under the other checkouts of the
+// same repository (a rewrite is recorded with the checkout of its original),
+// which is also what lets the lookup use the (repo_id, sha) index.
+func recordedRanges(db *store.DB, repoID, sha, file string) (out []rangeRow, known bool) {
+	if repoID == "" {
+		return nil, false
+	}
+	var commitID, committedAt string
+	if err := db.QueryRow(`
+		SELECT id, committed_at FROM commits
+		WHERE sha = ? AND repo_id IN `+store.CheckoutsOf+`
+		ORDER BY (repo_id = ?) DESC LIMIT 1`, sha, repoID, repoID, repoID).Scan(&commitID, &committedAt); err != nil {
+		return nil, false
+	}
+	for _, r := range db.CommitLineRecords(commitID) {
+		if r.File != file {
+			continue
+		}
+		for _, run := range store.LineRuns(r.Numbers) {
+			row := rangeRow{
+				eventID:   fmt.Sprintf("record:%s:%s:%d-%d", sha, r.SessionID, run[0], run[1]),
+				sessionID: sql.NullString{String: r.SessionID, Valid: r.SessionID != ""},
+				agentSlug: r.Agent,
+				eventTS:   r.TS,
+				startLine: run[0],
+				endLine:   run[1],
+				commitSHA: sql.NullString{String: sha, Valid: true},
+			}
+			if r.Model != "" {
+				row.modelSlug = sql.NullString{String: r.Model, Valid: true}
+			}
+			if row.agentSlug == "" {
+				row.agentSlug = "unknown"
+			}
+			out = append(out, row)
+		}
+	}
+	if len(out) > 0 {
+		return out, true
+	}
+	var credited int
+	_ = db.QueryRow(`SELECT COALESCE(SUM(lines_attributed), 0) FROM commit_session_files WHERE commit_id = ? AND file_path = ?`, commitID, file).Scan(&credited)
+	if credited > 0 {
+		return nil, false
+	}
+	// Credited nothing in this file. For a commit matched by content that is
+	// the answer; an older commit never said which lines it was credited.
+	return nil, db.MatchesByContent(committedAt)
+}
+
+// applyFileMap brings in what the file's authorship map knows, which is more
+// than any record of a commit: the edit that wrote each line, and the lines
+// that are in no commit yet.
+//
+// The map is lined up with the file as it is being shown. An uncommitted
+// line is the agent's exactly when the map says an edit wrote it. A
+// committed line takes its edit from the map when the map counted that line
+// in the same commit git blames it on, so the prompt shown above it is the
+// one that produced it and not just one from the same session.
+func applyFileMap(db *store.DB, repoRoot, relPath string, lines []blameLine, matches map[int]matchedRange) {
+	m, ok := db.FileMap(filepath.Join(repoRoot, filepath.FromSlash(relPath)))
+	if !ok || !m.HasAuthors() || len(lines) == 0 {
+		return
+	}
+	texts := make([]string, len(lines))
+	for i, l := range lines {
+		texts[i] = l.content
+	}
+	lined, _ := m.Carry(texts)
+	models := map[string]sql.NullString{}
+	for i, l := range lines {
+		author, written := lined.AuthorOf(i)
+		switch {
+		case l.sha == zeroSha:
+			delete(matches, l.finalLine)
+			if !written {
+				continue
+			}
+		case !written || lined.CommitOf(i) != l.sha:
+			continue
+		}
+		model, seen := models[author.SessionID]
+		if !seen {
+			_ = db.QueryRow(`SELECT model_slug FROM sessions WHERE id = ?`, author.SessionID).Scan(&model)
+			models[author.SessionID] = model
+		}
+		agent := author.Agent
+		if agent == "" {
+			agent = "unknown"
+		}
+		matches[l.finalLine] = matchedRange{
+			eventID:   author.EventID,
+			sessionID: sql.NullString{String: author.SessionID, Valid: author.SessionID != ""},
+			agentSlug: agent,
+			modelSlug: model,
+			eventTS:   author.TS,
+			startLine: l.finalLine,
+			endLine:   l.finalLine,
+		}
+	}
 }
 
 // palette holds the ANSI sequences used by blame; every field is empty when
