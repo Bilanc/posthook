@@ -864,6 +864,13 @@ func TestCommandMovesContent(t *testing.T) {
 		"git mv a.go b.go",
 		"(git pull)",
 		"echo start; git --no-pager checkout -- file.txt",
+		// git named by its path, or past an alias.
+		"/usr/bin/git stash pop",
+		"/usr/bin/git apply fix.patch",
+		"cd repo && /opt/homebrew/bin/git -C . checkout main",
+		"./tools/git reset --hard",
+		`\git stash apply`,
+		`"/usr/local/bin/git" pull`,
 	}
 	for _, c := range moves {
 		if !commandMovesContent(c) {
@@ -882,6 +889,9 @@ func TestCommandMovesContent(t *testing.T) {
 		"git commit --amend --no-edit",
 		"echo 'git pull' > notes.txt",
 		"legit pull",
+		"/usr/bin/legit pull",
+		"ls /usr/bin/git",
+		"/usr/bin/git status",
 		"git fetch origin",
 		"gh pr checkout 12",
 	}
@@ -903,10 +913,13 @@ func TestCommandCommits(t *testing.T) {
 		"python3 gen.py && git add -A && git commit -q -m generated": true,
 		"git -C ../repo commit -am wip":                              true,
 		"git -c user.name=x commit --allow-empty -m e":               true,
-		"git status":            false,
-		"git log --grep commit": false,
-		"python3 gen.py":        false,
-		"gitcommit -m x":        false,
+		"/usr/bin/git commit -m x":                                   true,
+		"python3 gen.py && /opt/homebrew/bin/git -C . commit -am x":  true,
+		"ls /usr/bin/git && echo commit":                             false,
+		"git status":                                                 false,
+		"git log --grep commit":                                      false,
+		"python3 gen.py":                                             false,
+		"gitcommit -m x":                                             false,
 	} {
 		if got := commandCommits(command); got != want {
 			t.Errorf("commandCommits(%q) = %v, want %v", command, got, want)
@@ -1030,6 +1043,11 @@ func TestLooksAgainstWeakEvidence(t *testing.T) {
 	t.Run("looks wait for events that are still queued", func(t *testing.T) { testLooksWaitForTheQueue(t, home) })
 	t.Run("a commit that a rewrite replaced is not credited again", func(t *testing.T) { testReplacedCommitStaysRetired(t, home) })
 	t.Run("a note written after its commit was pushed is sent", func(t *testing.T) { testNoteSentAfterLatePush(t, home) })
+	t.Run("lines a look gives back are no longer in the shell call's line ranges", func(t *testing.T) { testGivenBackLinesLeaveTheRanges(t, home) })
+	t.Run("line ranges already uploaded are corrected in place when lines are given back", func(t *testing.T) { testGivenBackLinesAfterUpload(t, home) })
+	t.Run("a committed file too large to keep a map for is not read from git", func(t *testing.T) { testLargeBaseFileIsNotRead(t, home) })
+	t.Run("after a look that could not read everything, a queued edit still holds a script's lines in a file with a map", func(t *testing.T) { testPartialLookThenScriptAndEdit(t, home) })
+	t.Run("after a look that could not read everything, nothing is held in a file with no map", func(t *testing.T) { testPartialLookHoldsNothingWithoutAMap(t, home) })
 }
 
 func testCopyAndMove(t *testing.T, home string) {
@@ -1080,16 +1098,13 @@ func testBaseUnknown(t *testing.T, home string) {
 	writeFile(t, path, content+"extra = new\n")
 
 	// git answers everything but the question "what was this file".
-	saved := lookGit
-	lookGit = func(root, stdin string, args ...string) ([]byte, error) {
-		if len(args) > 0 && args[0] == "cat-file" {
-			return nil, os.ErrDeadlineExceeded
-		}
-		return saved(root, stdin, args...)
+	saved := lookBlobs
+	lookBlobs = func(root string, names []string, limit int64) ([]blobAnswer, error) {
+		return nil, os.ErrDeadlineExceeded
 	}
 	shellRan(t, session, repo, "make restore")
 	settleLooks(t)
-	lookGit = saved
+	lookBlobs = saved
 
 	// With the file's version in git, the three restored lines are known
 	// not to be new. Without it they cannot be told from the one that is,
@@ -1333,5 +1348,319 @@ func testNoteSentAfterLatePush(t *testing.T, home string) {
 	}
 	if !hasNote(remote, sha) {
 		t.Error("the note was written after the push and never sent")
+	}
+}
+
+// lineRangesOf lists the line ranges on record for a session's events, each
+// as "first-last", in file order. A range emptied in place (see
+// store.RetractEventLines) is not a range.
+func lineRangesOf(t *testing.T, session string) []string {
+	t.Helper()
+	rows, err := openDB(t).Query(`
+		SELECT elr.start_line, elr.end_line FROM event_line_ranges elr
+		JOIN events e ON e.id = elr.event_id
+		WHERE e.session_id = ? AND elr.end_line >= elr.start_line
+		ORDER BY elr.start_line`, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var first, last int
+		if err := rows.Scan(&first, &last); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%d-%d", first, last))
+	}
+	return out
+}
+
+// committedBy is the lines of a commit attributed to a session.
+func committedBy(t *testing.T, sha, session string) int {
+	t.Helper()
+	var n int
+	if err := openDB(t).QueryRow(`
+		SELECT COALESCE(SUM(cs.lines_attributed), 0) FROM commit_sessions cs
+		JOIN commits c ON c.id = cs.commit_id WHERE c.sha = ? AND cs.session_id = ?`, sha, session).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// lookRanAhead plays a script that changes one line and an edit, by another
+// session, that inserts three, with the script's look run before the edit's
+// event arrives. It returns the repository, the file and the edit's payload,
+// still to be delivered at the returned time.
+func lookRanAhead(t *testing.T, home, name string) (repo, path string, edit map[string]any, at time.Time) {
+	t.Helper()
+	repo, _, path, content := lookRepo(t, home, name)
+	promptSubmitted(t, name+"-script", repo)
+	fired := time.Now().Add(-3 * time.Second)
+	afterScript := scripted(content, "k2")
+	afterEdit, edit := insertPayload(name+"-edit", path, afterScript, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, afterEdit)
+	deliverAt(t, "claude-code", repo, shellPayload(name+"-script", repo, scriptCommand), fired)
+	settleLooks(t)
+	wantGenerated(t, name+"-script", 4)
+	if got, want := lineRangesOf(t, name+"-script"), []string{"2-2", "6-8"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("test setup: the look recorded ranges %v for the script, want %v", got, want)
+	}
+	return repo, path, edit, fired.Add(time.Second)
+}
+
+func testGivenBackLinesLeaveTheRanges(t *testing.T, home string) {
+	const script, editor = "weak-ranges-script", "weak-ranges-edit"
+	repo, path, edit, at := lookRanAhead(t, home, "weak-ranges")
+	deliverAt(t, "claude-code", repo, edit, at)
+	wantGenerated(t, script, 1)
+	wantGenerated(t, editor, 3)
+
+	// The script's ranges name its own line and nothing else: the three
+	// lines it gave back are the edit's alone.
+	if got, want := lineRangesOf(t, script), []string{"2-2"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("the script's line ranges are %v, want %v", got, want)
+	}
+	var lines int
+	if err := openDB(t).QueryRow(`
+		SELECT COALESCE(SUM(elr.new_text_lines), 0) FROM event_line_ranges elr
+		JOIN events e ON e.id = elr.event_id WHERE e.session_id = ?`, script).Scan(&lines); err != nil {
+		t.Fatal(err)
+	}
+	if lines != 1 {
+		t.Errorf("the script's range rows count %d line(s), want 1", lines)
+	}
+	for _, r := range openDB(t).UncommittedRanges(gitx.Canonicalize(repo), "cfg.ini") {
+		if r.End < r.Start {
+			t.Errorf("a range that names no line is read as one: %+v", r)
+		}
+	}
+
+	// A commit matched by position (the file's map is gone) credits each
+	// line once, to the event that wrote it, and its note names the same
+	// lines.
+	if _, err := openDB(t).Exec(`DELETE FROM file_snapshots WHERE file_path = ?`, gitx.Canonicalize(path)); err != nil {
+		t.Fatal(err)
+	}
+	sha := commitAll(t, repo, "both")
+	if err := GitCommit(repo, sha); err != nil {
+		t.Fatal(err)
+	}
+	if got := committedBy(t, sha, script); got != 1 {
+		t.Errorf("the script is credited %d committed line(s), want 1", got)
+	}
+	if got := committedBy(t, sha, editor); got != 3 {
+		t.Errorf("the edit is credited %d committed line(s), want 3", got)
+	}
+	if got, want := rangesIn(noteOf(t, repo, sha), "cfg.ini"), "2,6-8"; got != want {
+		t.Errorf("the note names lines %s of cfg.ini, want %s", got, want)
+	}
+}
+
+func testGivenBackLinesAfterUpload(t *testing.T, home string) {
+	const script = "weak-uploaded-script"
+	repo, _, edit, at := lookRanAhead(t, home, "weak-uploaded")
+	// The sync loop uploaded the script's ranges before the edit's event
+	// was handled.
+	db := openDB(t)
+	if _, err := db.Exec(`
+		UPDATE event_line_ranges SET synced_at = '2026-11-14T10:00:00Z'
+		WHERE event_id IN (SELECT id FROM events WHERE session_id = ?)`, script); err != nil {
+		t.Fatal(err)
+	}
+	deliverAt(t, "claude-code", repo, edit, at)
+	wantGenerated(t, script, 1)
+	if got, want := lineRangesOf(t, script), []string{"2-2"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("the script's line ranges are %v, want %v", got, want)
+	}
+	// The row that named the three lines is not deleted: its uploaded copy
+	// would keep counting them. It stays, names no line, and is due for
+	// upload again. The row that did not change is not sent again.
+	rows, err := db.Query(`
+		SELECT elr.start_line, elr.end_line, elr.new_text_lines, elr.synced_at IS NULL
+		FROM event_line_ranges elr JOIN events e ON e.id = elr.event_id
+		WHERE e.session_id = ? ORDER BY elr.start_line`, script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type row struct {
+		first, last, lines int
+		pending            bool
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.first, &r.last, &r.lines, &r.pending); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	want := []row{{2, 2, 1, false}, {6, 5, 0, true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("range rows %+v, want %+v", got, want)
+	}
+}
+
+func testLargeBaseFileIsNotRead(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-large-base")
+	const session = "weak-large-base"
+	// A generated file, larger than posthook keeps a map for, is in git,
+	// with a small file on either side of it by name.
+	big := filepath.Join(repo, "generated.txt")
+	rows := numbered(60000, "row %07d of data")
+	if len(rows) <= store.MaxSnapshotBytes {
+		t.Fatalf("test setup: the generated file is only %d bytes", len(rows))
+	}
+	writeFile(t, big, rows)
+	last := filepath.Join(repo, "zz.ini")
+	writeFile(t, last, content)
+	commitAll(t, repo, "add generated data")
+	promptSubmitted(t, session, repo)
+
+	// A command replaces the generated file with three lines, and changes a
+	// line of each small file.
+	writeFile(t, big, "a = 1\nb = 2\nc = 3\n")
+	writeFile(t, path, scripted(content, "k2"))
+	writeFile(t, last, scripted(content, "k7"))
+	saved := lookBlobs
+	calls, read, tooLarge := 0, 0, 0
+	lookBlobs = func(root string, names []string, limit int64) ([]blobAnswer, error) {
+		answers, err := saved(root, names, limit)
+		calls++
+		for _, a := range answers {
+			read += len(a.content)
+			if a.tooLarge {
+				tooLarge++
+			}
+		}
+		return answers, err
+	}
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	lookBlobs = saved
+
+	if tooLarge != 1 || read > 2*len(content) {
+		t.Errorf("the look read %d bytes of committed versions and found %d too large, want the two small files only and 1", read, tooLarge)
+	}
+	if calls != 2 {
+		t.Errorf("git was asked %d times, want 2: once up to the large file, once for the files after it", calls)
+	}
+	// The small files are credited as always, the one after the large file
+	// too. What the large one was is not known, so nothing in it is credited.
+	wantGenerated(t, session, 2)
+}
+
+// The reader stops at a file that is too large without reading it, and says
+// which answers it has.
+func TestRunLookBlobsStopsAtALargeFile(t *testing.T) {
+	_ = store.Close()
+	home := isolateIngest(t)
+	t.Cleanup(func() { _ = store.Close() })
+	repo, _, _, content := lookRepo(t, home, "blobs")
+	writeFile(t, filepath.Join(repo, "big.txt"), numbered(2000, "row %05d"))
+	writeFile(t, filepath.Join(repo, "dir", "inner.txt"), "inner\n")
+	commitAll(t, repo, "more files")
+
+	names := []string{"HEAD:cfg.ini", "HEAD:nothing.txt", "HEAD:dir", "HEAD:big.txt", "HEAD:dir/inner.txt"}
+	answers, err := runLookBlobs(repo, names, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answers) != 4 {
+		t.Fatalf("%d answers, want 4: the reader stops at the large file", len(answers))
+	}
+	if a := answers[0]; !a.isBlob || a.tooLarge || string(a.content) != content {
+		t.Errorf("cfg.ini: %+v", a)
+	}
+	if a := answers[1]; a.isBlob || a.tooLarge || a.content != nil {
+		t.Errorf("a name with nothing under it: %+v", a)
+	}
+	if a := answers[2]; a.isBlob || a.tooLarge {
+		t.Errorf("a directory: %+v", a)
+	}
+	if a := answers[3]; !a.isBlob || !a.tooLarge || a.content != nil {
+		t.Errorf("the large file: %+v", a)
+	}
+	// With room for it, every name is answered.
+	answers, err = runLookBlobs(repo, names, 1<<20)
+	if err != nil || len(answers) != 5 || string(answers[4].content) != "inner\n" || len(answers[3].content) == 0 {
+		t.Errorf("with a larger limit: %d answers, err %v", len(answers), err)
+	}
+}
+
+// manyChangedFiles leaves a repository with more changed files than one look
+// reads, all sorting before cfg.ini.
+func manyChangedFiles(t *testing.T, repo string) {
+	t.Helper()
+	for i := 0; i < maxLookFiles+5; i++ {
+		writeFile(t, filepath.Join(repo, "a", fmt.Sprintf("f%03d.txt", i)), "by hand\n")
+	}
+	gitOut(t, repo, "add", "-A")
+}
+
+func wantPartialLook(t *testing.T, repo string) {
+	t.Helper()
+	if look, ok := openDB(t).RepoLook(gitx.Canonicalize(repo)); !ok || !look.Partial {
+		t.Fatalf("test setup: the look read everything (%+v)", look)
+	}
+}
+
+func testPartialLookThenScriptAndEdit(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-partial-held")
+	const script, editor = "weak-partial-held-script", "weak-partial-held-edit"
+	// cfg.ini has a map: an edit put a line into it a minute ago.
+	withEdit, first := insertPayload(editor, path, content, 8, "e0 = new")
+	writeFile(t, path, withEdit)
+	deliverAt(t, "claude-code", repo, first, time.Now().Add(-time.Minute))
+	// The engineer has more files changed than one look reads.
+	manyChangedFiles(t, repo)
+	promptSubmitted(t, script, repo)
+	wantPartialLook(t, repo)
+
+	// A script changes one line of cfg.ini; right after, an edit inserts
+	// three. The edit is handled first and holds the script's line for the
+	// script's look. The file's map is older than the script, so the line
+	// is known to be new, whatever the last look did not get to.
+	fired := time.Now().Add(-3 * time.Second)
+	afterScript := scripted(withEdit, "k2")
+	afterEdit, edit := insertPayload(editor, path, afterScript, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, afterEdit)
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, scriptCommand), fired)
+	deliverAt(t, "claude-code", repo, edit, fired.Add(time.Second))
+	settleLooks(t)
+	wantGenerated(t, script, 1)
+	wantGenerated(t, editor, 4)
+}
+
+func testPartialLookHoldsNothingWithoutAMap(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-partial-nomap")
+	const script, editor = "weak-partial-nomap-script", "weak-partial-nomap-edit"
+	// More files are changed than one look reads, and cfg.ini, with a line
+	// changed by hand, is among the ones the look does not get to.
+	manyChangedFiles(t, repo)
+	byHand := strings.Replace(content, "k1 = old", "k1 = by hand", 1)
+	writeFile(t, path, byHand)
+	promptSubmitted(t, script, repo)
+	wantPartialLook(t, repo)
+
+	// A script changes another line; right after, an edit inserts three and
+	// is handled first. The file had no map: nothing says the hand-written
+	// line was there before the script ran, so the edit holds nothing for
+	// the script's look, and neither line is credited.
+	fired := time.Now().Add(-3 * time.Second)
+	afterScript := scripted(byHand, "k9")
+	afterEdit, edit := insertPayload(editor, path, afterScript, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, afterEdit)
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, scriptCommand), fired)
+	deliverAt(t, "claude-code", repo, edit, fired.Add(time.Second))
+	settleLooks(t)
+	wantGenerated(t, script, 0)
+	wantGenerated(t, editor, 3)
+	m, _ := openDB(t).FileMap(gitx.Canonicalize(path))
+	for i := range m.Hashes {
+		if a, ok := m.AuthorOf(i); ok && a.SessionID != editor {
+			t.Errorf("line %d has author %+v: only the edit's lines have one", i+1, a)
+		}
 	}
 }

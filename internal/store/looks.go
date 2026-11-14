@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Working state for looks at a working tree (ingest/looks.go).
@@ -237,4 +239,107 @@ func (db *DB) SaveRepoLook(root string, l RepoLook) error {
 		  slow_until = excluded.slow_until, partial = excluded.partial, blind = excluded.blind`,
 		root, nullableOf(l.Head), l.LookedAt.UTC().Format(time.RFC3339Nano), slow, l.Partial, l.Blind)
 	return err
+}
+
+// NamesLines is the condition, on event_line_ranges aliased elr, that a row
+// names at least one line. SetEventLineRanges can leave a row that names
+// none; whoever reads ranges as lines leaves those out. (A query that only
+// asks whether an event has ranges still finds such a row: a shell call that
+// gave every line back stays listed as an edit, of no lines.)
+const NamesLines = `elr.end_line >= elr.start_line`
+
+// SetEventLineRanges makes the line ranges on record for an event in one
+// file the given runs of lines (first and last line of each, ascending). It
+// is for a shell call whose ranges a look recorded and which has since given
+// lines back to the edit that wrote them (ingest.takeBackFromLook). An event
+// with no ranges in the file is left without any.
+//
+// The rows are synced, and the cloud keeps the last copy it was sent of each
+// row, so a row is corrected in place and never deleted: deleting one here
+// would leave its uploaded copy counting the lines for good, and nothing on
+// a row says it was never uploaded (synced_at is NULL again after any change
+// to it).
+//
+//   - A row that already names one of the runs is left alone, and is not
+//     uploaded again.
+//   - The other rows take the remaining runs and are marked for upload. A
+//     run with no row left gets a new one.
+//   - A row left over stays as a range that names no line (end_line below
+//     start_line, no new lines), marked for upload. See NamesLines.
+func (db *DB) SetEventLineRanges(eventID, path string, runs [][2]int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.Query(`
+		SELECT id, rel_file_path, blob_sha_after, start_line, end_line
+		FROM event_line_ranges WHERE event_id = ? AND file_path = ? ORDER BY start_line, id`, eventID, path)
+	if err != nil {
+		return err
+	}
+	type rangeRow struct {
+		id          string
+		rel, blob   sql.NullString
+		first, last int
+		keptAsItIs  bool
+	}
+	var have []rangeRow
+	for rows.Next() {
+		var r rangeRow
+		if err := rows.Scan(&r.id, &r.rel, &r.blob, &r.first, &r.last); err != nil {
+			rows.Close()
+			return err
+		}
+		have = append(have, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(have) == 0 {
+		return nil
+	}
+
+	var rest [][2]int
+	for _, run := range runs {
+		kept := false
+		for i := range have {
+			if !have[i].keptAsItIs && have[i].first == run[0] && have[i].last == run[1] {
+				have[i].keptAsItIs, kept = true, true
+				break
+			}
+		}
+		if !kept {
+			rest = append(rest, run)
+		}
+	}
+	for _, r := range have {
+		switch {
+		case r.keptAsItIs:
+		case len(rest) > 0:
+			run := rest[0]
+			rest = rest[1:]
+			if _, err := tx.Exec(`
+				UPDATE event_line_ranges SET start_line = ?, end_line = ?, new_text_lines = ?, synced_at = NULL
+				WHERE id = ?`, run[0], run[1], run[1]-run[0]+1, r.id); err != nil {
+				return err
+			}
+		case r.last >= r.first:
+			if _, err := tx.Exec(`
+				UPDATE event_line_ranges SET end_line = start_line - 1, new_text_lines = 0, synced_at = NULL
+				WHERE id = ?`, r.id); err != nil {
+				return err
+			}
+		}
+	}
+	for _, run := range rest {
+		if _, err := tx.Exec(`
+			INSERT INTO event_line_ranges (id, event_id, file_path, rel_file_path, blob_sha_after, start_line, end_line, new_text_lines)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			uuid.NewString(), eventID, path, have[0].rel, have[0].blob, run[0], run[1], run[1]-run[0]+1); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

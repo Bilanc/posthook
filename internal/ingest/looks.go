@@ -60,7 +60,8 @@ import (
 //     after a look that could not read every changed file (more than
 //     maxLookFiles), a file with no map is recorded and not credited.
 //   - Whenever git cannot say what the base version of a file is, the file
-//     is recorded and not credited.
+//     is recorded and not credited. A base version too large to keep a map
+//     for (store.MaxSnapshotBytes) is not read, and counts as unknown.
 //
 // A look runs in the background worker, after the fact, like every event.
 // It is held back until the worker has caught up with the events that had
@@ -73,6 +74,12 @@ import (
 // and cannot make the engineer's or the agent's own git command fail, and
 // with a timeout: on a repository where git does not answer in time the
 // event credits nothing, and the repository is left alone for a while.
+//
+// What a look costs: one `git status` when nothing changed, which is most
+// looks. When files changed it also reads them, asks git for their base
+// versions (blobsAt: one `git cat-file`), lists the base tree when one of
+// them is a new file (blobsInTree), and attributes again the recent commits
+// that hold lines it has just given an author.
 
 const (
 	// lookSettle is how long after its hook fired a look waits before it
@@ -202,13 +209,18 @@ func shellCommand(payload map[string]any) string {
 	return ""
 }
 
+// gitInvocation matches how a shell command calls git, up to the subcommand:
+// `git` as a word of its own, by its path (/usr/bin/git) or past an alias
+// (\git), quoted or not, then the options that may stand before the
+// subcommand (-C dir, -c k=v, --no-pager).
+const gitInvocation = `(^|[\s;&|(){}'"` + "`" + `])([^\s;&|(){}'"` + "`" + `]*[/\\])?git(\.exe)?['"]?` +
+	`(\s+(-[cC]\s+\S+|--?[A-Za-z][\w-]*(=\S+)?))*\s+`
+
 // movesContentRE matches a git invocation whose subcommand brings existing
 // content into the working tree or moves it there: text nobody wrote during
-// this call. Options between `git` and the subcommand (-C dir, -c k=v,
-// --no-pager) are skipped.
-var movesContentRE = regexp.MustCompile(
-	`(^|[\s;&|(){}'"` + "`" + `])git(\s+(-[cC]\s+\S+|--?[A-Za-z][\w-]*(=\S+)?))*\s+` +
-		`(stash\s+(pop|apply)|apply|am|mv|checkout|switch|restore|reset|pull|merge|rebase|cherry-pick|revert)\b`)
+// this call.
+var movesContentRE = regexp.MustCompile(gitInvocation +
+	`(stash\s+(pop|apply)|apply|am|mv|checkout|switch|restore|reset|pull|merge|rebase|cherry-pick|revert)\b`)
 
 // commandMovesContent reports whether a shell command runs a git command
 // that brings existing content into the working tree. A look after such a
@@ -221,8 +233,7 @@ func commandMovesContent(command string) bool {
 }
 
 // commitsRE matches a `git commit` invocation.
-var commitsRE = regexp.MustCompile(
-	`(^|[\s;&|(){}'"` + "`" + `])git(\s+(-[cC]\s+\S+|--?[A-Za-z][\w-]*(=\S+)?))*\s+commit\b`)
+var commitsRE = regexp.MustCompile(gitInvocation + `commit\b`)
 
 // commandCommits reports whether a shell command runs `git commit`.
 func commandCommits(command string) bool {
@@ -395,8 +406,11 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 			// A file with no map was unchanged at the last look, unless that
 			// look could not read everything that had changed. A map made
 			// since this look's command ran (by an edit handled just before)
-			// says nothing about the time before it.
-			if fileCredit && prev.Partial && !(lf.found && !lf.prev.AsOf.After(look.FiredAt)) {
+			// says nothing about the time before it, unless it holds lines
+			// for this look: the edit held them against the map the file had
+			// before (updateAuthorship holds nothing in a file that had none
+			// after such a look).
+			if fileCredit && prev.Partial && !(lf.found && (!lf.prev.AsOf.After(look.FiredAt) || holdsFor(lf.prev, look.EventID))) {
 				fileCredit = false
 			}
 			if fileCredit && !inGit && !lf.found && (copied == nil || copied[lf.blob]) {
@@ -1034,10 +1048,15 @@ func changedBetween(root, from, to string) []string {
 }
 
 // blobsAt returns the content of the named files at a commit, for those
-// that exist there, from one `git cat-file --batch`. answered says for which
-// files git gave an answer at all, content or "not there": a file it is
-// missing for (git failed, or did not answer in time) has an unknown base,
-// and must not be taken for a file that is not in git.
+// that exist there. answered says for which files git gave an answer at all,
+// content or "not there": a file it is missing for has an unknown base, and
+// must not be taken for a file that is not in git. That is so when git
+// failed or did not answer in time, and for a version larger than
+// store.MaxSnapshotBytes, which is never read: a command that shrinks a huge
+// generated file must not make the worker hold the old one in memory.
+//
+// One `git cat-file --batch` in all but that last case: git is stopped at a
+// version that is too large, and asked again for the files after it.
 func blobsAt(root, rev string, rels []string) (found map[string]string, answered map[string]bool) {
 	found, answered = map[string]string{}, map[string]bool{}
 	if len(rels) == 0 {
@@ -1050,47 +1069,116 @@ func blobsAt(root, rev string, rels []string) (found map[string]string, answered
 		}
 		return found, answered
 	}
-	var asked []string
-	var stdin strings.Builder
+	var asked, names []string
 	for _, rel := range rels {
 		if strings.ContainsAny(rel, "\n\x00") {
 			continue
 		}
 		asked = append(asked, rel)
-		stdin.WriteString(rev + ":" + rel + "\n")
+		names = append(names, rev+":"+rel)
 	}
-	out, err := lookGit(root, stdin.String(), "cat-file", "--batch")
+	for calls := 0; len(asked) > 0 && calls <= maxLargeBases; calls++ {
+		answers, err := lookBlobs(root, names, store.MaxSnapshotBytes)
+		if err != nil {
+			break
+		}
+		for i, a := range answers {
+			switch {
+			case a.tooLarge:
+				// Not read: an unknown base.
+			case a.isBlob:
+				answered[asked[i]] = true
+				found[asked[i]] = string(a.content)
+			default:
+				// Not there, or a directory or a submodule: no file of lines.
+				answered[asked[i]] = true
+			}
+		}
+		if len(answers) == 0 || !answers[len(answers)-1].tooLarge {
+			// Every name is answered, or git stopped answering.
+			break
+		}
+		asked, names = asked[len(answers):], names[len(answers):]
+	}
+	return found, answered
+}
+
+// maxLargeBases bounds how often one look asks git again after a version
+// that was too large to read. The files after that stay unanswered.
+const maxLargeBases = 4
+
+// blobAnswer is what git says of one object asked for by name.
+type blobAnswer struct {
+	// isBlob: the name is a file; content is its text unless tooLarge.
+	// Neither set: there is nothing under the name, or no file.
+	isBlob   bool
+	tooLarge bool
+	content  []byte
+}
+
+// lookBlobs asks git for objects by name. A variable so a test can make git
+// fail to answer, or watch what it is asked.
+var lookBlobs = runLookBlobs
+
+// runLookBlobs runs one `git cat-file --batch` for the named objects and
+// returns git's answers, in order. Its output is read as it comes: at the
+// first file larger than limit it stops, with that answer (tooLarge, no
+// content) as the last, and git is stopped without its content having been
+// read. Fewer answers than names otherwise means git stopped answering.
+func runLookBlobs(root string, names []string, limit int64) ([]blobAnswer, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), lookTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "--no-optional-locks", "cat-file", "--batch")
+	cmd.Dir = root
+	cmd.Env = gitx.BypassEnv()
+	cmd.WaitDelay = 500 * time.Millisecond
+	cmd.Stdin = strings.NewReader(strings.Join(names, "\n") + "\n")
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return found, answered
+		return nil, err
 	}
-	reader := bufio.NewReader(bytes.NewReader(out))
-	for _, rel := range asked {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	reader := bufio.NewReader(stdout)
+	var answers []blobAnswer
+	for range names {
+		// "<id> <type> <size>", then the content and a newline; or
+		// "<name> missing".
 		header, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
-		fields := strings.Fields(strings.TrimSpace(header))
+		fields := strings.Fields(header)
 		if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
-			answered[rel] = true
+			answers = append(answers, blobAnswer{})
 			continue
 		}
 		if len(fields) != 3 {
 			break
 		}
-		size, err := strconv.Atoi(fields[2])
+		size, err := strconv.ParseInt(fields[2], 10, 64)
 		if err != nil {
 			break
 		}
-		content := make([]byte, size+1) // the content, then a newline
+		if fields[1] == "blob" && size > limit {
+			answers = append(answers, blobAnswer{isBlob: true, tooLarge: true})
+			break
+		}
+		content := make([]byte, size+1)
 		if _, err := readFull(reader, content); err != nil {
 			break
 		}
-		answered[rel] = true
-		if fields[1] == "blob" {
-			found[rel] = string(content[:size])
-		}
+		answers = append(answers, blobAnswer{isBlob: fields[1] == "blob", content: content[:size]})
 	}
-	return found, answered
+	timedOut := ctx.Err() != nil
+	// Stops git if it is still writing a file that will not be read.
+	cancel()
+	_ = cmd.Wait()
+	if timedOut && len(answers) < len(names) {
+		return answers, context.DeadlineExceeded
+	}
+	return answers, nil
 }
 
 // blobsInTree reports which of the given blob ids are the content of some

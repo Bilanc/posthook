@@ -795,6 +795,7 @@ func rangeNoteEntries(db *store.DB, repoID, commitID, committedAt string, carrie
 			WHERE cf.commit_id = ?
 			  AND e.repo_id = ?
 			  AND elr.rel_file_path IS NOT NULL
+			  AND `+store.NamesLines+`
 			  AND datetime(?) >= datetime(e.ts)
 			  AND NOT EXISTS (
 				SELECT 1

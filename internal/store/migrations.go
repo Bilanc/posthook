@@ -177,6 +177,13 @@ func (db *DB) applyMigrations() error {
 			}
 		}
 	}
+
+	// v17 and v18 also add whole tables (commit_ai_lines; pending_looks and
+	// repo_looks) and an index (idx_commits_sha). Those need no guard here:
+	// migrate applies schemaSQL before it calls this, and its CREATE ... IF
+	// NOT EXISTS statements make them on a database that lacks them. They
+	// are working state the dashboard never reads, so they have no row type
+	// in dash/src/types/posthook.ts either.
 	return nil
 }
 

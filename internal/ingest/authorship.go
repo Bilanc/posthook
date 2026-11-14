@@ -91,7 +91,7 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor, f
 			return err
 		}
 		for eventID, hashes := range taken {
-			takeBackFromLook(db, holders[eventID], fc.path, hashes)
+			takeBackFromLook(db, holders[eventID], fc.path, hashes, prev)
 		}
 		return nil
 	}
@@ -115,8 +115,14 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor, f
 	// in between and its look at the working tree is still due (looks.go),
 	// they may be what that command wrote: they are held for the look, which
 	// confirms or drops them. Otherwise they have no author.
+	//
+	// A file with no map yet is taken to have been unchanged at the last
+	// look, so all of it that is not in git is new. After a look that could
+	// not read every changed file that does not follow (see runLook), and
+	// nothing is held in such a file: its lines may have been there, unseen.
 	if fc.root != "" {
-		if look, due := db.PendingShellLook(fc.root, firedAt, author.EventID); due && firedAt.Sub(look.FiredAt) <= maxLookAge {
+		if look, due := db.PendingShellLook(fc.root, firedAt, author.EventID); due && firedAt.Sub(look.FiredAt) <= maxLookAge &&
+			(found || !lastLookWasPartial(db, fc.root)) {
 			held := false
 			holder := look.Author(true)
 			for j := range lines {
@@ -141,9 +147,12 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor, f
 // behind, or the look ran between the tool's write and its hook), the look
 // credits the edit's lines to its shell call. When the edit is then handled
 // it claims its lines in the map, and here the shell call gives the count
-// back: lines_generated, its share in the per-file split, and the session's
-// ledger. Only for a shell call: no other event is credited by a look.
-func takeBackFromLook(db *store.DB, holder store.LineAuthor, path string, hashes []uint64) {
+// back: lines_generated, its share in the per-file split, the session's
+// ledger, and the line ranges the look recorded for it. Those are rewritten
+// from current, the file's map now that the edit has its lines: a commit
+// attributed by position reads the ranges, and so do blame and the cloud.
+// Only for a shell call: no other event is credited by a look.
+func takeBackFromLook(db *store.DB, holder store.LineAuthor, path string, hashes []uint64, current store.FileMap) {
 	var tool, split sql.NullString
 	var generated sql.NullInt64
 	if err := db.QueryRow(`SELECT json_extract(payload, '$.tool_name'), lines_generated, file_lines FROM events WHERE id = ?`,
@@ -183,7 +192,23 @@ func takeBackFromLook(db *store.DB, holder store.LineAuthor, path string, hashes
 		}
 		_ = db.SaveSessionFileLines(holder.SessionID, path, kept)
 	}
+	var still []int
+	for i := range current.Hashes {
+		if a, ok := current.AuthorOf(i); ok && a.EventID == holder.EventID {
+			still = append(still, i+1)
+		}
+	}
+	if err := db.SetEventLineRanges(holder.EventID, path, store.LineRuns(still)); err != nil {
+		logx.Warnf("rewriting the line ranges of shell event %s failed: %v", holder.EventID, err)
+	}
 	logx.Debugf("shell event %s gave back %d line(s) of %s that a later edit wrote", holder.EventID, n, path)
+}
+
+// lastLookWasPartial reports whether the last look at a repository could not
+// read every changed file.
+func lastLookWasPartial(db *store.DB, root string) bool {
+	last, looked := db.RepoLook(root)
+	return looked && last.Partial
 }
 
 // seedMapAuthors gives a snapshot from before the authorship map the authors
