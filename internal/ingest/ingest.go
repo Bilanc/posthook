@@ -247,7 +247,8 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	// worker gets to the event later, so this is the only clock that says
 	// which of the file's states the event could have seen (capture.go).
 	firedAt, err := time.Parse(time.RFC3339Nano, env.ReceivedAt)
-	if err != nil {
+	firedKnown := err == nil
+	if !firedKnown {
 		firedAt = time.Now()
 	}
 	var capture *editCapture
@@ -288,7 +289,13 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 
 	// Line ranges and capture state. Fail-soft: never block ingest on these.
 	if capture != nil {
-		if err := capture.store(db, store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}); err != nil {
+		author := store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}
+		if firedKnown && len(shellWrites) == 0 {
+			// An edit tool's hook fires as it writes. A shell command's
+			// fires when the command ends, so when it wrote is not known.
+			author.From = firedAt.UTC().Format(time.RFC3339Nano)
+		}
+		if err := capture.store(db, author); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
 	}

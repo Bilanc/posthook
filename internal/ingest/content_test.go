@@ -39,6 +39,9 @@ func TestContentAttribution(t *testing.T) {
 	t.Run("upgrade: the next edit carries the earlier edits into the map", func(t *testing.T) { testEditsInFlightAcrossTheUpgrade(t, home) })
 	t.Run("upgrade: a rewrite of a commit from before the map is matched by position", func(t *testing.T) { testRewriteOfACommitFromBeforeTheMap(t, home) })
 	t.Run("upgrade: a commit made before the map is matched by position", func(t *testing.T) { testCommitFromBeforeTheMap(t, home) })
+	t.Run("an edit made after a commit is not credited in it", func(t *testing.T) { testEditAfterTheCommit(t, home) })
+	t.Run("an event handled late does not take lines a newer edit wrote", func(t *testing.T) { testLateEventLeavesNewerLines(t, home) })
+	t.Run("a cherry-pick does not let the original branch count the lines again", func(t *testing.T) { testCherryPickThenRevertTwice(t, home) })
 }
 
 // seededRepo makes a repository whose one committed file holds n lines.
@@ -511,4 +514,103 @@ func testCommitFromBeforeTheMap(t *testing.T, home string) {
 	if got := confidenceOf(t, sha, "ca-old-commit"); got != "line_range_committed_intersect" {
 		t.Errorf("confidence %q, want the position match", got)
 	}
+}
+
+func testEditAfterTheCommit(t *testing.T, home string) {
+	repo, path, content := seededRepo(t, home, "content-later-edit", "cfg.ini", 10)
+	// The engineer adds two lines by hand and commits with a git posthook
+	// does not see.
+	byHand := strings.Replace(content, "k5 = old\n", "k5 = old\nh1 = by hand\nh2 = by hand\n", 1)
+	writeFile(t, path, byHand)
+	sha := commitAll(t, repo, "by hand")
+	// Later the agent re-indents one of them. From then on the line is the
+	// agent's in the file's map, and reads as the committed one does.
+	writeFile(t, path, strings.Replace(byHand, "h1 = by hand\n", "    h1 = by hand\n", 1))
+	deliverAt(t, "claude-code", repo, claudeEdit("ca-later", "Edit", path,
+		map[string]any{"old_string": "h1 = by hand\n", "new_string": "    h1 = by hand\n"},
+		[]map[string]any{hunk(5, " k5 = old", "-h1 = by hand", "+    h1 = by hand", " h2 = by hand")},
+		map[string]any{"originalFile": byHand}), time.Now().Add(5*time.Second))
+
+	// The commit is recorded only now. The agent's edit came after it, so
+	// nothing the commit holds was written by the agent.
+	if err := GitCommit(repo, sha); err != nil {
+		t.Fatal(err)
+	}
+	wantCommit(t, openDB(t), "a commit made before the agent's edit", sha, 0)
+}
+
+func testLateEventLeavesNewerLines(t *testing.T, home string) {
+	repo, path, content := seededRepo(t, home, "content-late-event", "cfg.ini", 10)
+	// One session inserts a line. Its hook is slow to reach the queue.
+	base := time.Now().Add(-30 * time.Second)
+	with, first := insertPayload("ca-late-first", path, content, 5, "enabled = true")
+	// Meanwhile another session takes the line out and puts the same line
+	// back. Those two events are handled first.
+	removal := claudeEdit("ca-late-second", "Edit", path,
+		map[string]any{"old_string": "k5 = old\nenabled = true\n", "new_string": "k5 = old\n"},
+		[]map[string]any{hunk(5, " k5 = old", "-enabled = true", " k6 = old")},
+		map[string]any{"originalFile": with})
+	again, second := insertPayload("ca-late-second", path, content, 5, "enabled = true")
+	writeFile(t, path, again)
+	deliverAt(t, "claude-code", repo, removal, base.Add(10*time.Second))
+	deliverAt(t, "claude-code", repo, second, base.Add(20*time.Second))
+	// Now the first session's event arrives. The line in the file is the
+	// one the second session wrote after it.
+	deliverAt(t, "claude-code", repo, first, base)
+
+	sha := commitAll(t, repo, "enabled")
+	if err := GitCommit(repo, sha); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t)
+	for session, want := range map[string]int{"ca-late-first": 0, "ca-late-second": 1} {
+		var got int
+		if err := db.QueryRow(`
+			SELECT COALESCE(SUM(cs.lines_attributed), 0) FROM commit_sessions cs
+			JOIN commits c ON c.id = cs.commit_id WHERE c.sha = ? AND cs.session_id = ?`, sha, session).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("session %s: %d committed line(s), want %d", session, got, want)
+		}
+	}
+}
+
+func testCherryPickThenRevertTwice(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "content-pick-revert")
+	path := filepath.Join(repo, "cfg.ini")
+	content := numbered(10, "k%d = old")
+	writeFile(t, path, content)
+	commitAll(t, repo, "add cfg")
+	gitOut(t, repo, "push", "-q", "origin", "main")
+
+	gitOut(t, repo, "checkout", "-q", "-b", "feature")
+	agentInserts(t, "ca-pick-revert", repo, path, content, 8, "a1 = new", "a2 = new", "a3 = new")
+	original := commitAll(t, repo, "agent change")
+	if err := GitCommit(repo, original); err != nil {
+		t.Fatal(err)
+	}
+
+	// The commit is cherry-picked onto a release branch. Both branches have
+	// now counted the lines.
+	gitOut(t, repo, "checkout", "-q", "-b", "release", "main")
+	laterSecond()
+	gitOut(t, repo, "cherry-pick", original)
+	picked := recordHead(t, repo)
+
+	// Back on the feature branch the commit is reverted, and the revert is
+	// reverted: the lines are added again in a history that already counted
+	// them.
+	gitOut(t, repo, "checkout", "-q", "feature")
+	laterSecond()
+	gitOut(t, repo, "revert", "--no-edit", original)
+	recordHead(t, repo)
+	laterSecond()
+	gitOut(t, repo, "revert", "--no-edit", "HEAD")
+	again := recordHead(t, repo)
+
+	db := openDB(t)
+	wantCommit(t, db, "the original", original, 3)
+	wantCommit(t, db, "the cherry-pick", picked, 3)
+	wantCommit(t, db, "the commit that adds the lines again", again, 0)
 }
