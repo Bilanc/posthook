@@ -325,7 +325,7 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 	visited := map[string]bool{}
 	defer func() {
 		// A file that holds lines for this look and was not reached (git
-		// did not answer, the file is gone, too many files) gives them up.
+		// did not answer, the file is gone) gives them up.
 		for _, path := range look.Files {
 			if !visited[path] {
 				releaseHeld(db, path, look.EventID)
@@ -377,11 +377,15 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 			rels = append(rels, changedBetween(root, before, status.head)...)
 		}
 	}
+	// The files that keep lines for this look come first, and are read
+	// whatever time is left: no later look would settle those lines.
+	var kept []string
 	for _, path := range look.Files {
 		if rel := gitx.RelPathInRepo(root, path); rel != "" {
-			rels = append(rels, rel)
+			kept = append(kept, rel)
 		}
 	}
+	rels = append(kept, rels...)
 
 	// Read what changed, and settle it a batch at a time so that a command
 	// that changed thousands of files does not have them all in memory.
@@ -450,12 +454,12 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 		holds[path] = true
 	}
 	began := time.Now()
-	for _, rel := range rels {
+	for i, rel := range rels {
 		if seen[rel] || rel == "" {
 			continue
 		}
 		seen[rel] = true
-		if time.Since(began) > lookBudget {
+		if i >= len(kept) && time.Since(began) > lookBudget {
 			logx.Debugf("look: no time left for the rest of the changed files in %s", root)
 			partial = true
 			break

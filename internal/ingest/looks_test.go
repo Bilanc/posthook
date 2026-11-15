@@ -1059,6 +1059,7 @@ func TestLooksAgainstWeakEvidence(t *testing.T) {
 	t.Run("a changed file that has not been written since it was looked at is not read again", func(t *testing.T) { testUnchangedFilesAreNotReadAgain(t, home) })
 	t.Run("a look that runs out of time leaves the rest for later, uncredited", func(t *testing.T) { testLookRunsOutOfTime(t, home) })
 	t.Run("a file a look did not get to is not a later command's", func(t *testing.T) { testSkippedFileIsNotALaterCommands(t, home) })
+	t.Run("lines kept for a look are settled even when it has no time for anything else", func(t *testing.T) { testHeldLinesSettledWithoutTime(t, home) })
 	t.Run("a file replaced with its old modification time is still seen to have changed", func(t *testing.T) { testReplacedFileWithOldTimestamp(t, home) })
 	t.Run("a script that changes more files than are held at once is credited for all of them", func(t *testing.T) { testManyFilesInOneLook(t, home) })
 }
@@ -1941,4 +1942,34 @@ func testManyFilesInOneLook(t *testing.T, home string) {
 	if look, ok := openDB(t).RepoLook(gitx.Canonicalize(repo)); !ok || look.Partial {
 		t.Errorf("the look did not see everything (%+v)", look)
 	}
+}
+
+func testHeldLinesSettledWithoutTime(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-held-budget")
+	const script, editor = "weak-held-budget-script", "weak-held-budget-edit"
+	other := filepath.Join(repo, "other.ini")
+	writeFile(t, other, content)
+	commitAll(t, repo, "add other")
+	promptSubmitted(t, script, repo)
+	// A script changes a line in each of two files. Right after, an edit
+	// inserts three lines into cfg.ini and is handled first: it keeps the
+	// script's line there for the script's look.
+	fired := time.Now().Add(-3 * time.Second)
+	afterScript := scripted(content, "k2")
+	afterEdit, edit := insertPayload(editor, path, afterScript, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, afterEdit)
+	writeFile(t, other, scripted(content, "k7"))
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, scriptCommand), fired)
+	deliverAt(t, "claude-code", repo, edit, fired.Add(time.Second))
+
+	// The script's look has no time for the changed files. The line that
+	// was kept for it is settled all the same: no later look would credit
+	// it. The other file is left as any file a look does not get to.
+	saved := lookBudget
+	lookBudget = -time.Second
+	settleLooks(t)
+	lookBudget = saved
+	wantGenerated(t, script, 1)
+	wantGenerated(t, editor, 3)
+	wantPartialLook(t, repo)
 }
