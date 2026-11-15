@@ -114,6 +114,7 @@ func TestLooks(t *testing.T) {
 	t.Run("a script, then git commit in the next command", func(t *testing.T) { testScriptThenCommit(t, home) })
 	t.Run("a script and git commit --amend in one command", func(t *testing.T) { testScriptAndAmend(t, home) })
 	t.Run("a commit made before its edits were handled is attributed once they are", func(t *testing.T) { testCommitBeforeEditsHandled(t, home) })
+	t.Run("a commit made between an edit and its hook is attributed once the edit is handled", func(t *testing.T) { testCommitBeforeTheHookFired(t, home) })
 
 	t.Run("git pull brings a teammate's commit: nothing is generated", func(t *testing.T) { testAgentPulls(t, home) })
 	t.Run("git merge of another branch", func(t *testing.T) { testAgentMerges(t, home) })
@@ -1676,4 +1677,28 @@ func testPartialLookHoldsNothingWithoutAMap(t *testing.T, home string) {
 			t.Errorf("line %d has author %+v: only the edit's lines have one", i+1, a)
 		}
 	}
+}
+
+func testCommitBeforeTheHookFired(t *testing.T, home string) {
+	repo, path, content := seededRepo(t, home, "look-commit-before-hook", "cfg.ini", 10)
+	// The agent writes three lines and the file is committed at once, before
+	// the edit's hook has fired (an auto-commit on save, the engineer in
+	// another terminal). The git shadow records the commit; the hook's time
+	// falls two seconds after the commit's.
+	next, payload := insertPayload("look-commit-before-hook", path, content, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, next)
+	sha := commitAll(t, repo, "committed before the hook fired")
+	if err := GitCommit(repo, sha); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t)
+	wantCommit(t, db, "the commit, when it is made", sha, 0)
+	var committed int64
+	if _, err := fmt.Sscan(gitOut(t, repo, "log", "-1", "--format=%ct", sha), &committed); err != nil {
+		t.Fatal(err)
+	}
+	// The edit is the commit's (a hook fires after the write it reports),
+	// so handling it has the commit attributed again.
+	deliverAt(t, "claude-code", repo, payload, time.Unix(committed+2, 0))
+	wantCommit(t, db, "the commit, once its edit is handled", sha, 3)
 }

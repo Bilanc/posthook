@@ -327,7 +327,8 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
 		// A commit made after this edit and before the worker got to it was
-		// attributed without it.
+		// attributed without it. The edit was written a moment before its
+		// hook fired, so that goes for a commit made in that moment too.
 		edited := map[string]map[string]bool{}
 		for i := range capture.files {
 			fc := &capture.files[i]
@@ -341,7 +342,7 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 			edited[fc.root][fc.rel.String] = true
 		}
 		for root, rels := range edited {
-			reattributeRecentCommits(db, root, rels, firedAt)
+			reattributeRecentCommits(db, root, rels, firedAt.Add(-hookDelay))
 		}
 	}
 	// Edits no payload describes are found by looking at the repository
