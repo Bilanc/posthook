@@ -53,6 +53,10 @@ type addedFile struct {
 	norms   []uint64
 }
 
+// MatchesByContent reports whether a commit made at committedAt is one this
+// database matches by content.
+func (db *DB) MatchesByContent(committedAt string) bool { return db.matchesByContent(committedAt) }
+
 // matchesByContent reports whether a commit made at committedAt is matched
 // by content: it was made no earlier than this database began to.
 func (db *DB) matchesByContent(committedAt string) bool {

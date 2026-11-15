@@ -109,6 +109,8 @@ From there it rolls up:
 
 This is what powers the "AI lines committed" and "AI code %" figures in `posthook metrics`, the per-line headers in `posthook blame`, and the breakdowns in the dashboard.
 
+**The git note and `posthook blame`.** The note on a commit (`refs/notes/posthook`) is written from the same record: per file, the runs of lines the commit is credited with, in the commit's own line numbers, each with its agent, model, session and time. So a teammate who has only the note sees the lines the agent wrote that are in the commit, and not a line you changed before committing. Such a note says `"v": 2`. A note from an earlier release (`"v": 1`) lists the ranges the edits were recorded at; it has the same shape and is read the same way, by a line's number in the commit that introduced it, so an older `posthook blame` reads the new notes unchanged and the new one reads the old. A commit that was matched by position in some file still gets a v1 note. `posthook blame` uses, in order: the file's authorship map for the lines it still holds (which also knows the lines in no commit yet, and the exact edit behind each line, for the prompt shown above it), the record of a commit made on this machine, the commit's note, and for commits older than all of these the line ranges of the edits before them.
+
 **How generated lines are counted.** For every edit, posthook works out the lines the agent actually added or changed, not the size of the text the tool was handed:
 
 - Claude Code reports each edit as a patch against the file it read, and posthook uses that patch as is.
@@ -200,7 +202,7 @@ By default, everything stays in `~/.posthook/posthook.db` on your machine. No HT
 - Absolute file paths, plus a derived repo-relative path.
 - Commit metadata (author email, message subject, file paths) from your local git.
 
-**What's written to `refs/notes/posthook` and pushed to remotes:** line ranges, agent slug, session ID, model name, event timestamp. **No prompt text. No code snippets.** To keep attribution on your own machine, turn the transport off:
+**What's written to `refs/notes/posthook` and pushed to remotes:** the line numbers the commit is credited with, agent slug, session ID, model name, timestamp of the session's last edit of the file. **No prompt text. No code snippets. No fingerprints of lines.** To keep attribution on your own machine, turn the transport off:
 
 ```bash
 export POSTHOOK_NOTES_SYNC=0   # shadow stops pushing/fetching refs/notes/posthook
