@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -533,7 +534,7 @@ func applyFileMap(db *store.DB, repoRoot, relPath string, lines []blameLine, mat
 			if !written {
 				continue
 			}
-		case !written || lined.CommitOf(i) != l.sha:
+		case !written || !slices.Contains(lined.CountedIn(i), l.sha):
 			continue
 		}
 		model, seen := models[author.SessionID]

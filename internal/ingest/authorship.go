@@ -80,7 +80,14 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor, f
 					continue
 				}
 				at := match[n-1]
-				if was, ok := prev.AuthorOf(at); ok && was.EventID != author.EventID {
+				was, written := prev.AuthorOf(at)
+				// A line that an event which began after this one fired has
+				// written stays that event's: it wrote the line last,
+				// whatever order the two arrived in.
+				if written && beganAfter(was, author) {
+					continue
+				}
+				if written && was.EventID != author.EventID {
 					taken[was.EventID] = append(taken[was.EventID], prev.Hashes[at])
 					holders[was.EventID] = was
 				}
@@ -209,6 +216,17 @@ func takeBackFromLook(db *store.DB, holder store.LineAuthor, path string, hashes
 func lastLookWasPartial(db *store.DB, root string) bool {
 	last, looked := db.RepoLook(root)
 	return looked && last.Partial
+}
+
+// beganAfter reports whether the event a began after the event b, as far as
+// both say when they began (store.LineAuthor.From).
+func beganAfter(a, b store.LineAuthor) bool {
+	if a.From == "" || b.From == "" {
+		return false
+	}
+	at, errA := time.Parse(time.RFC3339Nano, a.From)
+	bt, errB := time.Parse(time.RFC3339Nano, b.From)
+	return errA == nil && errB == nil && at.After(bt)
 }
 
 // seedMapAuthors gives a snapshot from before the authorship map the authors

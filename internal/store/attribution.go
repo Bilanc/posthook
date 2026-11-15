@@ -273,7 +273,7 @@ func (db *DB) attributeCommit(c commitRow, carried []string, merge bool) (int, e
 	if c.root != "" && db.matchesByContent(c.committedAt) {
 		adds = commitAdds(c.root, c.sha, db.contentFiles(c, files, carried))
 	}
-	content := &contentMatcher{db: db, c: c, carried: carried, ancestors: map[string]bool{}}
+	content := newContentMatcher(db, c, carried)
 	var sources []EventSource
 	for file, linesAdded := range files {
 		af := adds[file]

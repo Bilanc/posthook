@@ -225,8 +225,17 @@ type contentMatcher struct {
 	db      *DB
 	c       commitRow
 	carried []string
+	// madeAt is when c was committed, zero when that is not on record.
+	madeAt time.Time
 	// ancestors remembers, per commit sha, whether it is an ancestor of c.
-	ancestors map[string]bool
+	// The commits c carries are in it from the first question on: a carried
+	// commit is by definition not an ancestor, and git need not be asked.
+	ancestors   map[string]bool
+	carriedSeen bool
+}
+
+func newContentMatcher(db *DB, c commitRow, carried []string) *contentMatcher {
+	return &contentMatcher{db: db, c: c, carried: carried, madeAt: eventTime(c.committedAt), ancestors: map[string]bool{}}
 }
 
 // attributeFile credits the lines c adds to file by content and reports
@@ -258,7 +267,9 @@ func (x *contentMatcher) attributeFile(file string, af *addedFile, att *attribut
 		if db.creditedWithoutLines(id, file) {
 			// A commit this one replaces was credited in this file by
 			// position, with no lines on record to inherit: one from before
-			// v17. Its replacement is matched the same way.
+			// v17. Its replacement is matched the same way, in the whole
+			// file: matching some of a file's lines by content and the rest
+			// by position could count a line under both.
 			return false
 		}
 	}
@@ -286,11 +297,15 @@ func (x *contentMatcher) attributeFile(file string, af *addedFile, att *attribut
 			marked := false
 			for k, n := range af.numbers {
 				author, ok := lined.AuthorOf(n - 1)
-				if !ok {
+				if !ok || x.beganAfter(author) {
+					// Nobody's, or the work of an event that began after the
+					// commit was made: the map is the file as it is now, and
+					// this commit can be older than what the map knows (one
+					// recorded late, or attributed again).
 					continue
 				}
 				settled[k] = true
-				if counted := lined.CommitOf(n - 1); counted != "" && counted != x.c.sha && x.isAncestor(counted) {
+				if x.countedByAnAncestor(lined.CountedIn(n - 1)) {
 					att.exclude(file, n)
 					continue
 				}
@@ -299,8 +314,7 @@ func (x *contentMatcher) attributeFile(file string, af *addedFile, att *attribut
 				if from != nil {
 					at = from[n-1]
 				}
-				if at >= 0 && m.CommitOf(at) != x.c.sha {
-					m.SetCommit(at, x.c.sha)
+				if at >= 0 && m.MarkCounted(at, x.c.sha) {
 					marked = true
 				}
 			}
@@ -414,16 +428,70 @@ func (x *contentMatcher) inherit(att *attribution, fa *fileAgg, originalID, sess
 	}
 }
 
+// beganAfter reports whether the event behind a line began after the commit
+// was made, so that the commit's copy of the line cannot be its work. An
+// event with no known beginning (LineAuthor.From) is not held to this. A
+// commit's time has one-second resolution, so an event in the commit's own
+// second counts as before it.
+func (x *contentMatcher) beganAfter(author LineAuthor) bool {
+	if author.From == "" || x.madeAt.IsZero() {
+		return false
+	}
+	from := eventTime(author.From)
+	return !from.IsZero() && from.Truncate(time.Second).After(x.madeAt)
+}
+
+// countedByAnAncestor reports whether one of the commits that counted a line
+// is an ancestor of the commit being attributed.
+func (x *contentMatcher) countedByAnAncestor(counted []string) bool {
+	for _, sha := range counted {
+		if sha != x.c.sha && x.isAncestor(sha) {
+			return true
+		}
+	}
+	return false
+}
+
 // isAncestor reports whether the commit sha is an ancestor of the commit
 // being attributed. When git cannot say (the commit is gone) it is not: a
 // commit nothing refers to any more is one that was replaced.
 func (x *contentMatcher) isAncestor(sha string) bool {
+	if !x.carriedSeen {
+		x.carriedSeen = true
+		for _, carried := range x.db.commitSHAs(x.carried) {
+			x.ancestors[carried] = false
+		}
+	}
 	if known, ok := x.ancestors[sha]; ok {
 		return known
 	}
 	ancestor, err := gitx.IsAncestor(x.c.root, sha, x.c.sha)
 	x.ancestors[sha] = err == nil && ancestor
 	return x.ancestors[sha]
+}
+
+// commitSHAs returns the shas of recorded commits, given their ids.
+func (db *DB) commitSHAs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := db.Query(`SELECT sha FROM commits WHERE id IN (?`+strings.Repeat(", ?", len(ids)-1)+`)`, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var shas []string
+	for rows.Next() {
+		var sha string
+		if rows.Scan(&sha) == nil {
+			shas = append(shas, sha)
+		}
+	}
+	return shas
 }
 
 // creditedWithoutLines reports whether a commit is credited lines in a file
