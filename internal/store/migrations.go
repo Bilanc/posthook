@@ -1,6 +1,9 @@
 package store
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // applyMigrations runs idempotent ALTER TABLE guards for every schema bump.
 // Each block is gated on existence of a column so re-runs are safe.
@@ -156,6 +159,22 @@ func (db *DB) applyMigrations() error {
 		}
 		if _, err := db.Exec(fileSnapshotsDDL); err != nil {
 			return err
+		}
+	}
+
+	// v17: the snapshot becomes the authorship map. Rows written before keep
+	// NULL in the new columns: such a file has no authors yet, and a commit
+	// of it is attributed by line position until an edit gives it some.
+	snapshotCols, err = db.columnSet("file_snapshots")
+	if err != nil {
+		return err
+	}
+	for _, col := range fileSnapshotV17Columns {
+		name, _, _ := strings.Cut(col, " ")
+		if !snapshotCols[name] {
+			if _, err := db.Exec(`ALTER TABLE file_snapshots ADD COLUMN ` + col); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

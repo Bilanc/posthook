@@ -38,9 +38,9 @@
   <circle cx="504" cy="68" r="11" fill="#3fb950"/>
   <text x="504" y="72" font-size="11" fill="#0d1117" text-anchor="middle" font-weight="700">3</text>
   <text x="526" y="72" font-size="12" fill="#e6edf3" font-weight="600">Posthook links them</text>
-  <text x="496" y="100" font-size="10.5" fill="#8b949e">Each touched file is</text>
+  <text x="496" y="100" font-size="10.5" fill="#8b949e">Each added line is</text>
   <text x="496" y="116" font-size="10.5" fill="#8b949e">credited to the session</text>
-  <text x="496" y="132" font-size="10.5" fill="#8b949e">that last edited it.</text>
+  <text x="496" y="132" font-size="10.5" fill="#8b949e">that wrote it.</text>
   <rect x="494" y="150" width="152" height="26" rx="6" fill="#0d1117" stroke="#30363d"/>
   <text x="570" y="167" font-size="10.5" fill="#3fb950" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">commit_sessions</text>
 

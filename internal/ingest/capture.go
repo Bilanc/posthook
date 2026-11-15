@@ -87,11 +87,19 @@ type fileCapture struct {
 
 	// snapshot is the file as this event left it, kept as the baseline for
 	// the next whole-file write, and snapshotAsOf the instant it was true.
-	// snapshotBytes is the size of the content it was taken from.
+	// snapshotBytes is the size of the content it was taken from, and
+	// snapshotText that content: the authorship map (authorship.go) is the
+	// snapshot with an author per line.
 	snapshot      []uint64
 	hasSnapshot   bool
 	snapshotAsOf  time.Time
 	snapshotBytes int
+	snapshotText  string
+
+	// authored is where the lines this event added sit in snapshotText.
+	// They are the same lines as change.Ranges, which are positions in the
+	// file as read and differ when the two contents do.
+	authored []lineranges.LineRange
 
 	// generated and reworked are this file's share of the event's counts,
 	// and lines the session's ledger for the file after the event. All set
@@ -143,6 +151,7 @@ func (fc *fileCapture) setChange(c lineranges.Change, unlocated int) {
 func (fc *fileCapture) snapshotOf(content string, asOf time.Time) {
 	fc.snapshot, fc.hasSnapshot = hashLines(content), true
 	fc.snapshotAsOf, fc.snapshotBytes = asOf, len(content)
+	fc.snapshotText = content
 }
 
 // snapshotFromDisk records the file as read while handling the event. It is
@@ -178,15 +187,31 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 			// A Write that left the file as it was: an empty patch against
 			// an existing file.
 		}
-		if original, ok := resp["originalFile"].(string); ok {
+		original, haveOriginal := resp["originalFile"].(string)
+		if haveOriginal {
 			fc.before, fc.hasBefore = hashLines(original), true
 		} else if createdFile(resp) {
 			fc.before, fc.hasBefore = nil, true
 		}
-		if toolName == "Write" && input.Content != "" {
+		// The patch's line numbers are positions in the file as this edit
+		// left it. That content is known whatever the disk holds by now: the
+		// text a Write carries, or the patch applied to the previous content.
+		switch after, applied := applyHunks(original, hunks); {
+		case toolName == "Write" && input.Content != "":
 			fc.snapshotOf(input.Content, firedAt)
-		} else {
+			fc.wrote(fc.change.Ranges)
+		case haveOriginal && len(hunks) > 0 && applied:
+			if fc.hasPost && sameLines(after, string(fc.post)) {
+				// Nothing has touched the file since: keep the bytes as read.
+				after = string(fc.post)
+			}
+			fc.snapshotOf(after, firedAt)
+			fc.wrote(fc.change.Ranges)
+		default:
 			fc.snapshotFromDisk()
+			if fc.hasPost && addedLinesInPlace(fc.change, string(fc.post)) {
+				fc.wrote(fc.change.Ranges)
+			}
 		}
 		return &editCapture{files: []fileCapture{fc}}
 	}
@@ -199,6 +224,7 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 			return nil
 		}
 		fc.change = overwriteChange(db, &fc, after, firedAt)
+		fc.wrote(fc.change.Ranges)
 		if input.Content != "" {
 			fc.snapshotOf(after, firedAt)
 			if fc.hasPost {
@@ -213,9 +239,11 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 		fc.setChange(lineranges.EditsChange(
 			[]lineranges.Edit{{OldString: input.OldString, NewString: input.NewString}}, string(fc.post)))
 		fc.snapshotFromDisk()
+		fc.wrote(fc.change.Ranges)
 	case "MultiEdit":
 		fc.setChange(lineranges.EditsChange(input.Edits, string(fc.post)))
 		fc.snapshotFromDisk()
+		fc.wrote(fc.change.Ranges)
 	default:
 		return nil
 	}
@@ -237,6 +265,7 @@ func captureApplyPatch(files []lineranges.ApplyPatchFile, cwd string, workspaceR
 			// count, they just have no position.
 			fc.setChange(lineranges.LocateApplyPatch(file, string(fc.post)))
 			fc.snapshotFromDisk()
+			fc.wrote(fc.change.Ranges)
 		}
 		c.files = append(c.files, fc)
 	}
@@ -279,6 +308,7 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 			}
 			fc.setChange(added, unlocated)
 			fc.snapshotFromDisk()
+			fc.wrote(fc.change.Ranges)
 			c.files = append(c.files, fc)
 			continue
 		}
@@ -293,6 +323,7 @@ func captureShellWrites(db *store.DB, writes []lineranges.ShellWrite, cwd string
 		// of the text is in the file any more, which is exactly that case.
 		fc.change = overwriteChange(db, &fc, w.Content, firedAt)
 		fc.snapshotOf(w.Content, firedAt)
+		fc.wrote(fc.change.Ranges)
 		if post := string(fc.post); strings.Contains(post, w.Content) || mostlyPresent(w.Content, post) {
 			fc.change, fc.unlocated = placeInFile(fc.change, w.Content, post)
 		} else {
@@ -512,8 +543,9 @@ func (c *editCapture) score(db *store.DB, sessionID string) {
 }
 
 // store writes the ranges and the working state for an event already
-// inserted as eventID. Fail-soft: the caller logs and carries on.
-func (c *editCapture) store(db *store.DB, eventID, sessionID string) error {
+// inserted, named by author. Fail-soft: the caller logs and carries on.
+func (c *editCapture) store(db *store.DB, author store.LineAuthor) error {
+	eventID, sessionID := author.EventID, author.SessionID
 	for i := range c.files {
 		fc := &c.files[i]
 		if !fc.countable {
@@ -535,7 +567,7 @@ func (c *editCapture) store(db *store.DB, eventID, sessionID string) error {
 				// later write is not diffed against a stale one.
 				err = db.DropFileSnapshot(fc.path)
 			} else {
-				err = db.SaveFileSnapshot(fc.path, fc.snapshot, fc.snapshotAsOf)
+				err = fc.updateAuthorship(db, author)
 			}
 			if err != nil {
 				return err

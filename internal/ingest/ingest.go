@@ -246,7 +246,8 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	// worker gets to the event later, so this is the only clock that says
 	// which of the file's states the event could have seen (capture.go).
 	firedAt, err := time.Parse(time.RFC3339Nano, env.ReceivedAt)
-	if err != nil {
+	firedKnown := err == nil
+	if !firedKnown {
 		firedAt = time.Now()
 	}
 	var capture *editCapture
@@ -287,7 +288,14 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 
 	// Line ranges and capture state. Fail-soft: never block ingest on these.
 	if capture != nil {
-		if err := capture.store(db, id, sessionID); err != nil {
+		author := store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}
+		if firedKnown && len(shellWrites) == 0 {
+			// An edit tool's hook fires just after it has written. A shell
+			// command's fires when the command ends, so when it wrote is
+			// not known.
+			author.From = firedAt.Add(-hookDelay).UTC().Format(time.RFC3339Nano)
+		}
+		if err := capture.store(db, author); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
 	}
@@ -704,6 +712,13 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+// hookDelay is how long before its hook fired an edit tool is taken to have
+// written, at the earliest. The hook reports a write that has already
+// happened, as a rule milliseconds before, and a commit can land in between
+// (an auto-commit on save, the engineer in another terminal). An edit must
+// not lose that commit because its hook fired in the next second.
+const hookDelay = 3 * time.Second
 
 // shellToolNames are the tool names under which agents run shell commands:
 // Claude Code's Bash, Codex CLI's shell / exec_command, Cursor's Shell.
