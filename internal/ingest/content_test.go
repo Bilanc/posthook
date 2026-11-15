@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -40,6 +41,7 @@ func TestContentAttribution(t *testing.T) {
 	t.Run("upgrade: a rewrite of a commit from before the map is matched by position", func(t *testing.T) { testRewriteOfACommitFromBeforeTheMap(t, home) })
 	t.Run("upgrade: a commit made before the map is matched by position", func(t *testing.T) { testCommitFromBeforeTheMap(t, home) })
 	t.Run("an edit made after a commit is not credited in it", func(t *testing.T) { testEditAfterTheCommit(t, home) })
+	t.Run("an edit whose hook fires just after the commit is credited in it", func(t *testing.T) { testHookFiresAfterTheCommit(t, home) })
 	t.Run("an event handled late does not take lines a newer edit wrote", func(t *testing.T) { testLateEventLeavesNewerLines(t, home) })
 	t.Run("a cherry-pick does not let the original branch count the lines again", func(t *testing.T) { testCherryPickThenRevertTwice(t, home) })
 }
@@ -529,7 +531,7 @@ func testEditAfterTheCommit(t *testing.T, home string) {
 	deliverAt(t, "claude-code", repo, claudeEdit("ca-later", "Edit", path,
 		map[string]any{"old_string": "h1 = by hand\n", "new_string": "    h1 = by hand\n"},
 		[]map[string]any{hunk(5, " k5 = old", "-h1 = by hand", "+    h1 = by hand", " h2 = by hand")},
-		map[string]any{"originalFile": byHand}), time.Now().Add(5*time.Second))
+		map[string]any{"originalFile": byHand}), time.Now().Add(30*time.Second))
 
 	// The commit is recorded only now. The agent's edit came after it, so
 	// nothing the commit holds was written by the agent.
@@ -613,4 +615,26 @@ func testCherryPickThenRevertTwice(t *testing.T, home string) {
 	wantCommit(t, db, "the original", original, 3)
 	wantCommit(t, db, "the cherry-pick", picked, 3)
 	wantCommit(t, db, "the commit that adds the lines again", again, 0)
+}
+
+func testHookFiresAfterTheCommit(t *testing.T, home string) {
+	repo, path, content := seededRepo(t, home, "content-hook-after", "cfg.ini", 10)
+	// The agent writes three lines. Before its hook has fired, the file is
+	// committed (an auto-commit on save, the engineer in another terminal),
+	// and the hook's time falls two seconds after the commit's.
+	next, payload := insertPayload("ca-hook-after", path, content, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, next)
+	sha := commitAll(t, repo, "committed before the hook fired")
+	var committed int64
+	if _, err := fmt.Sscan(gitOut(t, repo, "log", "-1", "--format=%ct", sha), &committed); err != nil {
+		t.Fatal(err)
+	}
+	deliverAt(t, "claude-code", repo, payload, time.Unix(committed+2, 0))
+
+	// A hook fires after the write it reports, so the edit is the commit's
+	// all the same.
+	if err := GitCommit(repo, sha); err != nil {
+		t.Fatal(err)
+	}
+	wantCommit(t, openDB(t), "a commit made between the write and its hook", sha, 3)
 }
