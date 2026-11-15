@@ -871,6 +871,13 @@ func TestCommandMovesContent(t *testing.T) {
 		"./tools/git reset --hard",
 		`\git stash apply`,
 		`"/usr/local/bin/git" pull`,
+		// A quoted path with spaces in it, and git found by a substitution.
+		`"/opt/Git Tools/bin/git" stash pop`,
+		`'/Applications/My Git/git' apply fix.patch`,
+		`"C:\Program Files\Git\cmd\git.exe" -C repo checkout main`,
+		`/opt/my\ tools/git stash pop`,
+		`$(which git) stash pop`,
+		`"$(command -v git)" reset --hard`,
 	}
 	for _, c := range moves {
 		if !commandMovesContent(c) {
@@ -892,6 +899,8 @@ func TestCommandMovesContent(t *testing.T) {
 		"/usr/bin/legit pull",
 		"ls /usr/bin/git",
 		"/usr/bin/git status",
+		`"/opt/Git Tools/bin/git" status`,
+		`ls "/opt/Git Tools/bin/git"`,
 		"git fetch origin",
 		"gh pr checkout 12",
 	}
@@ -916,10 +925,14 @@ func TestCommandCommits(t *testing.T) {
 		"/usr/bin/git commit -m x":                                   true,
 		"python3 gen.py && /opt/homebrew/bin/git -C . commit -am x":  true,
 		"ls /usr/bin/git && echo commit":                             false,
-		"git status":                                                 false,
-		"git log --grep commit":                                      false,
-		"python3 gen.py":                                             false,
-		"gitcommit -m x":                                             false,
+		`"/opt/Git Tools/bin/git" commit -m x`:                       true,
+		`'/opt/Git Tools/bin/git' -C . commit -am x`:                 true,
+		`$(which git) commit -m x`:                                   true,
+		`"/opt/Git Tools/bin/git" log --grep commit`:                 false,
+		"git status":            false,
+		"git log --grep commit": false,
+		"python3 gen.py":        false,
+		"gitcommit -m x":        false,
 	} {
 		if got := commandCommits(command); got != want {
 			t.Errorf("commandCommits(%q) = %v, want %v", command, got, want)

@@ -212,8 +212,10 @@ func shellCommand(payload map[string]any) string {
 // gitInvocation matches how a shell command calls git, up to the subcommand:
 // `git` as a word of its own, by its path (/usr/bin/git) or past an alias
 // (\git), quoted or not, then the options that may stand before the
-// subcommand (-C dir, -c k=v, --no-pager).
-const gitInvocation = `(^|[\s;&|(){}'"` + "`" + `])([^\s;&|(){}'"` + "`" + `]*[/\\])?git(\.exe)?['"]?` +
+// subcommand (-C dir, -c k=v, --no-pager). A quoted path with spaces in it
+// ("/opt/Git Tools/bin/git") is matched from its last space on, and what
+// closes a quote or a substitution may follow the name ("$(which git)").
+const gitInvocation = `(^|[\s;&|(){}'"` + "`" + `])([^\s;&|(){}'"` + "`" + `]*[/\\])?git(\.exe)?['")` + "`" + `]*` +
 	`(\s+(-[cC]\s+\S+|--?[A-Za-z][\w-]*(=\S+)?))*\s+`
 
 // movesContentRE matches a git invocation whose subcommand brings existing
