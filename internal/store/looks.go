@@ -120,10 +120,14 @@ func (db *DB) CountPendingLooks() int {
 	return n
 }
 
-// PendingShellLook returns the newest shell look queued for root whose hook
-// fired no later than firedBy, other than the one for event except.
-func (db *DB) PendingShellLook(root string, firedBy time.Time, except string) (PendingLook, bool) {
-	rows, err := db.Query(`SELECT `+pendingLookColumns+` FROM pending_looks WHERE root = ? AND kind = ? AND event_id != ? ORDER BY fired_at DESC, id DESC`,
+// PendingShellLook returns the oldest shell look queued for root whose hook
+// fired after `after` and no later than firedBy, other than the one for
+// event except. Looks run oldest first, and the first to run settles what it
+// finds on disk, so that is the look a line that turned up in between is
+// kept for. A command that had ended by `after` (when the file was last
+// seen, zero when it never was) did not write what turned up since.
+func (db *DB) PendingShellLook(root string, after, firedBy time.Time, except string) (PendingLook, bool) {
+	rows, err := db.Query(`SELECT `+pendingLookColumns+` FROM pending_looks WHERE root = ? AND kind = ? AND event_id != ? ORDER BY fired_at, id`,
 		root, LookShell, except)
 	if err != nil {
 		return PendingLook{}, false
@@ -134,7 +138,7 @@ func (db *DB) PendingShellLook(root string, firedBy time.Time, except string) (P
 		if err != nil {
 			return PendingLook{}, false
 		}
-		if !l.FiredAt.After(firedBy) {
+		if l.FiredAt.After(after) && !l.FiredAt.After(firedBy) {
 			return l, true
 		}
 	}

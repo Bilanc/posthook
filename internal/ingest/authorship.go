@@ -128,7 +128,13 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor, f
 	// not read every changed file that does not follow (see runLook), and
 	// nothing is held in such a file: its lines may have been there, unseen.
 	if fc.root != "" {
-		if look, due := db.PendingShellLook(fc.root, firedAt, author.EventID); due && firedAt.Sub(look.FiredAt) <= maxLookAge &&
+		// A command that had ended when the file was last seen did not
+		// write what has turned up in it since.
+		var lastSeen time.Time
+		if found {
+			lastSeen = prev.AsOf
+		}
+		if look, due := db.PendingShellLook(fc.root, lastSeen, firedAt, author.EventID); due && firedAt.Sub(look.FiredAt) <= maxLookAge &&
 			(found || !lastLookWasPartial(db, fc.root)) {
 			held := false
 			holder := look.Author(true)

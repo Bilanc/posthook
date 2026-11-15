@@ -1062,6 +1062,10 @@ func TestLooksAgainstWeakEvidence(t *testing.T) {
 	t.Run("a committed file too large to keep a map for is not read from git", func(t *testing.T) { testLargeBaseFileIsNotRead(t, home) })
 	t.Run("after a look that could not read everything, a queued edit still holds a script's lines in a file with a map", func(t *testing.T) { testPartialLookThenScriptAndEdit(t, home) })
 	t.Run("after a look that could not read everything, nothing is held in a file with no map", func(t *testing.T) { testPartialLookHoldsNothingWithoutAMap(t, home) })
+	t.Run("lines an edit cannot explain are held for the first command still to be looked at", func(t *testing.T) { testHeldLinesGoToTheFirstQueuedCommand(t, home) })
+	t.Run("lines that appear after an edit are not held for a command that ended before it", func(t *testing.T) { testHeldLinesSkipEarlierCommands(t, home) })
+	t.Run("a changed file that has not been written since it was looked at is not read again", func(t *testing.T) { testUnchangedFilesAreNotReadAgain(t, home) })
+	t.Run("a look that runs out of time leaves the rest for later, uncredited", func(t *testing.T) { testLookRunsOutOfTime(t, home) })
 }
 
 func testCopyAndMove(t *testing.T, home string) {
@@ -1701,4 +1705,162 @@ func testCommitBeforeTheHookFired(t *testing.T, home string) {
 	// so handling it has the commit attributed again.
 	deliverAt(t, "claude-code", repo, payload, time.Unix(committed+2, 0))
 	wantCommit(t, db, "the commit, once its edit is handled", sha, 3)
+}
+
+// generatedByCommand is the lines generated on record for a session's shell
+// call with the given command text.
+func generatedByCommand(t *testing.T, session, command string) int {
+	t.Helper()
+	var n int
+	if err := openDB(t).QueryRow(`
+		SELECT COALESCE(SUM(lines_generated), 0) FROM events
+		WHERE session_id = ? AND json_extract(payload, '$.tool_input.command') = ?`, session, command).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func testHeldLinesGoToTheFirstQueuedCommand(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-held-order")
+	const script, editor = "weak-held-order-script", "weak-held-order-edit"
+	promptSubmitted(t, script, repo)
+	// A script changes one line. The agent then runs a git command that
+	// moves content (there is nothing to pull), and an edit by another
+	// session inserts three lines. All three events are handled before any
+	// look runs.
+	const pull = "git pull --ff-only"
+	fired := time.Now().Add(-4 * time.Second)
+	afterScript := scripted(content, "k2")
+	afterEdit, edit := insertPayload(editor, path, afterScript, 5, "a1 = new", "a2 = new", "a3 = new")
+	writeFile(t, path, afterEdit)
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, scriptCommand), fired)
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, pull), fired.Add(time.Second))
+	deliverAt(t, "claude-code", repo, edit, fired.Add(2*time.Second))
+	settleLooks(t)
+
+	// The line the edit could not explain is settled by the first look to
+	// run, the script's, as it would have been with no edit in between. It
+	// is not kept for the pull, whose look credits nothing.
+	if got := generatedByCommand(t, script, scriptCommand); got != 1 {
+		t.Errorf("the script is credited %d line(s), want 1", got)
+	}
+	if got := generatedByCommand(t, script, pull); got != 0 {
+		t.Errorf("the pull is credited %d line(s), want 0", got)
+	}
+	wantGenerated(t, editor, 3)
+}
+
+func testHeldLinesSkipEarlierCommands(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-held-after")
+	const script, editor = "weak-held-after-script", "weak-held-after-edit"
+	promptSubmitted(t, script, repo)
+	// Script, edit, another script, another edit, all handled before any
+	// look runs. The line the second edit cannot explain appeared after the
+	// first edit, so the first script, which had ended by then, did not
+	// write it.
+	const second = scriptCommand + "\n# second run"
+	fired := time.Now().Add(-6 * time.Second)
+	s1 := scripted(content, "k2")
+	e1, firstEdit := insertPayload(editor, path, s1, 5, "a1 = new")
+	s2 := scripted(e1, "k9")
+	e2, secondEdit := insertPayload(editor, path, s2, 6, "a2 = new")
+	writeFile(t, path, e2)
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, scriptCommand), fired)
+	deliverAt(t, "claude-code", repo, firstEdit, fired.Add(time.Second))
+	deliverAt(t, "claude-code", repo, shellPayload(script, repo, second), fired.Add(2*time.Second))
+	deliverAt(t, "claude-code", repo, secondEdit, fired.Add(3*time.Second))
+	settleLooks(t)
+
+	if got := generatedByCommand(t, script, scriptCommand); got != 1 {
+		t.Errorf("the first script is credited %d line(s), want 1", got)
+	}
+	if got := generatedByCommand(t, script, second); got != 1 {
+		t.Errorf("the second script is credited %d line(s), want 1", got)
+	}
+	wantGenerated(t, editor, 2)
+}
+
+func testUnchangedFilesAreNotReadAgain(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-reread")
+	const session = "weak-reread"
+	// The working tree has thirty changed files that have been that way for
+	// an hour.
+	hourAgo := time.Now().Add(-time.Hour)
+	for i := 0; i < 30; i++ {
+		name := filepath.Join(repo, "scratch", fmt.Sprintf("s%02d.txt", i))
+		writeFile(t, name, fmt.Sprintf("scratch %d\n", i))
+		if err := os.Chtimes(name, hourAgo, hourAgo); err != nil {
+			t.Fatal(err)
+		}
+	}
+	promptSubmitted(t, session, repo)
+
+	saved := readLookContent
+	reads := 0
+	readLookContent = func(name string) ([]byte, error) {
+		reads++
+		return saved(name)
+	}
+	defer func() { readLookContent = saved }()
+
+	// A command that changes nothing reads none of them again.
+	shellRan(t, session, repo, "ls")
+	settleLooks(t)
+	if reads != 0 {
+		t.Errorf("a look after a command that changed nothing read %d file(s), want none", reads)
+	}
+	// One that changes two files reads those two, and is credited for them.
+	reads = 0
+	writeFile(t, path, scripted(content, "k2"))
+	writeFile(t, filepath.Join(repo, "scratch", "s07.txt"), "scratch 7\nscripted\n")
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	if reads != 2 {
+		t.Errorf("a look after a command that changed two files read %d file(s), want 2", reads)
+	}
+	wantGenerated(t, session, 2)
+
+	// Those two were written a moment before they were looked at, too
+	// close to tell from their modification times. The next look reads them
+	// once more, finds them as they were, and from then on leaves them.
+	time.Sleep(writtenSlack + 100*time.Millisecond)
+	reads = 0
+	shellRan(t, session, repo, "ls")
+	settleLooks(t)
+	if reads != 2 {
+		t.Errorf("the look after that read %d file(s), want the same 2 once more", reads)
+	}
+	reads = 0
+	shellRan(t, session, repo, "ls")
+	settleLooks(t)
+	if reads != 0 {
+		t.Errorf("a later look read %d file(s), want none", reads)
+	}
+	wantGenerated(t, session, 2)
+}
+
+func testLookRunsOutOfTime(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-budget")
+	const session = "weak-budget"
+	promptSubmitted(t, session, repo)
+	// The look after this script has no time to examine anything.
+	writeFile(t, path, scripted(content, "k2"))
+	saved := lookBudget
+	lookBudget = -time.Second
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	lookBudget = saved
+	wantGenerated(t, session, 0)
+	wantPartialLook(t, repo)
+
+	// The next look gets to the file. It has no map and the last look did
+	// not see everything, so what is in it is recorded, not credited.
+	shellRan(t, session, repo, "ls")
+	settleLooks(t)
+	wantGenerated(t, session, 0)
+	// From then on the file is on record, and a change to it is credited.
+	writeFile(t, path, scripted(content, "k2", "k5"))
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	wantGenerated(t, session, 1)
 }

@@ -373,6 +373,19 @@ func (db *DB) FileMap(path string) (FileMap, bool) {
 	return m, true
 }
 
+// FileMapSeen says, without reading the map, when the file at path was last
+// seen (FileMap.AsOf) and whether its map carries authorship.
+func (db *DB) FileMapSeen(path string) (asOf time.Time, authored, ok bool) {
+	var at string
+	if err := db.QueryRow(`
+		SELECT updated_at, line_owners IS NOT NULL AND length(line_owners) > 0
+		FROM file_snapshots WHERE file_path = ?`, path).Scan(&at, &authored); err != nil {
+		return time.Time{}, false, false
+	}
+	asOf, err := time.Parse(time.RFC3339Nano, at)
+	return asOf, authored, err == nil
+}
+
 // SaveFileMap records m as the state of path.
 func (db *DB) SaveFileMap(path string, m FileMap) error {
 	norms, owners, meta := m.encode()

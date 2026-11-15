@@ -69,6 +69,9 @@ import (
 // own lines by the time the look reads the disk. Lines that such an edit
 // finds in a file and cannot explain are held for the look
 // (store.LineAuthor.Held), which confirms or drops them by the same rules.
+// With several looks waiting they are held for the oldest whose command
+// ended after the file was last seen: looks run oldest first, and that is
+// the one that would have found the lines had there been no edit.
 //
 // git is asked with --no-optional-locks, so a look never takes index.lock
 // and cannot make the engineer's or the agent's own git command fail, and
@@ -109,6 +112,10 @@ const (
 	// maxLookDirs the untracked directories it lists the files of.
 	maxLookFiles = 200
 	maxLookDirs  = 50
+	// writtenSlack is how much older than its map a file's modification
+	// time has to be for the file to count as not written since: file
+	// systems keep that time to different precisions.
+	writtenSlack = 2 * time.Second
 	// reflogDepth bounds how far back a look reads HEAD's reflog.
 	reflogDepth = 200
 )
@@ -116,6 +123,16 @@ const (
 // lookTimeout bounds each git call a look makes. A variable so a test can
 // make git "not answer in time".
 var lookTimeout = 2 * time.Second
+
+// lookBudget bounds the time one look spends examining the files git says
+// have changed. What it has not got to by then is left for later looks, and
+// the look counts as one that did not see everything. A variable so a test
+// can leave a look no time.
+var lookBudget = 2 * time.Second
+
+// readLookContent reads a changed file. A variable so a test can count the
+// reads.
+var readLookContent = os.ReadFile
 
 // queueLooks queues the looks an event calls for: one per repository after a
 // shell tool call, one for the session's repository when a prompt is
@@ -364,6 +381,11 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 	partial := status.partial
 	var files []*lookFile
 	seen := map[string]bool{}
+	holds := map[string]bool{}
+	for _, path := range look.Files {
+		holds[path] = true
+	}
+	began := time.Now()
 	for _, rel := range rels {
 		if seen[rel] || rel == "" {
 			continue
@@ -374,7 +396,12 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 			partial = true
 			break
 		}
-		lf := readLookFile(db, root, rel, look)
+		if time.Since(began) > lookBudget {
+			logx.Debugf("look: no time left for the rest of the changed files in %s", root)
+			partial = true
+			break
+		}
+		lf := readLookFile(db, root, rel, look, holds)
 		if lf == nil {
 			continue
 		}
@@ -449,7 +476,13 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 // readLookFile reads one changed file and its map. nil when there is
 // nothing to do for it: the file is gone, is not text, is too large to keep
 // a map for, or is exactly as its map has it.
-func readLookFile(db *store.DB, root, rel string, look store.PendingLook) *lookFile {
+//
+// A file that stays changed for a long time (a local config, a directory of
+// scratch files) is listed by git at every look. It is read once: after
+// that, as long as it has not been written since its map was made, it is
+// not opened again. holds are the paths that keep lines for this look, which
+// are always read.
+func readLookFile(db *store.DB, root, rel string, look store.PendingLook, holds map[string]bool) *lookFile {
 	path := filepath.Join(root, filepath.FromSlash(rel))
 	// Lstat: a symlink is not a file of lines, whatever it points at.
 	info, err := os.Lstat(path)
@@ -461,7 +494,13 @@ func readLookFile(db *store.DB, root, rel string, look store.PendingLook) *lookF
 		// turns: the worker got to the prompt late. The next look takes it.
 		return nil
 	}
-	content, err := os.ReadFile(path)
+	if !holds[path] {
+		if seen, authored, ok := db.FileMapSeen(path); ok && authored &&
+			info.ModTime().Add(writtenSlack).Before(seen) && time.Since(seen) <= mapRefresh {
+			return nil
+		}
+	}
+	content, err := readLookContent(path)
 	if err != nil || bytes.IndexByte(content[:min(len(content), 8000)], 0) >= 0 {
 		return nil
 	}
@@ -471,7 +510,10 @@ func readLookFile(db *store.DB, root, rel string, look store.PendingLook) *lookF
 		// Exactly as the map has it. A file that stays changed for weeks
 		// (a local config, a scratch file) must not lose its map to the
 		// expiry of untouched rows: without it the file would look new.
-		if lf.readAt.Sub(lf.prev.AsOf) > mapRefresh {
+		// And a map made right after the file was written is brought up to
+		// now, so the next look can tell from the file's modification time
+		// that it need not read it.
+		if lf.readAt.Sub(lf.prev.AsOf) > mapRefresh || !info.ModTime().Add(writtenSlack).Before(lf.prev.AsOf) {
 			lf.prev.AsOf = lf.readAt
 			_ = db.SaveFileMap(path, lf.prev)
 		}
