@@ -271,3 +271,44 @@ func TestBlameOfACommitCreditedNothing(t *testing.T) {
 		t.Errorf("lines %v are shown as the agent's; the commit holds none of its lines", got)
 	}
 }
+
+// A commit is recorded the moment it is made, and blame trusts what is on
+// record for it, also when that is nothing. An edit the worker had not
+// handled yet when the commit was made must therefore reach the record once
+// it is handled, or its lines would read as written by hand for good.
+func TestBlameOfACommitMadeBeforeItsEditWasHandled(t *testing.T) {
+	home := blameHome(t)
+	// posthook was installed before any of this: a commit made before its
+	// database existed would be one from before content matching.
+	if _, err := store.Open(); err != nil {
+		t.Fatal(err)
+	}
+	repo, _ := blameRepo(t, home, "blame-early-commit")
+	path := filepath.Join(repo, "f.txt")
+	content := "one\ntwo\nthree\n"
+	blameWrite(t, path, content)
+	fired := time.Now()
+	commitRecorded(t, repo, "add f")
+	if got := aiLines(t, repo, "f.txt"); len(got) != 0 {
+		t.Fatalf("test setup: blame already credits lines %v before the edit is handled", got)
+	}
+
+	// The worker gets to the edit's event, which fired before the commit, a
+	// good second after the commit was made: matching by position, which
+	// goes by the time the event was handled, could not credit it.
+	time.Sleep(1100 * time.Millisecond)
+	raw, err := json.Marshal(map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": "blame-early", "tool_name": "Write",
+		"tool_input":    map[string]any{"file_path": path, "content": content},
+		"tool_response": map[string]any{"type": "create", "filePath": path, "structuredPatch": []any{}, "originalFile": nil},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ingest.ProcessAgentEnvelope(spool.Envelope{
+		Agent: "claude-code", Cwd: repo, ReceivedAt: fired.UTC().Format(time.RFC3339Nano), Payload: raw,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantAILines(t, "blame once the edit is handled", aiLines(t, repo, "f.txt"), "blame-early", 1, 2, 3)
+}
