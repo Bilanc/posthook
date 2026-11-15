@@ -1942,6 +1942,18 @@ func testManyFilesInOneLook(t *testing.T, home string) {
 	if look, ok := openDB(t).RepoLook(gitx.Canonicalize(repo)); !ok || look.Partial {
 		t.Errorf("the look did not see everything (%+v)", look)
 	}
+
+	// The same goes for files a script creates in a directory git does not
+	// know yet.
+	for i := 0; i < n; i++ {
+		writeFile(t, filepath.Join(repo, "out", fmt.Sprintf("o%03d.txt", i)), "made = 1\n")
+	}
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	wantGenerated(t, session, 2*n)
+	if look, ok := openDB(t).RepoLook(gitx.Canonicalize(repo)); !ok || look.Partial {
+		t.Errorf("the look at the new directory did not see everything (%+v)", look)
+	}
 }
 
 func testHeldLinesSettledWithoutTime(t *testing.T, home string) {

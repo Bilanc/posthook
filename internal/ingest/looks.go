@@ -910,10 +910,6 @@ func gitStatus(root string) (repoStatus, error) {
 		dirs, status.partial = dirs[:maxLookDirs], true
 	}
 	for _, dir := range dirs {
-		if len(status.files) >= maxLookFiles {
-			status.partial = true
-			break
-		}
 		listed, err := lookGit(root, "", "ls-files", "--others", "--exclude-standard", "-z", "--", dir)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
@@ -924,10 +920,6 @@ func gitStatus(root string) (repoStatus, error) {
 		for _, rel := range strings.Split(string(listed), "\x00") {
 			if rel == "" || strings.HasSuffix(rel, "/") {
 				continue
-			}
-			if len(status.files) >= maxLookFiles {
-				status.partial = true
-				break
 			}
 			status.files = append(status.files, rel)
 		}
