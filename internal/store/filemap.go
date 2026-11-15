@@ -46,10 +46,11 @@ type LineAuthor struct {
 	// it, which can be well after it happened.
 	TS string `json:"t,omitempty"`
 	// From is the earliest instant the event can have written its lines:
-	// when its hook fired, for an edit tool. Empty when that is not known,
-	// as for a shell command, whose hook fires when the command ends. A
-	// commit made before From does not hold the event's work, and of two
-	// events the one with the later From wrote a line last.
+	// for an edit tool, a few seconds before its hook fired (the hook fires
+	// once the write is done). Empty when that is not known, as for a shell
+	// command, whose hook fires when the command ends. A commit made before
+	// From does not hold the event's work, and of two events the one with
+	// the later From wrote a line last.
 	From string `json:"f,omitempty"`
 }
 
