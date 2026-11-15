@@ -30,17 +30,27 @@ import (
 // Two copies are lined up on the whitespace-insensitive fingerprint, so a
 // line that format-on-save re-indented is still the same line.
 //
-// Each line also remembers the last commit it was counted in. A commit that
-// adds a line again which one of its ancestors was already credited for (a
-// revert of a revert) does not count it a second time; a commit that
-// replaces the one that counted it (an amend, a rebase, a cherry-pick) does.
+// Each line also remembers the commits it was counted in. A commit that adds
+// a line again which one of its ancestors was already credited for (a revert
+// of a revert) does not count it a second time; a commit that replaces the
+// one that counted it (an amend, a rebase, a cherry-pick) does. Several are
+// remembered, not only the last: after a cherry-pick two histories have
+// counted the line, and neither may count it again.
 
 // LineAuthor is the agent event that wrote a line.
 type LineAuthor struct {
 	EventID   string `json:"e"`
 	SessionID string `json:"s"`
 	Agent     string `json:"a,omitempty"`
-	TS        string `json:"t,omitempty"`
+	// TS is the event's time on record (events.ts): when the worker handled
+	// it, which can be well after it happened.
+	TS string `json:"t,omitempty"`
+	// From is the earliest instant the event can have written its lines:
+	// when its hook fired, for an edit tool. Empty when that is not known,
+	// as for a shell command, whose hook fires when the command ends. A
+	// commit made before From does not hold the event's work, and of two
+	// events the one with the later From wrote a line last.
+	From string `json:"f,omitempty"`
 }
 
 // FileMap is one file's authorship map.
@@ -50,9 +60,10 @@ type FileMap struct {
 	Hashes []uint64
 	Norms  []uint64
 	// Owner[i] is 1 + the index in Authors of the event that wrote line i,
-	// or 0 for nobody. Commit[i] is 1 + the index in Commits of the commit
-	// line i was last counted in, or 0. Both are nil on a row written before
-	// v17: such a file has no authors yet.
+	// or 0 for nobody. Commit[i] is 1 + the index in Commits of the commits
+	// line i was counted in, or 0; an entry of Commits is one sha or several
+	// with a space between them. Both are nil on a row written before v17:
+	// such a file has no authors yet.
 	Owner   []int
 	Commit  []int
 	Authors []LineAuthor
@@ -80,13 +91,13 @@ func (m FileMap) AuthorOf(i int) (LineAuthor, bool) {
 	return m.Authors[m.Owner[i]-1], true
 }
 
-// CommitOf returns the sha of the commit line i (0-based) was last counted
-// in, empty when in none.
-func (m FileMap) CommitOf(i int) string {
+// CountedIn returns the shas of the commits line i (0-based) was counted in,
+// oldest first; none for a line no commit has counted yet.
+func (m FileMap) CountedIn(i int) []string {
 	if i < 0 || i >= len(m.Commit) || m.Commit[i] <= 0 || m.Commit[i] > len(m.Commits) {
-		return ""
+		return nil
 	}
-	return m.Commits[m.Commit[i]-1]
+	return strings.Fields(m.Commits[m.Commit[i]-1])
 }
 
 // SetAuthor makes author the writer of line i (0-based). A line that is
@@ -112,23 +123,43 @@ func (m *FileMap) SetAuthor(i int, author LineAuthor) {
 	m.Commit[i] = 0
 }
 
-// SetCommit records sha as the commit line i (0-based) was counted in.
-func (m *FileMap) SetCommit(i int, sha string) {
+// maxCountMarks bounds the commits a line remembers it was counted in. One
+// is the rule; every rewrite of that commit (an amend, a rebase) and every
+// branch it is cherry-picked to adds one, and the oldest is dropped.
+const maxCountMarks = 4
+
+// MarkCounted records that line i (0-based) was counted in the commit sha,
+// and reports whether that was not on record yet.
+func (m *FileMap) MarkCounted(i int, sha string) bool {
 	if i < 0 || i >= len(m.Commit) || sha == "" {
-		return
+		return false
 	}
+	marks := m.CountedIn(i)
+	for _, c := range marks {
+		if c == sha {
+			return false
+		}
+	}
+	marks = append(marks, sha)
+	if len(marks) > maxCountMarks {
+		marks = marks[len(marks)-maxCountMarks:]
+	}
+	entry := strings.Join(marks, " ")
 	at := -1
 	for k, c := range m.Commits {
-		if c == sha {
+		if c == entry {
 			at = k
 			break
 		}
 	}
 	if at < 0 {
-		m.Commits = append(m.Commits[:len(m.Commits):len(m.Commits)], sha)
+		// Never append in place: Carry shares Commits with the map it came
+		// from.
+		m.Commits = append(m.Commits[:len(m.Commits):len(m.Commits)], entry)
 		at = len(m.Commits) - 1
 	}
 	m.Commit[i] = at + 1
+	return true
 }
 
 // Carry lines the map up with a newer copy of the file, given as its lines,

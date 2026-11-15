@@ -33,7 +33,7 @@ func sessionsOf(m FileMap) []string {
 func TestFileMapRoundTrip(t *testing.T) {
 	db := newTestDB(t)
 	m := mapOf([]string{"package a", "", "func a() {}", "// by hand"}, []string{"s1", "s1", "s2", ""})
-	m.SetCommit(0, "1111111111111111111111111111111111111111")
+	m.MarkCounted(0, "1111111111111111111111111111111111111111")
 	m.AsOf = time.Date(2026, 11, 13, 9, 30, 0, 123456789, time.UTC)
 	m.Blob = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 	if err := db.SaveFileMap("/repo/a.go", m); err != nil {
@@ -49,8 +49,8 @@ func TestFileMapRoundTrip(t *testing.T) {
 	if want := []string{"s1", "s1", "s2", ""}; !reflect.DeepEqual(sessionsOf(got), want) {
 		t.Errorf("authors %v, want %v", sessionsOf(got), want)
 	}
-	if got.CommitOf(0) != "1111111111111111111111111111111111111111" || got.CommitOf(1) != "" {
-		t.Errorf("commit marks: %q, %q", got.CommitOf(0), got.CommitOf(1))
+	if countedIn(got, 0) != "1111111111111111111111111111111111111111" || countedIn(got, 1) != "" {
+		t.Errorf("commit marks: %q, %q", countedIn(got, 0), countedIn(got, 1))
 	}
 	if !got.AsOf.Equal(m.AsOf) || got.Blob != m.Blob {
 		t.Errorf("as of %v blob %q", got.AsOf, got.Blob)
@@ -120,7 +120,7 @@ func TestFileMapStoresNoFileContentAndDropsUnusedAuthors(t *testing.T) {
 func TestCarryKeepsAuthorsWhereLinesAreKept(t *testing.T) {
 	old := []string{"func a() {", "\treturn 1", "}", "", "func b() {", "\treturn 2", "}"}
 	m := mapOf(old, []string{"", "s1", "", "", "s2", "s2", "s2"})
-	m.SetCommit(1, "c1")
+	m.MarkCounted(1, "c1")
 
 	cases := []struct {
 		name  string
@@ -174,8 +174,8 @@ func TestCarryKeepsAuthorsWhereLinesAreKept(t *testing.T) {
 
 	t.Run("the commit a line was counted in travels with it", func(t *testing.T) {
 		next, _ := m.Carry(append([]string{"// header"}, old...))
-		if next.CommitOf(2) != "c1" || next.CommitOf(1) != "" {
-			t.Errorf("commit marks after an insert above: %q %q", next.CommitOf(2), next.CommitOf(1))
+		if countedIn(next, 2) != "c1" || countedIn(next, 1) != "" {
+			t.Errorf("commit marks after an insert above: %q %q", countedIn(next, 2), countedIn(next, 1))
 		}
 	})
 
@@ -183,7 +183,7 @@ func TestCarryKeepsAuthorsWhereLinesAreKept(t *testing.T) {
 		before := sessionsOf(m)
 		next, _ := m.Carry(old)
 		next.SetAuthor(0, LineAuthor{EventID: "event-s9", SessionID: "s9"})
-		next.SetCommit(0, "c9")
+		next.MarkCounted(0, "c9")
 		if !reflect.DeepEqual(sessionsOf(m), before) || len(m.Authors) != 2 || len(m.Commits) != 1 {
 			t.Errorf("the source map changed: %q authors=%d commits=%d", sessionsOf(m), len(m.Authors), len(m.Commits))
 		}
@@ -192,14 +192,14 @@ func TestCarryKeepsAuthorsWhereLinesAreKept(t *testing.T) {
 
 func TestSetAuthorStartsALineAfresh(t *testing.T) {
 	m := mapOf([]string{"a", "b"}, []string{"s1", "s1"})
-	m.SetCommit(0, "c1")
+	m.MarkCounted(0, "c1")
 	m.SetAuthor(0, LineAuthor{EventID: "event-s2", SessionID: "s2"})
-	if a, _ := m.AuthorOf(0); a.SessionID != "s2" || m.CommitOf(0) != "" {
-		t.Errorf("rewritten line: author %q commit %q", a.SessionID, m.CommitOf(0))
+	if a, _ := m.AuthorOf(0); a.SessionID != "s2" || countedIn(m, 0) != "" {
+		t.Errorf("rewritten line: author %q commit %q", a.SessionID, countedIn(m, 0))
 	}
 	// Out of range is ignored, not a panic.
 	m.SetAuthor(7, LineAuthor{EventID: "x"})
-	m.SetCommit(-1, "c")
+	m.MarkCounted(-1, "c")
 }
 
 func TestUpdateFileMapMarksLeavesANewerRowAlone(t *testing.T) {
@@ -218,22 +218,22 @@ func TestUpdateFileMapMarksLeavesANewerRowAlone(t *testing.T) {
 	if err := db.SaveFileMap("/repo/f", newer); err != nil {
 		t.Fatal(err)
 	}
-	read.SetCommit(0, "c1")
+	read.MarkCounted(0, "c1")
 	if written, err := db.UpdateFileMapMarks("/repo/f", read); err != nil || written {
 		t.Fatalf("marks written over a newer row: written=%v err=%v", written, err)
 	}
-	if got, _ := db.FileMap("/repo/f"); len(got.Hashes) != 3 || got.CommitOf(0) != "" {
-		t.Errorf("the newer row was changed: %d lines, mark %q", len(got.Hashes), got.CommitOf(0))
+	if got, _ := db.FileMap("/repo/f"); len(got.Hashes) != 3 || countedIn(got, 0) != "" {
+		t.Errorf("the newer row was changed: %d lines, mark %q", len(got.Hashes), countedIn(got, 0))
 	}
 
 	// With the row as it was read, the marks land.
 	again, _ := db.FileMap("/repo/f")
-	again.SetCommit(2, "c2")
+	again.MarkCounted(2, "c2")
 	if written, err := db.UpdateFileMapMarks("/repo/f", again); err != nil || !written {
 		t.Fatalf("marks not written: written=%v err=%v", written, err)
 	}
-	if got, _ := db.FileMap("/repo/f"); got.CommitOf(2) != "c2" {
-		t.Errorf("mark %q, want c2", got.CommitOf(2))
+	if got, _ := db.FileMap("/repo/f"); countedIn(got, 2) != "c2" {
+		t.Errorf("mark %q, want c2", countedIn(got, 2))
 	}
 }
 
@@ -359,5 +359,70 @@ func TestLocalTablesAreNotSynced(t *testing.T) {
 		if err != nil || len(cols) != want[table] {
 			t.Errorf("%s has %d columns (err %v), want %d", table, len(cols), err, want[table])
 		}
+	}
+}
+
+// countedIn is the commits a line was counted in, as one string.
+func countedIn(m FileMap, i int) string { return strings.Join(m.CountedIn(i), " ") }
+
+func TestALineRemembersTheCommitsThatCountedIt(t *testing.T) {
+	m := mapOf([]string{"a", "b"}, []string{"s1", "s1"})
+	if !m.MarkCounted(0, "c1") || m.MarkCounted(0, "c1") {
+		t.Error("marking a line counted: the first time is news, the second is not")
+	}
+	// A cherry-pick counts the line on another branch: both are remembered.
+	m.MarkCounted(0, "c2")
+	if got := countedIn(m, 0); got != "c1 c2" {
+		t.Errorf("counted in %q, want both commits", got)
+	}
+	if got := countedIn(m, 1); got != "" {
+		t.Errorf("the other line is counted in %q", got)
+	}
+	// Lines counted in the same commits share one entry.
+	m.MarkCounted(1, "c1")
+	m.MarkCounted(1, "c2")
+	if len(m.Commits) != 2 {
+		t.Errorf("%d entries, want the 2 the first line made (c1; c1 c2)", len(m.Commits))
+	}
+	// Only the newest few are kept.
+	for _, sha := range []string{"c3", "c4", "c5", "c6"} {
+		m.MarkCounted(0, sha)
+	}
+	if got := countedIn(m, 0); got != "c3 c4 c5 c6" {
+		t.Errorf("after six commits the line remembers %q, want the last %d", got, maxCountMarks)
+	}
+	// The marks survive a save, and a line written anew has none.
+	db := newTestDB(t)
+	m.AsOf = time.Now()
+	if err := db.SaveFileMap("/repo/marks.go", m); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := db.FileMap("/repo/marks.go")
+	if !ok || countedIn(got, 0) != "c3 c4 c5 c6" || countedIn(got, 1) != "c1 c2" {
+		t.Errorf("read back: %q and %q", countedIn(got, 0), countedIn(got, 1))
+	}
+	got.SetAuthor(0, LineAuthor{EventID: "e9", SessionID: "s9"})
+	if countedIn(got, 0) != "" {
+		t.Errorf("a rewritten line is still counted in %q", countedIn(got, 0))
+	}
+}
+
+func TestAnEventThatBeganAfterTheCommit(t *testing.T) {
+	x := newContentMatcher(nil, commitRow{committedAt: "2026-11-14T10:00:05-08:00"}, nil)
+	for from, want := range map[string]bool{
+		"":                               false, // not known when it began
+		"2026-11-14T18:00:04.9Z":         false, // before the commit
+		"2026-11-14T18:00:05.999999999Z": false, // in the commit's own second
+		"2026-11-14T18:00:06Z":           true,
+		"2026-11-15T09:00:00+01:00":      true,
+		"not a time":                     false,
+	} {
+		if got := x.beganAfter(LineAuthor{EventID: "e", From: from}); got != want {
+			t.Errorf("an event that began at %q: after the commit = %v, want %v", from, got, want)
+		}
+	}
+	undated := newContentMatcher(nil, commitRow{}, nil)
+	if undated.beganAfter(LineAuthor{From: "2026-11-14T18:00:06Z"}) {
+		t.Error("a commit with no time on record rules an event out")
 	}
 }

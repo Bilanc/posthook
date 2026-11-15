@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bilanc/posthook/internal/lineranges"
 	"github.com/bilanc/posthook/internal/store"
@@ -67,9 +68,16 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor) e
 		match := lineranges.AlignHashes(mine, theirs)
 		for _, r := range fc.authored {
 			for n := r.StartLine; n <= r.EndLine; n++ {
-				if n >= 1 && n <= len(match) && match[n-1] >= 0 {
-					prev.SetAuthor(match[n-1], author)
+				if n < 1 || n > len(match) || match[n-1] < 0 {
+					continue
 				}
+				// A line that an event which began after this one fired has
+				// written stays that event's: it wrote the line last,
+				// whatever order the two arrived in.
+				if was, ok := prev.AuthorOf(match[n-1]); ok && beganAfter(was, author) {
+					continue
+				}
+				prev.SetAuthor(match[n-1], author)
 			}
 		}
 		return db.SaveFileMap(fc.path, prev)
@@ -86,6 +94,17 @@ func (fc *fileCapture) updateAuthorship(db *store.DB, author store.LineAuthor) e
 		}
 	}
 	return db.SaveFileMap(fc.path, next)
+}
+
+// beganAfter reports whether the event a began after the event b, as far as
+// both say when they began (store.LineAuthor.From).
+func beganAfter(a, b store.LineAuthor) bool {
+	if a.From == "" || b.From == "" {
+		return false
+	}
+	at, errA := time.Parse(time.RFC3339Nano, a.From)
+	bt, errB := time.Parse(time.RFC3339Nano, b.From)
+	return errA == nil && errB == nil && at.After(bt)
 }
 
 // seedAuthors gives a snapshot from before the authorship map the authors
