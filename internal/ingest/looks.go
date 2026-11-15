@@ -57,8 +57,9 @@ import (
 //   - The first look at a repository credits nothing: there is no earlier
 //     look to say what was already there. Nor does the first look after one
 //     that could not be made (git did not answer), or after a long gap. And
-//     after a look that could not read every changed file (more than
-//     maxLookFiles), a file with no map is recorded and not credited.
+//     after a look that did not get to every changed file (its time ran
+//     out), a file with no map is recorded and not credited, and neither is
+//     a file last changed before that look ran: it was that look's to see.
 //   - Whenever git cannot say what the base version of a file is, the file
 //     is recorded and not credited. A base version too large to keep a map
 //     for (store.MaxSnapshotBytes) is not read, and counts as unknown.
@@ -108,14 +109,11 @@ const (
 	// the map has it is marked as seen, so it does not expire while the
 	// file stays that way.
 	mapRefresh = 24 * time.Hour
-	// maxLookFiles bounds the changed files one look reads, and
-	// maxLookDirs the untracked directories it lists the files of.
+	// maxLookFiles bounds the changed files a look holds in memory at a
+	// time (it settles them in batches of that many), and maxLookDirs the
+	// untracked directories it lists the files of.
 	maxLookFiles = 200
 	maxLookDirs  = 50
-	// writtenSlack is how much older than its map a file's modification
-	// time has to be for the file to count as not written since: file
-	// systems keep that time to different precisions.
-	writtenSlack = 2 * time.Second
 	// reflogDepth bounds how far back a look reads HEAD's reflog.
 	reflogDepth = 200
 )
@@ -133,6 +131,11 @@ var lookBudget = 2 * time.Second
 // readLookContent reads a changed file. A variable so a test can count the
 // reads.
 var readLookContent = os.ReadFile
+
+// writtenSlack is how much older than its map a file's last change has to be
+// for the file to count as not written since: file systems keep that time
+// to different precisions. A variable so a test need not wait as long.
+var writtenSlack = 2 * time.Second
 
 // queueLooks queues the looks an event calls for: one per repository after a
 // shell tool call, one for the session's repository when a prompt is
@@ -305,6 +308,9 @@ type lookFile struct {
 	prev      store.FileMap
 	found     bool
 	blob      string
+	// changedAt is when the file last changed on disk, when that is known.
+	changedAt   time.Time
+	changeKnown bool
 
 	// What the look credited its event in this file.
 	credited []int    // 1-based line numbers
@@ -377,9 +383,67 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 		}
 	}
 
-	// Read what changed.
+	// Read what changed, and settle it a batch at a time so that a command
+	// that changed thousands of files does not have them all in memory.
 	partial := status.partial
-	var files []*lookFile
+	changed := map[string]bool{}
+	var batch []*lookFile
+	settle := func() {
+		if len(batch) == 0 {
+			return
+		}
+		names := make([]string, len(batch))
+		for i, lf := range batch {
+			names[i] = lf.rel
+		}
+		baseContent, answered := blobsAt(root, base, names)
+		// New files that are in git nowhere at their path: copied or moved
+		// from a file of the base commit, or written just now.
+		var copied map[string]bool
+		if credit {
+			var fresh []string
+			for _, lf := range batch {
+				if _, inGit := baseContent[lf.rel]; answered[lf.rel] && !inGit && !lf.found {
+					fresh = append(fresh, lf.blob)
+				}
+			}
+			if len(fresh) > 0 {
+				copied = blobsInTree(root, base, fresh)
+			}
+		}
+		for _, lf := range batch {
+			baseLines, inGit := baseContent[lf.rel]
+			fileCredit := credit && answered[lf.rel]
+			if fileCredit && prev.Partial {
+				// The last look did not get to every changed file. A file
+				// with no map was unchanged at the last look only if that
+				// look saw everything. A map made since this look's command
+				// ran (by an edit handled just before) says nothing about
+				// the time before it, unless it holds lines for this look:
+				// the edit held them against the map the file had before
+				// (updateAuthorship holds nothing in a file that had none
+				// after such a look). And a file last changed before that
+				// look ran was that look's to see: whoever changed it, it
+				// was not the command being looked at now.
+				mapFromBefore := lf.found && (!lf.prev.AsOf.After(look.FiredAt) || holdsFor(lf.prev, look.EventID))
+				changedSince := lf.changeKnown && lf.changedAt.After(prev.LookedAt)
+				fileCredit = mapFromBefore && changedSince
+			}
+			if fileCredit && !inGit && !lf.found && (copied == nil || copied[lf.blob]) {
+				// The whole file is content the base commit already holds
+				// (or git could not say): nobody wrote it.
+				fileCredit = false
+			}
+			lookAtFile(db, look, lf, baseLines, inGit, fileCredit)
+			if lf.changed {
+				changed[lf.rel] = true
+			}
+		}
+		if look.Kind == store.LookShell {
+			creditLook(db, look, batch)
+		}
+		batch = nil
+	}
 	seen := map[string]bool{}
 	holds := map[string]bool{}
 	for _, path := range look.Files {
@@ -391,11 +455,6 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 			continue
 		}
 		seen[rel] = true
-		if len(files) == maxLookFiles {
-			logx.Debugf("look: more than %d changed files in %s, the rest are not read", maxLookFiles, root)
-			partial = true
-			break
-		}
 		if time.Since(began) > lookBudget {
 			logx.Debugf("look: no time left for the rest of the changed files in %s", root)
 			partial = true
@@ -406,53 +465,11 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 			continue
 		}
 		visited[lf.path] = true
-		files = append(files, lf)
-	}
-
-	if len(files) > 0 {
-		names := make([]string, len(files))
-		for i, lf := range files {
-			names[i] = lf.rel
-		}
-		baseContent, answered := blobsAt(root, base, names)
-		// New files that are in git nowhere at their path: copied or moved
-		// from a file of the base commit, or written just now.
-		var copied map[string]bool
-		if credit {
-			var fresh []string
-			for _, lf := range files {
-				if _, inGit := baseContent[lf.rel]; answered[lf.rel] && !inGit && !lf.found {
-					fresh = append(fresh, lf.blob)
-				}
-			}
-			if len(fresh) > 0 {
-				copied = blobsInTree(root, base, fresh)
-			}
-		}
-		for _, lf := range files {
-			baseLines, inGit := baseContent[lf.rel]
-			fileCredit := credit && answered[lf.rel]
-			// A file with no map was unchanged at the last look, unless that
-			// look could not read everything that had changed. A map made
-			// since this look's command ran (by an edit handled just before)
-			// says nothing about the time before it, unless it holds lines
-			// for this look: the edit held them against the map the file had
-			// before (updateAuthorship holds nothing in a file that had none
-			// after such a look).
-			if fileCredit && prev.Partial && !(lf.found && (!lf.prev.AsOf.After(look.FiredAt) || holdsFor(lf.prev, look.EventID))) {
-				fileCredit = false
-			}
-			if fileCredit && !inGit && !lf.found && (copied == nil || copied[lf.blob]) {
-				// The whole file is content the base commit already holds
-				// (or git could not say): nobody wrote it.
-				fileCredit = false
-			}
-			lookAtFile(db, look, lf, baseLines, inGit, fileCredit)
-		}
-		if look.Kind == store.LookShell {
-			creditLook(db, look, files)
+		if batch = append(batch, lf); len(batch) == maxLookFiles {
+			settle()
 		}
 	}
+	settle()
 
 	if err := db.SaveRepoLook(root, store.RepoLook{Head: status.head, LookedAt: now, Partial: partial}); err != nil {
 		logx.Warnf("look: recording the look at %s failed: %v", root, err)
@@ -460,12 +477,6 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 
 	// A commit made since the last look can hold lines this look has only
 	// now given an author (a script and `git commit` in one command).
-	changed := map[string]bool{}
-	for _, lf := range files {
-		if lf.changed {
-			changed[lf.rel] = true
-		}
-	}
 	since := look.FiredAt.Add(-10 * time.Minute)
 	if looked {
 		since = prev.LookedAt
@@ -479,7 +490,8 @@ func runLook(db *store.DB, look store.PendingLook, now time.Time) {
 //
 // A file that stays changed for a long time (a local config, a directory of
 // scratch files) is listed by git at every look. It is read once: after
-// that, as long as it has not been written since its map was made, it is
+// that, as long as it has not changed since its map was made (changedAt,
+// not the modification time, which a copy or a move can carry over), it is
 // not opened again. holds are the paths that keep lines for this look, which
 // are always read.
 func readLookFile(db *store.DB, root, rel string, look store.PendingLook, holds map[string]bool) *lookFile {
@@ -489,14 +501,21 @@ func readLookFile(db *store.DB, root, rel string, look store.PendingLook, holds 
 	if err != nil || !info.Mode().IsRegular() || info.Size() > store.MaxSnapshotBytes {
 		return nil
 	}
-	if look.Kind == store.LookPrompt && info.ModTime().After(look.FiredAt) {
+	changed, changeKnown := changedAt(info)
+	if !changeKnown {
+		changed = info.ModTime()
+	}
+	if look.Kind == store.LookPrompt && changed.After(look.FiredAt) {
 		// Changed after the prompt was submitted, so not by a person between
 		// turns: the worker got to the prompt late. The next look takes it.
 		return nil
 	}
+	// notWrittenSince: the file last changed well before the instant at.
+	notWrittenSince := func(at time.Time) bool {
+		return changeKnown && changed.Add(writtenSlack).Before(at)
+	}
 	if !holds[path] {
-		if seen, authored, ok := db.FileMapSeen(path); ok && authored &&
-			info.ModTime().Add(writtenSlack).Before(seen) && time.Since(seen) <= mapRefresh {
+		if seen, authored, ok := db.FileMapSeen(path); ok && authored && notWrittenSince(seen) && time.Since(seen) <= mapRefresh {
 			return nil
 		}
 	}
@@ -504,16 +523,18 @@ func readLookFile(db *store.DB, root, rel string, look store.PendingLook, holds 
 	if err != nil || bytes.IndexByte(content[:min(len(content), 8000)], 0) >= 0 {
 		return nil
 	}
-	lf := &lookFile{rel: rel, path: path, content: content, readAt: time.Now(), blob: gitBlobID(string(content))}
+	lf := &lookFile{rel: rel, path: path, content: content, readAt: time.Now(), blob: gitBlobID(string(content)),
+		changedAt: changed, changeKnown: changeKnown}
 	lf.prev, lf.found = db.FileMap(path)
 	if lf.found && lf.prev.HasAuthors() && lf.prev.Blob == lf.blob && !holdsFor(lf.prev, look.EventID) {
 		// Exactly as the map has it. A file that stays changed for weeks
 		// (a local config, a scratch file) must not lose its map to the
 		// expiry of untouched rows: without it the file would look new.
 		// And a map made right after the file was written is brought up to
-		// now, so the next look can tell from the file's modification time
-		// that it need not read it.
-		if lf.readAt.Sub(lf.prev.AsOf) > mapRefresh || !info.ModTime().Add(writtenSlack).Before(lf.prev.AsOf) {
+		// now, once the file has been left alone for long enough to tell:
+		// the next look then sees from when the file last changed that it
+		// need not read it.
+		if lf.readAt.Sub(lf.prev.AsOf) > mapRefresh || (!notWrittenSince(lf.prev.AsOf) && notWrittenSince(lf.readAt)) {
 			lf.prev.AsOf = lf.readAt
 			_ = db.SaveFileMap(path, lf.prev)
 		}

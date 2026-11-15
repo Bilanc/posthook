@@ -980,18 +980,10 @@ func TestALookThatCannotReadEverythingIsNotTrustedForUnseenFiles(t *testing.T) {
 	openDB(t)
 	repo, _, path, content := lookRepo(t, home, "look-partial")
 	const session = "look-partial"
-	// The engineer has more files changed than one look reads, cfg.ini among
-	// the ones it does not get to (names sort before it).
-	for i := 0; i < maxLookFiles+5; i++ {
-		writeFile(t, filepath.Join(repo, "a", fmt.Sprintf("f%03d.txt", i)), "by hand\n")
-	}
-	gitOut(t, repo, "add", "-A")
+	// The engineer has changed a line of cfg.ini by hand, and the look at
+	// the start of the turn runs out of time before it gets to the file.
 	writeFile(t, path, strings.Replace(content, "k1 = old", "k1 = by hand", 1))
-	promptSubmitted(t, session, repo)
-	look, ok := openDB(t).RepoLook(gitx.Canonicalize(repo))
-	if !ok || !look.Partial {
-		t.Fatalf("test setup: the prompt's look read everything (%+v)", look)
-	}
+	promptWithNoTime(t, session, repo)
 
 	// A script now changes another line of cfg.ini. Whether the prompt's
 	// look saw the file or not, the hand-written line must not be credited.
@@ -1066,6 +1058,9 @@ func TestLooksAgainstWeakEvidence(t *testing.T) {
 	t.Run("lines that appear after an edit are not held for a command that ended before it", func(t *testing.T) { testHeldLinesSkipEarlierCommands(t, home) })
 	t.Run("a changed file that has not been written since it was looked at is not read again", func(t *testing.T) { testUnchangedFilesAreNotReadAgain(t, home) })
 	t.Run("a look that runs out of time leaves the rest for later, uncredited", func(t *testing.T) { testLookRunsOutOfTime(t, home) })
+	t.Run("a file a look did not get to is not a later command's", func(t *testing.T) { testSkippedFileIsNotALaterCommands(t, home) })
+	t.Run("a file replaced with its old modification time is still seen to have changed", func(t *testing.T) { testReplacedFileWithOldTimestamp(t, home) })
+	t.Run("a script that changes more files than are held at once is credited for all of them", func(t *testing.T) { testManyFilesInOneLook(t, home) })
 }
 
 func testCopyAndMove(t *testing.T, home string) {
@@ -1607,14 +1602,15 @@ func TestRunLookBlobsStopsAtALargeFile(t *testing.T) {
 	}
 }
 
-// manyChangedFiles leaves a repository with more changed files than one look
-// reads, all sorting before cfg.ini.
-func manyChangedFiles(t *testing.T, repo string) {
+// promptWithNoTime submits a prompt whose look has no time to examine any
+// file: a look that did not see everything that had changed.
+func promptWithNoTime(t *testing.T, session, repo string) {
 	t.Helper()
-	for i := 0; i < maxLookFiles+5; i++ {
-		writeFile(t, filepath.Join(repo, "a", fmt.Sprintf("f%03d.txt", i)), "by hand\n")
-	}
-	gitOut(t, repo, "add", "-A")
+	saved := lookBudget
+	lookBudget = -time.Second
+	promptSubmitted(t, session, repo)
+	lookBudget = saved
+	wantPartialLook(t, repo)
 }
 
 func wantPartialLook(t *testing.T, repo string) {
@@ -1631,10 +1627,8 @@ func testPartialLookThenScriptAndEdit(t *testing.T, home string) {
 	withEdit, first := insertPayload(editor, path, content, 8, "e0 = new")
 	writeFile(t, path, withEdit)
 	deliverAt(t, "claude-code", repo, first, time.Now().Add(-time.Minute))
-	// The engineer has more files changed than one look reads.
-	manyChangedFiles(t, repo)
-	promptSubmitted(t, script, repo)
-	wantPartialLook(t, repo)
+	// The look at the start of the turn does not get to every changed file.
+	promptWithNoTime(t, script, repo)
 
 	// A script changes one line of cfg.ini; right after, an edit inserts
 	// three. The edit is handled first and holds the script's line for the
@@ -1654,13 +1648,11 @@ func testPartialLookThenScriptAndEdit(t *testing.T, home string) {
 func testPartialLookHoldsNothingWithoutAMap(t *testing.T, home string) {
 	repo, _, path, content := lookRepo(t, home, "weak-partial-nomap")
 	const script, editor = "weak-partial-nomap-script", "weak-partial-nomap-edit"
-	// More files are changed than one look reads, and cfg.ini, with a line
-	// changed by hand, is among the ones the look does not get to.
-	manyChangedFiles(t, repo)
+	// cfg.ini has a line changed by hand, and the look at the start of the
+	// turn does not get to the file.
 	byHand := strings.Replace(content, "k1 = old", "k1 = by hand", 1)
 	writeFile(t, path, byHand)
-	promptSubmitted(t, script, repo)
-	wantPartialLook(t, repo)
+	promptWithNoTime(t, script, repo)
 
 	// A script changes another line; right after, an edit inserts three and
 	// is handled first. The file had no map: nothing says the hand-written
@@ -1783,15 +1775,12 @@ func testHeldLinesSkipEarlierCommands(t *testing.T, home string) {
 func testUnchangedFilesAreNotReadAgain(t *testing.T, home string) {
 	repo, _, path, content := lookRepo(t, home, "weak-reread")
 	const session = "weak-reread"
-	// The working tree has thirty changed files that have been that way for
-	// an hour.
-	hourAgo := time.Now().Add(-time.Hour)
+	savedSlack := writtenSlack
+	writtenSlack = time.Second
+	defer func() { writtenSlack = savedSlack }()
+	// The working tree has thirty changed files, which stay as they are.
 	for i := 0; i < 30; i++ {
-		name := filepath.Join(repo, "scratch", fmt.Sprintf("s%02d.txt", i))
-		writeFile(t, name, fmt.Sprintf("scratch %d\n", i))
-		if err := os.Chtimes(name, hourAgo, hourAgo); err != nil {
-			t.Fatal(err)
-		}
+		writeFile(t, filepath.Join(repo, "scratch", fmt.Sprintf("s%02d.txt", i)), fmt.Sprintf("scratch %d\n", i))
 	}
 	promptSubmitted(t, session, repo)
 
@@ -1802,14 +1791,29 @@ func testUnchangedFilesAreNotReadAgain(t *testing.T, home string) {
 		return saved(name)
 	}
 	defer func() { readLookContent = saved }()
-
-	// A command that changes nothing reads none of them again.
-	shellRan(t, session, repo, "ls")
-	settleLooks(t)
-	if reads != 0 {
-		t.Errorf("a look after a command that changed nothing read %d file(s), want none", reads)
+	// looksReading runs a command that changes nothing and says how many
+	// files its look read.
+	looksReading := func() int {
+		t.Helper()
+		reads = 0
+		shellRan(t, session, repo, "ls")
+		settleLooks(t)
+		return reads
 	}
-	// One that changes two files reads those two, and is credited for them.
+
+	// They were written a moment before they were first looked at, too
+	// close to tell whether they changed since. The next look reads them
+	// once more, finds them as they were, and from then on leaves them.
+	time.Sleep(writtenSlack + 100*time.Millisecond)
+	if got := looksReading(); got != 30 {
+		t.Errorf("the second look read %d file(s), want the 30 once more", got)
+	}
+	if got := looksReading(); got != 0 {
+		t.Errorf("a later look read %d file(s), want none", got)
+	}
+
+	// A command that changes two files has those two read, and is credited
+	// for them.
 	reads = 0
 	writeFile(t, path, scripted(content, "k2"))
 	writeFile(t, filepath.Join(repo, "scratch", "s07.txt"), "scratch 7\nscripted\n")
@@ -1819,22 +1823,12 @@ func testUnchangedFilesAreNotReadAgain(t *testing.T, home string) {
 		t.Errorf("a look after a command that changed two files read %d file(s), want 2", reads)
 	}
 	wantGenerated(t, session, 2)
-
-	// Those two were written a moment before they were looked at, too
-	// close to tell from their modification times. The next look reads them
-	// once more, finds them as they were, and from then on leaves them.
 	time.Sleep(writtenSlack + 100*time.Millisecond)
-	reads = 0
-	shellRan(t, session, repo, "ls")
-	settleLooks(t)
-	if reads != 2 {
-		t.Errorf("the look after that read %d file(s), want the same 2 once more", reads)
+	if got := looksReading(); got != 2 {
+		t.Errorf("the look after that read %d file(s), want the same 2 once more", got)
 	}
-	reads = 0
-	shellRan(t, session, repo, "ls")
-	settleLooks(t)
-	if reads != 0 {
-		t.Errorf("a later look read %d file(s), want none", reads)
+	if got := looksReading(); got != 0 {
+		t.Errorf("a later look read %d file(s), want none", got)
 	}
 	wantGenerated(t, session, 2)
 }
@@ -1863,4 +1857,88 @@ func testLookRunsOutOfTime(t *testing.T, home string) {
 	shellRan(t, session, repo, scriptCommand)
 	settleLooks(t)
 	wantGenerated(t, session, 1)
+}
+
+func testSkippedFileIsNotALaterCommands(t *testing.T, home string) {
+	repo, _, path, content := lookRepo(t, home, "weak-skipped")
+	const session, editor = "weak-skipped", "weak-skipped-edit"
+	// cfg.ini has a map: an edit put a line into it a minute ago.
+	withEdit, first := insertPayload(editor, path, content, 8, "e0 = new")
+	writeFile(t, path, withEdit)
+	deliverAt(t, "claude-code", repo, first, time.Now().Add(-time.Minute))
+	promptSubmitted(t, session, repo)
+
+	// A generator changes a line of it, and its look runs out of time
+	// before it gets to the file.
+	writeFile(t, path, scripted(withEdit, "k2"))
+	saved := lookBudget
+	lookBudget = -time.Second
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	lookBudget = saved
+	wantPartialLook(t, repo)
+	wantGenerated(t, session, 0)
+
+	// The next command changes nothing. Its look gets to the file, which
+	// was changed before the last look ran: whoever changed it, it was not
+	// this command.
+	shellRan(t, session, repo, "ls")
+	settleLooks(t)
+	if got := generatedByCommand(t, session, "ls"); got != 0 {
+		t.Errorf("a command that changed nothing is credited %d line(s) of a file the look before did not get to", got)
+	}
+	wantGenerated(t, session, 0)
+
+	// The file is on record as it stands, and a change made from now on is
+	// credited as always.
+	writeFile(t, path, scripted(withEdit, "k2", "k5"))
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	wantGenerated(t, session, 1)
+}
+
+func testReplacedFileWithOldTimestamp(t *testing.T, home string) {
+	repo, _, _, _ := lookRepo(t, home, "weak-old-mtime")
+	const session = "weak-old-mtime"
+	// A changed file posthook has on record, last modified an hour ago.
+	generated := filepath.Join(repo, "generated.txt")
+	hourAgo := time.Now().Add(-time.Hour)
+	writeFile(t, generated, "a = 1\nb = 2\n")
+	if err := os.Chtimes(generated, hourAgo, hourAgo); err != nil {
+		t.Fatal(err)
+	}
+	promptSubmitted(t, session, repo)
+
+	// A script replaces it the way `cp -p`, `mv` or `rsync -a` do: new
+	// content under the old modification time.
+	writeFile(t, generated, "a = 1\nb = 2\nc = 3\n")
+	if err := os.Chtimes(generated, hourAgo, hourAgo); err != nil {
+		t.Fatal(err)
+	}
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	wantGenerated(t, session, 1)
+}
+
+func testManyFilesInOneLook(t *testing.T, home string) {
+	repo, _, _, _ := lookRepo(t, home, "weak-many")
+	const session = "weak-many"
+	// More tracked files than a look holds in memory at once.
+	const n = maxLookFiles + 5
+	for i := 0; i < n; i++ {
+		writeFile(t, filepath.Join(repo, "gen", fmt.Sprintf("g%03d.txt", i)), "v = old\n")
+	}
+	commitAll(t, repo, "add generated files")
+	promptSubmitted(t, session, repo)
+
+	// A script adds a line to every one of them.
+	for i := 0; i < n; i++ {
+		writeFile(t, filepath.Join(repo, "gen", fmt.Sprintf("g%03d.txt", i)), "v = old\nscripted = 1\n")
+	}
+	shellRan(t, session, repo, scriptCommand)
+	settleLooks(t)
+	wantGenerated(t, session, n)
+	if look, ok := openDB(t).RepoLook(gitx.Canonicalize(repo)); !ok || look.Partial {
+		t.Errorf("the look did not see everything (%+v)", look)
+	}
 }
