@@ -854,9 +854,19 @@ func testCatchUpRemovesStaleNote(t *testing.T, home string) {
 		t.Fatal(err)
 	}
 	// Recorded alone, the second commit is the first one posthook knows on
-	// this file, and its note claims the agent's ranges.
-	if !hasNote(repo, second) {
-		t.Fatal("test setup: the second commit has no note before the first is recorded")
+	// this file. It adds one line, typed by hand, so it is credited nothing
+	// and gets no note.
+	if hasNote(repo, second) {
+		t.Fatal("a commit that is credited nothing has a note")
+	}
+	// An earlier release wrote one here all the same, from the ranges of the
+	// edits made before the commit, and it claims the agent's lines.
+	stale := `{"v":1,"commit":"` + second + `","files":{"n.txt":[{"lines":"1-5","agent":"claude-code","session":"note-1","ts":"2026-11-01T10:00:00Z"}]}}`
+	cmd := exec.Command("git", "notes", "--ref="+paths.NotesRef, "add", "-f", "-F", "-", second)
+	cmd.Dir = repo
+	cmd.Stdin = strings.NewReader(stale)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git notes add: %v: %s", err, out)
 	}
 
 	sweep(t, repo)

@@ -52,6 +52,11 @@ type LineAuthor struct {
 	// From does not hold the event's work, and of two events the one with
 	// the later From wrote a line last.
 	From string `json:"f,omitempty"`
+	// Held marks a line that is kept for a shell tool call whose look at the
+	// working tree is still due (looks.go): the line appeared after the
+	// command ran and before posthook looked. Until that look confirms it,
+	// the line counts as nobody's.
+	Held bool `json:"h,omitempty"`
 }
 
 // FileMap is one file's authorship map.
@@ -84,12 +89,40 @@ type FileMap struct {
 // row written before v17, whatever its lines.
 func (m FileMap) HasAuthors() bool { return m.Owner != nil }
 
-// AuthorOf returns the author of line i (0-based).
+// AuthorOf returns the author of line i (0-based). A line that is only held
+// for a look that is still due has none.
 func (m FileMap) AuthorOf(i int) (LineAuthor, bool) {
+	a, ok := m.authorEntry(i)
+	if !ok || a.Held {
+		return LineAuthor{}, false
+	}
+	return a, true
+}
+
+// HeldFor returns the event line i (0-based) is held for, if it is.
+func (m FileMap) HeldFor(i int) (LineAuthor, bool) {
+	a, ok := m.authorEntry(i)
+	if !ok || !a.Held {
+		return LineAuthor{}, false
+	}
+	return a, true
+}
+
+func (m FileMap) authorEntry(i int) (LineAuthor, bool) {
 	if i < 0 || i >= len(m.Owner) || m.Owner[i] <= 0 || m.Owner[i] > len(m.Authors) {
 		return LineAuthor{}, false
 	}
 	return m.Authors[m.Owner[i]-1], true
+}
+
+// ClearAuthor leaves line i (0-based) with no author.
+func (m *FileMap) ClearAuthor(i int) {
+	if i >= 0 && i < len(m.Owner) {
+		m.Owner[i] = 0
+		if i < len(m.Commit) {
+			m.Commit[i] = 0
+		}
+	}
 }
 
 // CountedIn returns the shas of the commits line i (0-based) was counted in,
@@ -109,7 +142,7 @@ func (m *FileMap) SetAuthor(i int, author LineAuthor) {
 	}
 	at := -1
 	for k, a := range m.Authors {
-		if a.EventID == author.EventID {
+		if a.EventID == author.EventID && a.Held == author.Held {
 			at = k
 			break
 		}
@@ -338,6 +371,19 @@ func (db *DB) FileMap(path string) (FileMap, bool) {
 		}
 	}
 	return m, true
+}
+
+// FileMapSeen says, without reading the map, when the file at path was last
+// seen (FileMap.AsOf) and whether its map carries authorship.
+func (db *DB) FileMapSeen(path string) (asOf time.Time, authored, ok bool) {
+	var at string
+	if err := db.QueryRow(`
+		SELECT updated_at, line_owners IS NOT NULL AND length(line_owners) > 0
+		FROM file_snapshots WHERE file_path = ?`, path).Scan(&at, &authored); err != nil {
+		return time.Time{}, false, false
+	}
+	asOf, err := time.Parse(time.RFC3339Nano, at)
+	return asOf, authored, err == nil
 }
 
 // SaveFileMap records m as the state of path.

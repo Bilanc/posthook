@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,14 @@ import (
 var editTools = map[string]bool{
 	"Edit": true, "Write": true, "MultiEdit": true,
 }
+
+// promptsFromTranscript are the agents that send a prompt-submit hook and
+// whose typed prompts are read from their transcript when a turn ends. The
+// hook from one of them marks the start of a turn and nothing more: its
+// prompt text is dropped at ingest. Storing it as well would number the
+// session's prompts twice, once by arrival and once by position in the
+// transcript.
+var promptsFromTranscript = map[string]bool{"claude-code": true}
 
 // Devin's tool names are lowercase but carry the same tool_input shape as
 // Claude Code's, so they map straight onto the canonical line-range tools.
@@ -265,6 +274,20 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		capture.score(db, sessionID)
 	}
 
+	// A prompt-submit event from an agent whose prompts are read from its
+	// transcript is kept as a marker only: when a turn began. The prompt it
+	// carries is not stored here, so registering the hook creates no second
+	// place where prompt text lives (the transcript copy lands in
+	// session_prompts at Stop, as it always has).
+	if eventType == "UserPromptSubmit" && promptsFromTranscript[agentSlug] {
+		if _, has := payload["prompt"]; has {
+			delete(payload, "prompt")
+			if without, err := json.Marshal(payload); err == nil {
+				raw = without
+			}
+		}
+	}
+
 	// Store the trimmed payload: tool output (file contents, command output,
 	// images) is dropped and oversized strings are capped. Everything the
 	// prompt and transcript extraction below needs is read from the full
@@ -287,23 +310,49 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	logx.Debugf("ingested %s event %s (session=%s, payload %d bytes, dropped %d)", agentSlug, eventType, sessionID, len(stored), droppedBytes)
 
 	// Line ranges and capture state. Fail-soft: never block ingest on these.
+	author := store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}
+	lookRoots := []string{repoRoot}
+	if cwd != "" {
+		lookRoots = append(lookRoots, gitx.FindRepoRoot(cwd))
+	}
 	if capture != nil {
-		author := store.LineAuthor{EventID: id, SessionID: sessionID, Agent: agentSlug, TS: ts}
+		writer := author
 		if firedKnown && len(shellWrites) == 0 {
 			// An edit tool's hook fires just after it has written. A shell
 			// command's fires when the command ends, so when it wrote is
 			// not known.
-			author.From = firedAt.Add(-hookDelay).UTC().Format(time.RFC3339Nano)
+			writer.From = firedAt.Add(-hookDelay).UTC().Format(time.RFC3339Nano)
 		}
-		if err := capture.store(db, author); err != nil {
+		if err := capture.store(db, writer, firedAt); err != nil {
 			logx.Warnf("line-range capture failed: %v", err)
 		}
+		// A commit made after this edit and before the worker got to it was
+		// attributed without it. The edit was written a moment before its
+		// hook fired, so that goes for a commit made in that moment too.
+		edited := map[string]map[string]bool{}
+		for i := range capture.files {
+			fc := &capture.files[i]
+			if !fc.countable || !fc.rel.Valid {
+				continue
+			}
+			lookRoots = append(lookRoots, fc.root)
+			if edited[fc.root] == nil {
+				edited[fc.root] = map[string]bool{}
+			}
+			edited[fc.root][fc.rel.String] = true
+		}
+		for root, rels := range edited {
+			reattributeRecentCommits(db, root, rels, firedAt.Add(-hookDelay))
+		}
 	}
+	// Edits no payload describes are found by looking at the repository
+	// once the worker has caught up (looks.go).
+	queueLooks(db, eventType, agentSlug, payload, author, lookRoots, firedAt)
 
 	// Cursor's beforeSubmitPrompt and Devin's UserPromptSubmit hooks carry the
 	// typed prompt directly — neither exposes a readable transcript on Stop, so
 	// this is the only moment the prompt is available.
-	if (eventType == "beforeSubmitPrompt" || eventType == "UserPromptSubmit") && sessionID != "" {
+	if (eventType == "beforeSubmitPrompt" || eventType == "UserPromptSubmit") && sessionID != "" && !promptsFromTranscript[agentSlug] {
 		if promptText := pickString(payload, "prompt"); promptText != "" {
 			if err := db.AppendHookPrompt(sessionID, agentSlug, ts, promptText); err != nil {
 				logx.Warnf("prompt capture failed: %v", err)
@@ -594,79 +643,70 @@ func attributeCarrying(db *store.DB, repoRoot, repoID, sha, commitID string, car
 	}
 }
 
+// noteEntry is one run of AI-written lines in a git note.
+type noteEntry struct {
+	Lines   string `json:"lines"`
+	Agent   string `json:"agent"`
+	Session string `json:"session,omitempty"`
+	Model   string `json:"model,omitempty"`
+	TS      string `json:"ts"`
+}
+
+// noteV2 marks a note whose every line range is exact: the lines the commit
+// is credited with, in the commit's own line numbers. A v1 note lists the
+// ranges agent edits were recorded at before the commit, which are where the
+// lines were when they were written. Both have the same shape, and a reader
+// matches both the same way, by a line's number in the commit that
+// introduced it; a v2 note is simply right where a v1 note can be off.
+const (
+	noteV1 = 1
+	noteV2 = 2
+)
+
+// writeNoteForCommit writes the commit's git note from what it has just been
+// attributed.
+//
+// A file whose attributed lines are on record (commit_ai_lines) is written
+// from that record, one entry per run of consecutive lines. A file that was
+// matched by position with no record is written, as before, from the line
+// ranges of the edits in the commit's window.
 func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, carried []string, hadNote bool) error {
 	var committedAt string
 	if err := db.QueryRow(`SELECT committed_at FROM commits WHERE id = ?`, commitID).Scan(&committedAt); err != nil {
 		return err
 	}
-	type entry struct {
-		Lines   string `json:"lines"`
-		Agent   string `json:"agent"`
-		Session string `json:"session,omitempty"`
-		Model   string `json:"model,omitempty"`
-		TS      string `json:"ts"`
-	}
-	files := map[string][]entry{}
+	files := map[string][]noteEntry{}
 	count := 0
-	// The same edits as attribution reads (store.AttributionSources), in the
-	// same window: a commit this one carries does not close it
-	// (store.CarriedCommits), and neither does one that gave the session's
-	// lines in the file up (store.ClosesWindow).
-	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
-	for _, src := range db.AttributionSources(repoID, committedAt, carried) {
-		args := append([]any{commitID, src.RepoID, src.Until, src.Until}, carriedArgs...)
-		args = append(args, commitID)
-		rows, err := db.Query(`
-			SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
-			       e.ts AS event_ts, elr.start_line, elr.end_line
-			FROM commit_files cf
-			JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
-			JOIN events e ON e.id = elr.event_id
-			LEFT JOIN sessions s ON s.id = e.session_id
-			WHERE cf.commit_id = ?
-			  AND e.repo_id = ?
-			  AND elr.rel_file_path IS NOT NULL
-			  AND datetime(?) >= datetime(e.ts)
-			  AND NOT EXISTS (
-				SELECT 1
-				FROM commits c2
-				JOIN commit_files cf2 ON cf2.commit_id = c2.id
-				WHERE c2.repo_id = e.repo_id
-				  AND cf2.file_path = cf.file_path
-				  AND datetime(c2.committed_at) >= datetime(e.ts)
-				  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
-				  AND `+store.ClosesWindow+`
-			  )
-			ORDER BY elr.rel_file_path, elr.start_line`,
-			args...)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var rel, agent, ts string
-			var session, model sql.NullString
-			var start, end int
-			if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
-				rows.Close()
-				return err
+	version := noteV2
+	for _, r := range db.CommitLineRecords(commitID) {
+		for _, run := range store.LineRuns(r.Numbers) {
+			lines := strconv.Itoa(run[0])
+			if run[1] != run[0] {
+				lines += "-" + strconv.Itoa(run[1])
 			}
-			lineRange := fmt.Sprintf("%d", start)
-			if start != end {
-				lineRange = fmt.Sprintf("%d-%d", start, end)
-			}
-			files[rel] = append(files[rel], entry{
-				Lines:   lineRange,
-				Agent:   agent,
-				Session: session.String,
-				Model:   model.String,
-				TS:      ts,
-			})
+			files[r.File] = append(files[r.File], noteEntry{Lines: lines, Agent: r.Agent, Session: r.SessionID, Model: r.Model, TS: r.TS})
 			count++
 		}
-		err = rows.Err()
-		rows.Close()
+	}
+	for file, entries := range files {
+		sort.SliceStable(entries, func(i, j int) bool { return firstLine(entries[i].Lines) < firstLine(entries[j].Lines) })
+		files[file] = entries
+	}
+	byPosition, err := positionMatchedFiles(db, commitID, files)
+	if err != nil {
+		return err
+	}
+	if len(byPosition) > 0 {
+		ranged, n, err := rangeNoteEntries(db, repoID, commitID, committedAt, carried, byPosition)
 		if err != nil {
 			return err
+		}
+		if n > 0 {
+			version = noteV1
+			count += n
+			for file, entries := range ranged {
+				files[file] = entries
+			}
 		}
 	}
 	if count == 0 {
@@ -689,10 +729,10 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 	}
 
 	note := struct {
-		V      int                `json:"v"`
-		Commit string             `json:"commit"`
-		Files  map[string][]entry `json:"files"`
-	}{V: 1, Commit: sha, Files: files}
+		V      int                    `json:"v"`
+		Commit string                 `json:"commit"`
+		Files  map[string][]noteEntry `json:"files"`
+	}{V: version, Commit: sha, Files: files}
 	encoded, err := json.Marshal(note)
 	if err != nil {
 		return err
@@ -709,6 +749,109 @@ func writeNoteForCommit(db *store.DB, repoRoot, repoID, sha, commitID string, ca
 		logx.Debugf("note: wrote %d range(s) for %s", count, sha[:7])
 	}
 	return nil
+}
+
+// firstLine is the first line of a note entry's "a-b" or "a".
+func firstLine(lines string) int {
+	first, _, _ := strings.Cut(lines, "-")
+	n, _ := strconv.Atoi(first)
+	return n
+}
+
+// positionMatchedFiles returns the files a commit is credited lines in that
+// are not among recorded: those matched by position with no lines on record.
+func positionMatchedFiles(db *store.DB, commitID string, recorded map[string][]noteEntry) (map[string]bool, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT file_path FROM commit_session_files
+		WHERE commit_id = ? AND lines_attributed > 0`, commitID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var file string
+		if err := rows.Scan(&file); err != nil {
+			return nil, err
+		}
+		if _, ok := recorded[file]; !ok {
+			out[file] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// rangeNoteEntries returns the note entries of the named files from the line
+// ranges of the edits in the commit's window, as every note was written
+// before commit_ai_lines: the same edits attribution by position reads
+// (store.AttributionSources), in the same window. A commit this one carries
+// does not close it (store.CarriedCommits), and neither does one that gave
+// the session's lines in the file up (store.ClosesWindow).
+func rangeNoteEntries(db *store.DB, repoID, commitID, committedAt string, carried []string, only map[string]bool) (map[string][]noteEntry, int, error) {
+	files := map[string][]noteEntry{}
+	count := 0
+	notCarried, carriedArgs := store.NotInClause("c2.id", carried)
+	for _, src := range db.AttributionSources(repoID, committedAt, carried) {
+		args := append([]any{commitID, src.RepoID, src.Until, src.Until}, carriedArgs...)
+		args = append(args, commitID)
+		rows, err := db.Query(`
+			SELECT elr.rel_file_path, e.session_id, e.agent_slug, s.model_slug,
+			       e.ts AS event_ts, elr.start_line, elr.end_line
+			FROM commit_files cf
+			JOIN event_line_ranges elr ON elr.rel_file_path = cf.file_path
+			JOIN events e ON e.id = elr.event_id
+			LEFT JOIN sessions s ON s.id = e.session_id
+			WHERE cf.commit_id = ?
+			  AND e.repo_id = ?
+			  AND elr.rel_file_path IS NOT NULL
+			  AND `+store.NamesLines+`
+			  AND datetime(?) >= datetime(e.ts)
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM commits c2
+				JOIN commit_files cf2 ON cf2.commit_id = c2.id
+				WHERE c2.repo_id = e.repo_id
+				  AND cf2.file_path = cf.file_path
+				  AND datetime(c2.committed_at) >= datetime(e.ts)
+				  AND datetime(c2.committed_at) < datetime(?)`+notCarried+`
+				  AND `+store.ClosesWindow+`
+			  )
+			ORDER BY elr.rel_file_path, elr.start_line`,
+			args...)
+		if err != nil {
+			return nil, 0, err
+		}
+		for rows.Next() {
+			var rel, agent, ts string
+			var session, model sql.NullString
+			var start, end int
+			if err := rows.Scan(&rel, &session, &agent, &model, &ts, &start, &end); err != nil {
+				rows.Close()
+				return nil, 0, err
+			}
+			if !only[rel] {
+				continue
+			}
+			lineRange := fmt.Sprintf("%d", start)
+			if start != end {
+				lineRange = fmt.Sprintf("%d-%d", start, end)
+			}
+			files[rel] = append(files[rel], noteEntry{
+				Lines:   lineRange,
+				Agent:   agent,
+				Session: session.String,
+				Model:   model.String,
+				TS:      ts,
+			})
+			count++
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return files, count, nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────

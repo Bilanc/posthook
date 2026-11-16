@@ -55,7 +55,13 @@ const LocalOrgID = "local"
 // which committed lines were attributed. Both stay on the machine. Nothing
 // already recorded is recomputed: a commit made before this version was
 // applied is always attributed by line position, as it was.
-const schemaVersion = 17
+//
+// v18 adds two more local tables, for edits no hook payload describes (see
+// looks.go): pending_looks, the looks at a working tree that are due after
+// a shell tool call or a prompt, and repo_looks, what was seen the last time
+// each repository was looked at. It also indexes commits by sha, which
+// catch-up and blame look commits up by.
+const schemaVersion = 18
 
 // contentAttributionVersion is the schema version from which commits are
 // matched by content. ContentAttributionSince reads when it was applied.
@@ -66,7 +72,8 @@ const contentAttributionVersion = 17
 // declared in schemaSQL and the v7 migration in applyMigrations.
 //
 // file_snapshots, session_file_lines and commit_ai_lines are deliberately
-// absent: they are fingerprints of file content and stay on the machine.
+// absent: they are fingerprints of file content and stay on the machine. So
+// are pending_looks and repo_looks, which are working state.
 var SyncableTables = []string{
 	"repositories",
 	"sessions",
@@ -183,6 +190,7 @@ CREATE TABLE IF NOT EXISTS commits (
 );
 CREATE INDEX IF NOT EXISTS idx_commits_org_committed ON commits(org_id, committed_at);
 CREATE INDEX IF NOT EXISTS idx_commits_repo ON commits(repo_id);
+CREATE INDEX IF NOT EXISTS idx_commits_sha ON commits(sha);
 
 CREATE TABLE IF NOT EXISTS commit_files (
   commit_id TEXT NOT NULL REFERENCES commits(id),
@@ -278,6 +286,32 @@ CREATE TABLE IF NOT EXISTS commit_ai_lines (
   lines TEXT NOT NULL,
   line_norms BLOB NOT NULL,
   PRIMARY KEY (commit_id, file_path, session_id)
+);
+
+-- Looks at a working tree that are still due, and the last look at each
+-- repository (looks.go). Never synced.
+CREATE TABLE IF NOT EXISTS pending_looks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  session_id TEXT,
+  agent_slug TEXT,
+  event_ts TEXT,
+  root TEXT NOT NULL,
+  fired_at TEXT NOT NULL,
+  started_at TEXT,
+  command TEXT,
+  moves_content INTEGER NOT NULL DEFAULT 0,
+  commits INTEGER NOT NULL DEFAULT 0,
+  files TEXT
+);
+CREATE TABLE IF NOT EXISTS repo_looks (
+  root TEXT PRIMARY KEY,
+  head TEXT,
+  looked_at TEXT NOT NULL,
+  slow_until TEXT,
+  partial INTEGER NOT NULL DEFAULT 0,
+  blind INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
