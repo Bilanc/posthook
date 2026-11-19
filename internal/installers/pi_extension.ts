@@ -9,7 +9,9 @@
 // commits that ship them:
 //
 //   before_agent_start (a user prompt)  -> UserPromptSubmit  (no prompt text; prompts are read from the session file)
-//   tool_result                         -> PostToolUse       (the tool's name and arguments, never its output)
+//   tool_result                         -> PostToolUse       (the tool's name and arguments, never its output; for an
+//                                                             edit, the whole-line patch Pi computed, so posthook can
+//                                                             count it exactly; it is not stored)
 //   agent_settled                       -> Stop              (posthook reads model, tokens and prompts from the session file)
 //
 // Each event runs `posthook ingest --agent pi`, which only writes the event to
@@ -139,7 +141,13 @@ export default function posthook(pi: Api) {
 		payload.tool_name = event.toolName;
 		payload.tool_use_id = event.toolCallId;
 		payload.tool_input = event.input;
-		payload.tool_response = { is_error: Boolean(event.isError) };
+		const response: Record<string, unknown> = { is_error: Boolean(event.isError) };
+		// oldText/newText can cut through lines; the patch Pi built from them
+		// covers whole lines.
+		if (event.toolName === "edit" && !event.isError && typeof event.details?.patch === "string") {
+			response.patch = event.details.patch;
+		}
+		payload.tool_response = response;
 		if (event.parentToolCallId) payload.parent_tool_use_id = event.parentToolCallId;
 		send(payload);
 	});

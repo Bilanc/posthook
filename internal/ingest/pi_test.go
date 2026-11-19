@@ -116,3 +116,85 @@ func TestNormalizePiPayloadLeavesOtherToolsAlone(t *testing.T) {
 		}
 	}
 }
+
+func TestPiPatchHunks(t *testing.T) {
+	cases := []struct {
+		name  string
+		patch string
+		want  []any
+		ok    bool
+	}{
+		{
+			name:  "one hunk",
+			patch: "--- f\n+++ f\n@@ -1,3 +1,5 @@\n package seat\n \n-func Remove() {}\n+func Remove() {\n+\tprorate()\n+}\n",
+			want: []any{map[string]any{"oldStart": float64(1), "newStart": float64(1), "lines": []any{
+				" package seat", " ", "-func Remove() {}", "+func Remove() {", "+\tprorate()", "+}",
+			}}},
+			ok: true,
+		},
+		{
+			name:  "two hunks, a removed line that looks like a header",
+			patch: "--- f\n+++ f\n@@ -2 +2 @@\n-b\n+B\n@@ -11,2 +11,3 @@\n---k\n+K1\n+K2\n l\n",
+			want: []any{
+				map[string]any{"oldStart": float64(2), "newStart": float64(2), "lines": []any{"-b", "+B"}},
+				map[string]any{"oldStart": float64(11), "newStart": float64(11), "lines": []any{"---k", "+K1", "+K2", " l"}},
+			},
+			ok: true,
+		},
+		{
+			name:  "no newline at end of file",
+			patch: "--- f\n+++ f\n@@ -1,2 +1,2 @@\n x\n-y\n\\ No newline at end of file\n+z\n\\ No newline at end of file\n",
+			want: []any{map[string]any{"oldStart": float64(1), "newStart": float64(1), "lines": []any{
+				" x", "-y", "\\ No newline at end of file", "+z", "\\ No newline at end of file",
+			}}},
+			ok: true,
+		},
+		{name: "no hunks", patch: "--- f\n+++ f\n", ok: false},
+		{name: "a line outside any hunk", patch: "--- f\n+++ f\n x\n", ok: false},
+		{name: "an unmarked line in a hunk", patch: "@@ -1 +1 @@\nplain\n", ok: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := piPatchHunks(tc.patch)
+			if ok != tc.ok {
+				t.Fatalf("ok = %v, want %v (hunks %#v)", ok, tc.ok, got)
+			}
+			if tc.ok && !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("hunks = %#v\nwant %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// An edit's patch becomes Claude Code's structuredPatch, the shape ingest
+// already counts exactly; a patch it cannot read is dropped and the edit
+// falls back to diffing its strings.
+func TestNormalizePiPayloadEditPatch(t *testing.T) {
+	edit := func(resp map[string]any) map[string]any {
+		return normalizePiPayload(map[string]any{
+			"tool_name":     "edit",
+			"tool_input":    map[string]any{"path": "f", "edits": []any{map[string]any{"oldText": "a", "newText": "b"}}},
+			"tool_response": resp,
+		})
+	}
+	got := edit(map[string]any{"is_error": false, "patch": "@@ -1 +1 @@\n-a\n+b\n"})
+	resp := got["tool_response"].(map[string]any)
+	if _, has := resp["patch"]; has {
+		t.Error("patch text kept alongside the structured hunks")
+	}
+	if hunks, ok := resp["structuredPatch"].([]any); !ok || len(hunks) != 1 {
+		t.Errorf("structuredPatch = %#v", resp["structuredPatch"])
+	}
+	if resp["is_error"] != false {
+		t.Errorf("is_error lost: %#v", resp)
+	}
+
+	got = edit(map[string]any{"is_error": false, "patch": "not a patch"})
+	resp = got["tool_response"].(map[string]any)
+	if _, has := resp["structuredPatch"]; has {
+		t.Error("unreadable patch turned into hunks")
+	}
+	if _, has := resp["patch"]; has {
+		t.Error("unreadable patch kept")
+	}
+}

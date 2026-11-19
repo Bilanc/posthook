@@ -3,6 +3,7 @@ package ingest
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bilanc/posthook/internal/store"
@@ -133,5 +134,56 @@ func TestPiEndToEnd(t *testing.T) {
 	added, attributed := commitAndAttribute(t, repo, session)
 	if added != 6 || attributed != 6 {
 		t.Errorf("commit added %d lines, %d attributed to the Pi session; want 6 and 6", added, attributed)
+	}
+}
+
+// An edit whose oldText/newText cut through lines: Pi changed
+// "func Remove() {}" into three lines while sending only the text around
+// "Remove() {". Diffing the strings would credit only the new middle line;
+// the whole-line patch Pi reports with the result (details.patch, sent as
+// tool_response.patch) credits all three.
+func TestPiEditCreditsWholeLinesFromItsPatch(t *testing.T) {
+	_ = store.Close()
+	home := isolateIngest(t)
+	t.Cleanup(func() { _ = store.Close() })
+
+	const session = "pi-patch"
+	repo := filepath.Join(home, "repo-pi-patch")
+	initRepo(t, repo)
+	seat := filepath.Join(repo, "src", "seat.go")
+	writeFile(t, seat, "package seat\n\nfunc Remove() {}\n")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+
+	writeFile(t, seat, "package seat\n\nfunc Remove() {\n\tprorate()\n}\n")
+	deliver(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
+		"tool_name":   "edit",
+		"tool_use_id": "t1",
+		"tool_input": map[string]any{"path": "src/seat.go", "edits": []any{
+			map[string]any{"oldText": "Remove() {", "newText": "Remove() {\n\tprorate()\n"},
+		}},
+		"tool_response": map[string]any{
+			"is_error": false,
+			"patch":    "--- src/seat.go\n+++ src/seat.go\n@@ -1,3 +1,5 @@\n package seat\n \n-func Remove() {}\n+func Remove() {\n+\tprorate()\n+}\n",
+		},
+	}))
+
+	db := openDB(t)
+	if got := rangesForSession(t, db, session); len(got) != 1 || got[0] != (rangeRow{3, 5}) {
+		t.Errorf("line ranges = %+v, want [{3 5}]", got)
+	}
+	if c := countsForSession(t, db, session); len(c) != 1 || c[0].generated.Int64 != 3 {
+		t.Errorf("lines generated = %+v, want 3", c)
+	}
+	// The patch is used, not stored: tool_response keeps only its flags.
+	var stored sql.NullString
+	if err := db.QueryRow(`SELECT json_extract(payload, '$.tool_response') FROM events WHERE session_id = ?`, session).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored.String, "prorate") {
+		t.Errorf("stored tool_response carries code: %s", stored.String)
+	}
+	if added, attributed := commitAndAttribute(t, repo, session); added != 3 || attributed != 3 {
+		t.Errorf("commit added %d lines, %d attributed to the Pi session; want 3 and 3", added, attributed)
 	}
 }
