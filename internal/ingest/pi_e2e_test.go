@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bilanc/posthook/internal/store"
 )
@@ -185,5 +186,63 @@ func TestPiEditCreditsWholeLinesFromItsPatch(t *testing.T) {
 	}
 	if added, attributed := commitAndAttribute(t, repo, session); added != 3 || attributed != 3 {
 		t.Errorf("commit added %d lines, %d attributed to the Pi session; want 3 and 3", added, attributed)
+	}
+}
+
+// Two Pi edits queued before either is handled: the second puts a line
+// above the first's, so by the time the worker reads the file the first
+// edit's line has moved. With the file as it was before each edit
+// (tool_response.originalFile, sent by the extension), each patch is applied
+// to its own before-image, exactly as for Claude Code, and both lines keep
+// their author whatever the disk holds by now.
+func TestQueuedPiEditsKeepTheirLines(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		withOriginal bool
+		want         int
+	}{
+		{"with the file before each edit", true, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = store.Close()
+			home := isolateIngest(t)
+			t.Cleanup(func() { _ = store.Close() })
+
+			session := "pi-queued"
+			repo := filepath.Join(home, "repo-pi-queued")
+			initRepo(t, repo)
+			path := filepath.Join(repo, "list.txt")
+			writeFile(t, path, "a\nb\nc\n")
+			gitIn(t, repo, "add", "-A")
+			gitIn(t, repo, "commit", "-q", "-m", "init")
+
+			// Both edits have run by the time the worker gets to either.
+			writeFile(t, path, "X\na\nB\nc\n")
+			edit := func(id, before, oldText, newText, patch string, firedAt time.Time) {
+				resp := map[string]any{"is_error": false, "patch": patch}
+				if tc.withOriginal {
+					resp["originalFile"] = before
+				}
+				deliverAt(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
+					"tool_name": "edit", "tool_use_id": id,
+					"tool_input":    map[string]any{"path": "list.txt", "edits": []any{map[string]any{"oldText": oldText, "newText": newText}}},
+					"tool_response": resp,
+				}), firedAt)
+			}
+			fired := time.Now().Add(-3 * time.Second)
+			edit("t1", "a\nb\nc\n", "b", "B", "--- list.txt\n+++ list.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n", fired)
+			edit("t2", "a\nB\nc\n", "a", "X\na", "--- list.txt\n+++ list.txt\n@@ -1,3 +1,4 @@\n+X\n a\n B\n c\n", fired.Add(time.Second))
+
+			var stored sql.NullString
+			if err := openDB(t).QueryRow(`SELECT json_extract(payload, '$.tool_response') FROM events WHERE session_id = ? AND json_extract(payload, '$.tool_use_id') = 't1'`, session).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(stored.String, "originalFile") || strings.Contains(stored.String, "patch") {
+				t.Errorf("stored tool_response = %s, want neither the file nor the patch", stored.String)
+			}
+			if added, attributed := commitAndAttribute(t, repo, session); added != 2 || attributed != tc.want {
+				t.Errorf("commit added %d lines, %d attributed to the Pi session; want 2 and %d", added, attributed, tc.want)
+			}
+		})
 	}
 }

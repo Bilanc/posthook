@@ -30,10 +30,13 @@ const piAgentSlug = "pi"
 //
 // Pi's own name is kept under pi_tool_name. An edit's result also carries the
 // unified patch Pi computed from whole lines (details.patch, sent as
-// tool_response.patch). It is turned into Claude Code's structuredPatch, so
-// the edit is counted from the patch as is: oldText/newText are substrings
-// and can cut through lines, which a string diff would credit only in part.
-// Like every tool_response, it is dropped before the event is stored. Typed
+// tool_response.patch), with the file as it was before the edit
+// (tool_response.originalFile). The patch is turned into Claude Code's
+// structuredPatch, so the edit is counted and placed exactly as Claude
+// Code's are, its post-image rebuilt from originalFile. (oldText/newText are
+// substrings and can cut through lines, which a string diff would credit
+// only in part.) Like every tool_response, both are dropped before the event
+// is stored. Typed
 // prompts, model and token usage come from the Pi session file at Stop
 // (transcript/pi.go).
 

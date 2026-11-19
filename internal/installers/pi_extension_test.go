@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -172,15 +173,24 @@ func TestPiExtensionShutdownDoesNotWaitOutTheTimeout(t *testing.T) {
 }
 
 // An edit's result carries the whole-line patch Pi computed; the extension
-// passes it on so posthook can count the edit exactly. Nothing else of a
-// tool's result is sent.
+// passes it on with the file as it was before the edit (BOM dropped, as Pi
+// drops it before patching), so posthook can count the edit exactly. Nothing
+// else of a tool's result is sent, and a write sends neither.
 func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 	node := requireNodeTS(t)
 	events := t.TempDir()
 	runPiExtension(t, node, fakePosthook(t, events), `
+		write("a.txt", "\uFEFFa\n");
+		await fire("tool_call", { toolName: "edit", toolCallId: "e1", input: { path: "a.txt", edits: [] } });
+		write("a.txt", "\uFEFFb\n");
 		await fire("tool_result", { toolName: "edit", toolCallId: "e1", input: { path: "a.txt", edits: [] }, isError: false,
 			content: [{ type: "text", text: "Successfully replaced 1 block(s)" }], details: { diff: "display", patch: "@@ -1 +1 @@\n-a\n+b\n" } });
-		await fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: "b.txt", content: "x" }, isError: false,
+		write("big.txt", "x".repeat(5 * 1024 * 1024));
+		await fire("tool_call", { toolName: "edit", toolCallId: "e2", input: { path: "big.txt", edits: [] } });
+		await fire("tool_result", { toolName: "edit", toolCallId: "e2", input: { path: "big.txt", edits: [] }, isError: false,
+			details: { patch: "@@ -1 +1 @@\n-x\n+y\n" } });
+		await fire("tool_call", { toolName: "write", toolCallId: "w1", input: { path: "a.txt", content: "x" } });
+		await fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: "a.txt", content: "x" }, isError: false,
 			content: [{ type: "text", text: "ok" }], details: { patch: "should not be sent" } });
 	`)
 	files, _ := filepath.Glob(filepath.Join(events, "*.json"))
@@ -194,13 +204,14 @@ func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 		resp, _ := p["tool_response"].(map[string]any)
 		got[p["tool_use_id"].(string)] = resp
 	}
-	if got["e1"]["patch"] != "@@ -1 +1 @@\n-a\n+b\n" {
-		t.Errorf("edit tool_response = %#v, want the patch", got["e1"])
+	want := map[string]any{"is_error": false, "patch": "@@ -1 +1 @@\n-a\n+b\n", "originalFile": "a\n"}
+	if !reflect.DeepEqual(got["e1"], want) {
+		t.Errorf("edit tool_response = %#v\nwant %#v", got["e1"], want)
 	}
-	if len(got["e1"]) != 2 {
-		t.Errorf("edit tool_response = %#v, want only is_error and patch", got["e1"])
+	if _, has := got["e2"]["originalFile"]; has || got["e2"]["patch"] == nil {
+		t.Errorf("edit of a file over the size limit = %#v, want the patch and no originalFile", got["e2"])
 	}
-	if _, has := got["w1"]["patch"]; has || len(got["w1"]) != 1 {
+	if len(got["w1"]) != 1 {
 		t.Errorf("write tool_response = %#v, want only is_error", got["w1"])
 	}
 }

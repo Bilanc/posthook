@@ -31,7 +31,8 @@ import (
 //
 //  1. Claude Code reports each Edit, MultiEdit and Write as a patch against
 //     the file it read (tool_response.structuredPatch), and Pi each edit
-//     (its unified patch, turned into the same shape in pi.go). The patch is
+//     (its unified patch, turned into the same shape in pi.go, with the file
+//     as it was before as originalFile). The patch is
 //     used as is. It is only in the hook payload: TrimPayload drops it before
 //     the event is stored, so it has to be read here.
 //  2. An old/new string pair from any other agent is diffed line by line at
