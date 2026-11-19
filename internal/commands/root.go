@@ -38,8 +38,8 @@ func NewRootCmd() *cobra.Command {
 
 const longHelp = `posthook — local-first instrumentation for AI-assisted coding.
 
-Installs hooks into Claude Code, Cursor, Codex CLI and GitHub Copilot (CLI and
-VS Code); installs a git shadow that intercepts every git command on every
+Installs hooks into Claude Code, Cursor, Codex CLI, GitHub Copilot (CLI and
+VS Code) and Pi; installs a git shadow that intercepts every git command on every
 repo; captures everything into a single SQLite file at ~/.posthook/posthook.db.
 
 Environment:

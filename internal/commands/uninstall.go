@@ -33,7 +33,8 @@ from scratch. In order:
 
   1. stop the background sync daemon and the dashboard server
   2. remove posthook's hook entries from Claude Code, Cursor, Codex CLI and
-     GitHub Copilot (your own hooks in those files are untouched)
+     GitHub Copilot (your own hooks in those files are untouched), and delete
+     its Pi extension
   3. stop the spool worker, drain any queued events and, if cloud sync is
      configured, flush once more so nothing already captured is lost. If that
      hand-off fails, the database, config and queued events are kept and the
@@ -118,6 +119,9 @@ type agentTrace struct {
 	name      string
 	path      string
 	uninstall func() (installers.Result, error)
+	// installed overrides the default check (the file mentions posthook's
+	// hook command) for agents whose file posthook owns outright.
+	installed func() bool
 }
 
 // keepDataFiles are the ~/.posthook entries --keep-data preserves: the
@@ -153,12 +157,17 @@ func gatherUninstallPlan(keepData bool) uninstallPlan {
 	}
 
 	for _, a := range []agentTrace{
-		{"Claude Code", paths.ClaudeSettingsPath(), installers.UninstallClaudeCodeHooks},
-		{"Cursor", paths.CursorHooksPath(), installers.UninstallCursorHooks},
-		{"Codex CLI", paths.CodexConfigPath(), installers.UninstallCodexHooks},
-		{"GitHub Copilot", paths.CopilotHooksPath(), installers.UninstallCopilotHooks},
+		{name: "Claude Code", path: paths.ClaudeSettingsPath(), uninstall: installers.UninstallClaudeCodeHooks},
+		{name: "Cursor", path: paths.CursorHooksPath(), uninstall: installers.UninstallCursorHooks},
+		{name: "Codex CLI", path: paths.CodexConfigPath(), uninstall: installers.UninstallCodexHooks},
+		{name: "GitHub Copilot", path: paths.CopilotHooksPath(), uninstall: installers.UninstallCopilotHooks},
+		{name: "Pi", path: paths.PiExtensionPath(), uninstall: installers.UninstallPiExtension, installed: installers.PiExtensionInstalled},
 	} {
-		if fileContains(a.path, paths.PosthookMarker) {
+		installed := fileContains(a.path, paths.PosthookMarker)
+		if a.installed != nil {
+			installed = a.installed()
+		}
+		if installed {
 			p.agents = append(p.agents, a)
 		}
 	}
@@ -485,7 +494,7 @@ func (p uninstallPlan) execute() error {
 
 	fmt.Println("Done. Three things to know:")
 	fmt.Println("  - Open a new shell (or run `hash -r`): the shell may still have the old git path cached.")
-	fmt.Println("  - Restart any Claude Code / Cursor / Codex / Copilot session that is running: they loaded the hooks")
+	fmt.Println("  - Restart any Claude Code / Cursor / Codex / Copilot / Pi session that is running: they loaded the hooks")
 	fmt.Println("    at startup and will report a failed hook until restarted.")
 	fmt.Println("  - If you added ~/.local/bin to PATH in your shell rc, that line was left alone — it is a")
 	fmt.Println("    standard directory other tools use too.")

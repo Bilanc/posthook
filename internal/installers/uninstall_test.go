@@ -23,6 +23,7 @@ func isolate(t *testing.T) string {
 	t.Setenv("HOME", home)
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, ".gitconfig"))
 	t.Setenv("POSTHOOK_BIN", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
 	return home
 }
 
