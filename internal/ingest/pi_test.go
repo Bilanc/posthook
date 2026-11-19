@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/bilanc/posthook/internal/lineranges"
 )
 
 func TestNormalizePiPayload(t *testing.T) {
@@ -229,5 +231,38 @@ func TestApplyPatchToAFileWithABOM(t *testing.T) {
 				t.Errorf("applyPatch = %q, %v; want %q", got, ok, tc.want)
 			}
 		})
+	}
+}
+
+// Only lines that are line 1 of their side get the BOM: a context line 1 is
+// left alone (both sides already start with it, and it is neither added nor
+// removed), and so are lines further down.
+func TestBOMOnFirstLines(t *testing.T) {
+	const bom = "\uFEFF"
+	for _, tc := range []struct {
+		name                 string
+		hunk                 []string
+		wantAdded, wantRemov []string
+	}{
+		{"line 1 changed", []string{"-a", "+A", " b"}, []string{bom + "A"}, []string{bom + "a"}},
+		{"line inserted above line 1", []string{"+x", " a", " b"}, []string{bom + "x"}, nil},
+		{"line 1 deleted", []string{"-a", " b"}, nil, []string{bom + "a"}},
+		{"context line 1", []string{" a", "-b", "+B"}, []string{"B"}, []string{"b"}},
+		{"two lines replaced", []string{"-a", "-b", "+A", "+B"}, []string{bom + "A", "B"}, []string{bom + "a", "b"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hunks := []lineranges.PatchHunk{{NewStart: 1, Lines: tc.hunk}}
+			c := lineranges.ChangeFromHunks(hunks)
+			bomOnFirstLines(&c, hunks)
+			if !reflect.DeepEqual(c.Added, tc.wantAdded) || !reflect.DeepEqual(c.Removed, tc.wantRemov) {
+				t.Errorf("added %q removed %q, want %q and %q", c.Added, c.Removed, tc.wantAdded, tc.wantRemov)
+			}
+		})
+	}
+	hunks := []lineranges.PatchHunk{{NewStart: 3, Lines: []string{"-c", "+C"}}}
+	c := lineranges.ChangeFromHunks(hunks)
+	bomOnFirstLines(&c, hunks)
+	if c.Added[0] != "C" || c.Removed[0] != "c" {
+		t.Errorf("a hunk below line 1 was changed: %q %q", c.Added, c.Removed)
 	}
 }

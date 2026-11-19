@@ -325,3 +325,47 @@ func TestPiEditOfAFileWithABOM(t *testing.T) {
 		})
 	}
 }
+
+// Rework across the BOM: a session's own earlier lines are recorded as the
+// file holds them, BOM and all on line 1. A Pi edit revising that line has
+// to count it as rework (its patch, made after Pi strips the BOM, shows the
+// line without it), and a later whole-file write replacing a line 1 that Pi
+// wrote has to as well.
+func TestPiReworkOfABOMLine(t *testing.T) {
+	_ = store.Close()
+	home := isolateIngest(t)
+	t.Cleanup(func() { _ = store.Close() })
+
+	const bom = "\uFEFF"
+	session := "pi-bom-rework"
+	repo := filepath.Join(home, "repo-pi-bom-rework")
+	initRepo(t, repo)
+	writeFile(t, filepath.Join(repo, "README.md"), "# demo\n")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+	path := filepath.Join(repo, "list.txt")
+
+	write := func(content string) {
+		writeFile(t, path, content)
+		deliver(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
+			"tool_name": "write", "tool_input": map[string]any{"path": "list.txt", "content": content},
+		}))
+	}
+	edit := func(before, after, patch string) {
+		writeFile(t, path, after)
+		deliver(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
+			"tool_name":     "edit",
+			"tool_input":    map[string]any{"path": "list.txt", "edits": []any{map[string]any{"oldText": "x", "newText": "y"}}},
+			"tool_response": map[string]any{"is_error": false, "patch": patch, "originalFile": before},
+		}))
+	}
+
+	// The session writes the file, then Pi revises the session's own line 1.
+	write(bom + "a\nb\n")
+	edit(bom+"a\nb\n", bom+"A\nb\n", "--- list.txt\n+++ list.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n")
+	// Then a whole-file write replaces the line 1 that Pi wrote.
+	write(bom + "Z\nb\n")
+
+	db := openDB(t)
+	wantCounts(t, db, session, [2]int64{2, 0}, [2]int64{1, 1}, [2]int64{1, 1})
+}

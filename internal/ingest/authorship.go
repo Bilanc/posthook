@@ -332,6 +332,55 @@ func applyPatch(original string, hunks []lineranges.PatchHunk) (after string, ok
 	return "", false
 }
 
+// patchOmitsBOM reports whether hunks were made against original's text
+// after its UTF-8 BOM: they do not fit the file as it is, and do fit it
+// without the BOM.
+func patchOmitsBOM(original string, hunks []lineranges.PatchHunk) bool {
+	rest, hadBOM := strings.CutPrefix(original, utf8BOM)
+	if !hadBOM {
+		return false
+	}
+	if _, ok := applyHunks(original, hunks); ok {
+		return false
+	}
+	_, ok := applyHunks(rest, hunks)
+	return ok
+}
+
+// bomOnFirstLines gives the change's added and removed lines the BOM the
+// file's line 1 carries on each side, for a patch that omits it (see
+// patchOmitsBOM). Those texts are what the session's lines are hashed from,
+// and the file holds line 1 with its BOM: without it, an edit to a line 1
+// the session wrote (or a write over a line 1 such an edit wrote) would not
+// count as rework. Only the first hunk can reach line 1, and there the old
+// and new sides start at the same line; a removed or added line is changed
+// only when it is line 1 of its side.
+func bomOnFirstLines(c *lineranges.Change, hunks []lineranges.PatchHunk) {
+	if len(hunks) == 0 || hunks[0].NewStart > 1 {
+		return
+	}
+	oldDone, newDone := false, false
+	for _, l := range hunks[0].Lines {
+		if l == "" || oldDone && newDone {
+			break
+		}
+		switch l[0] {
+		case '-':
+			if !oldDone && len(c.Removed) > 0 {
+				c.Removed[0] = utf8BOM + c.Removed[0]
+			}
+			oldDone = true
+		case '+':
+			if !newDone && len(c.Added) > 0 {
+				c.Added[0] = utf8BOM + c.Added[0]
+			}
+			newDone = true
+		case ' ':
+			oldDone, newDone = true, true
+		}
+	}
+}
+
 func sameText(a, b string) bool {
 	return strings.TrimSuffix(a, "\r") == strings.TrimSuffix(b, "\r")
 }

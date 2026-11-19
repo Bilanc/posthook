@@ -182,7 +182,11 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 	if hunks, ok := structuredPatch(resp); ok && (len(hunks) > 0 || toolName == "Write") {
 		switch {
 		case len(hunks) > 0:
-			fc.setChange(lineranges.ChangeFromHunks(hunks), 0)
+			change := lineranges.ChangeFromHunks(hunks)
+			if original, _ := resp["originalFile"].(string); patchOmitsBOM(original, hunks) {
+				bomOnFirstLines(&change, hunks)
+			}
+			fc.setChange(change, 0)
 		case createdFile(resp):
 			fc.setChange(lineranges.DiffChange("", writtenContent(*input, fc.post)), 0)
 		default:
