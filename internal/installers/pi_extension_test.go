@@ -173,8 +173,8 @@ func TestPiExtensionShutdownDoesNotWaitOutTheTimeout(t *testing.T) {
 }
 
 // An edit's result carries the whole-line patch Pi computed; the extension
-// passes it on with the file as it was before the edit (BOM dropped, as Pi
-// drops it before patching), so posthook can count the edit exactly. Nothing
+// passes it on with the file as it was before the edit (as on disk, BOM
+// included), so posthook can count the edit exactly. Nothing
 // else of a tool's result is sent, and a write sends neither.
 func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 	node := requireNodeTS(t)
@@ -204,7 +204,7 @@ func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 		resp, _ := p["tool_response"].(map[string]any)
 		got[p["tool_use_id"].(string)] = resp
 	}
-	want := map[string]any{"is_error": false, "patch": "@@ -1 +1 @@\n-a\n+b\n", "originalFile": "a\n"}
+	want := map[string]any{"is_error": false, "patch": "@@ -1 +1 @@\n-a\n+b\n", "originalFile": "\uFEFFa\n"}
 	if !reflect.DeepEqual(got["e1"], want) {
 		t.Errorf("edit tool_response = %#v\nwant %#v", got["e1"], want)
 	}

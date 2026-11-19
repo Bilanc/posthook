@@ -60,11 +60,48 @@ func normalizePiPayload(payload map[string]any) map[string]any {
 		if patch, ok := resp["patch"].(string); ok {
 			delete(resp, "patch")
 			if hunks, ok := piPatchHunks(patch); ok {
+				if original, _ := resp["originalFile"].(string); strings.HasPrefix(original, utf8BOM) {
+					addBOMToFirstLine(hunks)
+				}
 				resp["structuredPatch"] = hunks
 			}
 		}
 	}
 	return payload
+}
+
+const utf8BOM = "\uFEFF"
+
+// addBOMToFirstLine puts a UTF-8 BOM back on line 1 of both sides of a patch.
+// Pi strips a file's BOM before matching and patching and writes it back
+// after, so its patch never shows it; posthook reads the file with the BOM,
+// and line 1 must carry it on both sides for the patch to apply and for the
+// rebuilt file to read the same as the disk. Only a hunk that starts at line
+// 1 touches it.
+func addBOMToFirstLine(hunks []any) {
+	if len(hunks) == 0 {
+		return
+	}
+	h := hunks[0].(map[string]any)
+	lines, _ := h["lines"].([]any)
+	oldDone := h["oldStart"] != float64(1)
+	newDone := h["newStart"] != float64(1)
+	for i, l := range lines {
+		s := l.(string)
+		if s == "" {
+			continue
+		}
+		oldSide := !oldDone && (s[0] == ' ' || s[0] == '-')
+		newSide := !newDone && (s[0] == ' ' || s[0] == '+')
+		if oldSide || newSide {
+			lines[i] = s[:1] + utf8BOM + s[1:]
+		}
+		oldDone = oldDone || oldSide
+		newDone = newDone || newSide
+		if oldDone && newDone {
+			return
+		}
+	}
 }
 
 var piHunkHeader = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)

@@ -135,7 +135,9 @@ export default function posthook(pi: Api) {
 		const path = toolPath(event.input, ctx.cwd);
 		if (!path) return;
 		const { state, content } = readState(path);
-		const original = event.toolName === "edit" && content ? content.toString("utf8").replace(/^\uFEFF/, "") : undefined;
+		// As on disk, BOM included: posthook puts the BOM Pi strips before
+		// patching back on the patch's first line, since Pi writes it back.
+		const original = event.toolName === "edit" && content ? content.toString("utf8") : undefined;
 		before.set(event.toolCallId, { path, state, original });
 	});
 

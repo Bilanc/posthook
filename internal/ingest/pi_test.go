@@ -198,3 +198,26 @@ func TestNormalizePiPayloadEditPatch(t *testing.T) {
 		t.Error("unreadable patch kept")
 	}
 }
+
+func TestAddBOMToFirstLine(t *testing.T) {
+	const bom = "\uFEFF"
+	hunks := func(oldStart, newStart float64, lines ...any) []any {
+		return []any{map[string]any{"oldStart": oldStart, "newStart": newStart, "lines": lines}}
+	}
+	for _, tc := range []struct {
+		name     string
+		in, want []any
+	}{
+		{"changed first line", hunks(1, 1, "-a", "+A", " b"), hunks(1, 1, "-"+bom+"a", "+"+bom+"A", " b")},
+		{"context first line", hunks(1, 1, " a", "+x"), hunks(1, 1, " "+bom+"a", "+x")},
+		{"line inserted above line 1", hunks(1, 1, "+x", " a"), hunks(1, 1, "+"+bom+"x", " "+bom+"a")},
+		{"hunk below line 1", hunks(5, 5, " e", "-f", "+F"), hunks(5, 5, " e", "-f", "+F")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addBOMToFirstLine(tc.in)
+			if !reflect.DeepEqual(tc.in, tc.want) {
+				t.Errorf("got %#v\nwant %#v", tc.in, tc.want)
+			}
+		})
+	}
+}

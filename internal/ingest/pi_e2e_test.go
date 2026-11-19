@@ -246,3 +246,40 @@ func TestQueuedPiEditsKeepTheirLines(t *testing.T) {
 		})
 	}
 }
+
+// A file that starts with a UTF-8 BOM: Pi strips it before matching and
+// patching, then writes it back. The extension sends the file as it was, BOM
+// and all, so the patch's first line has to carry the BOM too, or the
+// rebuilt line 1 never matches the committed one. The second edit leaves
+// the disk different from the first edit's post-image, so that post-image
+// (not the disk) is what the first edit's lines are recorded against.
+func TestPiEditOfAFileWithABOM(t *testing.T) {
+	_ = store.Close()
+	home := isolateIngest(t)
+	t.Cleanup(func() { _ = store.Close() })
+
+	const bom = "\uFEFF"
+	session := "pi-bom"
+	repo := filepath.Join(home, "repo-pi-bom")
+	initRepo(t, repo)
+	path := filepath.Join(repo, "list.txt")
+	writeFile(t, path, bom+"a\nb\n")
+	gitIn(t, repo, "add", "-A")
+	gitIn(t, repo, "commit", "-q", "-m", "init")
+
+	writeFile(t, path, bom+"A\nb\nc\n")
+	edit := func(id, before, patch string, firedAt time.Time) {
+		deliverAt(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
+			"tool_name": "edit", "tool_use_id": id,
+			"tool_input":    map[string]any{"path": "list.txt", "edits": []any{map[string]any{"oldText": "x", "newText": "y"}}},
+			"tool_response": map[string]any{"is_error": false, "patch": patch, "originalFile": before},
+		}), firedAt)
+	}
+	fired := time.Now().Add(-3 * time.Second)
+	edit("t1", bom+"a\nb\n", "--- list.txt\n+++ list.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n", fired)
+	edit("t2", bom+"A\nb\n", "--- list.txt\n+++ list.txt\n@@ -1,2 +1,3 @@\n A\n b\n+c\n", fired.Add(time.Second))
+
+	if added, attributed := commitAndAttribute(t, repo, session); added != 2 || attributed != 2 {
+		t.Errorf("commit added %d lines, %d attributed to the Pi session; want 2 and 2", added, attributed)
+	}
+}
