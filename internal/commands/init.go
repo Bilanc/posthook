@@ -53,6 +53,7 @@ func runInit(binFlag string) error {
 		{"Cursor", installers.DetectCursor, func() (installers.Result, error) { return installers.InstallCursorHooks(binaryPath) }},
 		{"Codex CLI", installers.DetectCodex, func() (installers.Result, error) { return installers.InstallCodexHooks(binaryPath) }},
 		{"GitHub Copilot", installers.DetectCopilot, func() (installers.Result, error) { return installers.InstallCopilotHooks(binaryPath) }},
+		{"Pi", installers.DetectPi, func() (installers.Result, error) { return installers.InstallPiExtension(binaryPath) }},
 	}
 
 	logx.Info("AI agent hooks:")

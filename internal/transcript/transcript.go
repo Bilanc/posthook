@@ -26,6 +26,9 @@
 // Only the CLI writes the model and usage events; VS Code's stream carries
 // neither, so those sessions keep a NULL model and NULL tokens.
 //
+// Pi session files ({type: "message", message: {role, model, usage}}) are
+// described in pi.go.
+//
 // Tokens are nullable by design: Cursor exposes no usage anywhere, so a
 // session without a Tokens summary means "agent doesn't report usage", not
 // zero. (Session token columns were dropped in schema v3 because cross-agent
@@ -215,9 +218,9 @@ func copilotPromptText(rec record) string {
 	return cleanPromptText(stringifyContent(d.Content))
 }
 
-// ParseFile reads a session transcript (Claude JSONL, Codex rollout or Copilot
-// event stream) and returns model + timestamp summary. Returns nil on missing
-// file / read failure.
+// ParseFile reads a session transcript (Claude JSONL, Codex rollout, Copilot
+// event stream or Pi session file) and returns model + timestamp summary.
+// Returns nil on missing file / read failure.
 func ParseFile(path string) *Summary {
 	if _, err := os.Stat(path); err != nil {
 		return nil
@@ -241,6 +244,7 @@ func parseString(raw string) *Summary {
 	var claudeNoID []claudeUsage
 	var codexTotal *codexUsage
 	var copilot copilotState
+	var pi piState
 
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -266,6 +270,10 @@ func parseString(raw string) *Summary {
 		}
 		if isCopilotEvent(rec.Type) {
 			copilot.observe(rec)
+			continue
+		}
+		if isPiMessage(rec) {
+			pi.observe(rec, line)
 			continue
 		}
 		if rec.Type != "assistant" || rec.Message == nil {
@@ -301,6 +309,15 @@ func parseString(raw string) *Summary {
 		}
 		if out.Tokens == nil {
 			out.Tokens = copilot.usage
+		}
+	}
+	if pi.seen {
+		out.AssistantMessageCount += pi.assistantMessages
+		if out.Model == "" {
+			out.Model = pi.model()
+		}
+		if out.Tokens == nil {
+			out.Tokens = pi.usage
 		}
 	}
 	return out
@@ -347,7 +364,8 @@ type UserPrompt struct {
 // present in rollouts duplicate these plus environment-context noise, so they
 // are ignored). Copilot streams: user.message events, whose content is the
 // prompt as typed (transformedContent, which adds a datetime header, is
-// ignored). Returns nil on missing/unreadable file.
+// ignored). Pi session files: message entries with role user. Returns nil on
+// missing/unreadable file.
 func ExtractUserPrompts(path string) []UserPrompt {
 	if _, err := os.Stat(path); err != nil {
 		return nil
@@ -378,6 +396,14 @@ func ExtractUserPrompts(path string) []UserPrompt {
 		// Copilot event-stream shape.
 		if rec.Type == "user.message" {
 			if text := copilotPromptText(rec); text != "" {
+				out = append(out, UserPrompt{TS: rec.Timestamp, Text: text})
+			}
+			continue
+		}
+
+		// Pi session shape.
+		if isPiMessage(rec) {
+			if text := piPromptText(rec); text != "" {
 				out = append(out, UserPrompt{TS: rec.Timestamp, Text: text})
 			}
 			continue
@@ -449,6 +475,8 @@ func FindPromptBefore(transcriptPath, beforeTS string) string {
 		switch {
 		case rec.Type == "user.message": // Copilot
 			text = copilotPromptText(rec)
+		case isPiMessage(rec): // Pi
+			text = piPromptText(rec)
 		case rec.Type == "user" && rec.Message != nil && rec.Message.Role == "user": // Claude Code
 			text = stringifyContent(rec.Message.Content)
 		default:

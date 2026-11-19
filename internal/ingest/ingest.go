@@ -44,7 +44,7 @@ var editTools = map[string]bool{
 // prompt text is dropped at ingest. Storing it as well would number the
 // session's prompts twice, once by arrival and once by position in the
 // transcript.
-var promptsFromTranscript = map[string]bool{"claude-code": true}
+var promptsFromTranscript = map[string]bool{"claude-code": true, piAgentSlug: true}
 
 // Devin's tool names are lowercase but carry the same tool_input shape as
 // Claude Code's, so they map straight onto the canonical line-range tools.
@@ -124,6 +124,14 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	// tool name is kept under copilot_tool_name.
 	if agentSlug == copilotAgentSlug {
 		payload = normalizeCopilotPayload(payload)
+		if normalized, err := json.Marshal(payload); err == nil {
+			raw = normalized
+		}
+	}
+	// Pi's payload likewise: its built-in edit/write/read/bash calls are stored
+	// under the canonical names, with Pi's own under pi_tool_name (pi.go).
+	if agentSlug == piAgentSlug {
+		payload = normalizePiPayload(payload)
 		if normalized, err := json.Marshal(payload); err == nil {
 			raw = normalized
 		}
@@ -360,9 +368,10 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		}
 	}
 
-	// Stop event: parse the transcript (Claude JSONL, Codex rollout or Copilot
-	// event stream — the hooks pass transcript_path, and Copilot's is found by
-	// session id when they don't) to backfill model + span + token totals.
+	// Stop event: parse the transcript (Claude JSONL, Codex rollout, Copilot
+	// event stream or Pi session file — the hooks pass transcript_path, and
+	// Copilot's is found by session id when they don't) to backfill model +
+	// span + token totals.
 	// Token totals are whole-transcript sums, so plain overwrite is idempotent
 	// across repeated Stops in one session.
 	if eventType == "Stop" && sessionID != "" {

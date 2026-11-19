@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 const (
@@ -49,6 +50,25 @@ func CopilotHooksPath() string { return filepath.Join(CopilotDir(), "hooks", "po
 // CopilotSessionStateDir holds one directory per Copilot CLI session, each
 // with an events.jsonl transcript (model, token usage, prompts, tool calls).
 func CopilotSessionStateDir() string { return filepath.Join(CopilotDir(), "session-state") }
+
+// PiAgentDir is Pi's (pi.dev) configuration directory. PI_CODING_AGENT_DIR
+// relocates it the way Pi itself honours it, "~" included.
+func PiAgentDir() string {
+	if v := os.Getenv("PI_CODING_AGENT_DIR"); v != "" {
+		switch {
+		case v == "~":
+			return Home()
+		case strings.HasPrefix(v, "~/"):
+			return filepath.Join(Home(), v[2:])
+		}
+		return v
+	}
+	return filepath.Join(Home(), ".pi", "agent")
+}
+
+// PiExtensionPath is posthook's own Pi extension. Pi loads every *.ts file in
+// <agent dir>/extensions, so posthook owns this one file outright.
+func PiExtensionPath() string { return filepath.Join(PiAgentDir(), "extensions", "posthook.ts") }
 
 // VSCodeUserDirs lists the VS Code user-data directories that can exist on
 // this platform (stable and Insiders). Copilot Chat writes its per-workspace
