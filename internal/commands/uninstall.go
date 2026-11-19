@@ -119,6 +119,9 @@ type agentTrace struct {
 	name      string
 	path      string
 	uninstall func() (installers.Result, error)
+	// installed overrides the default check (the file mentions posthook's
+	// hook command) for agents whose file posthook owns outright.
+	installed func() bool
 }
 
 // keepDataFiles are the ~/.posthook entries --keep-data preserves: the
@@ -154,13 +157,17 @@ func gatherUninstallPlan(keepData bool) uninstallPlan {
 	}
 
 	for _, a := range []agentTrace{
-		{"Claude Code", paths.ClaudeSettingsPath(), installers.UninstallClaudeCodeHooks},
-		{"Cursor", paths.CursorHooksPath(), installers.UninstallCursorHooks},
-		{"Codex CLI", paths.CodexConfigPath(), installers.UninstallCodexHooks},
-		{"GitHub Copilot", paths.CopilotHooksPath(), installers.UninstallCopilotHooks},
-		{"Pi", paths.PiExtensionPath(), installers.UninstallPiExtension},
+		{name: "Claude Code", path: paths.ClaudeSettingsPath(), uninstall: installers.UninstallClaudeCodeHooks},
+		{name: "Cursor", path: paths.CursorHooksPath(), uninstall: installers.UninstallCursorHooks},
+		{name: "Codex CLI", path: paths.CodexConfigPath(), uninstall: installers.UninstallCodexHooks},
+		{name: "GitHub Copilot", path: paths.CopilotHooksPath(), uninstall: installers.UninstallCopilotHooks},
+		{name: "Pi", path: paths.PiExtensionPath(), uninstall: installers.UninstallPiExtension, installed: installers.PiExtensionInstalled},
 	} {
-		if fileContains(a.path, paths.PosthookMarker) {
+		installed := fileContains(a.path, paths.PosthookMarker)
+		if a.installed != nil {
+			installed = a.installed()
+		}
+		if installed {
 			p.agents = append(p.agents, a)
 		}
 	}

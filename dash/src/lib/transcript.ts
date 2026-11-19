@@ -47,7 +47,8 @@ export function readPrompts(transcriptPath: string): PromptEntry[] {
 }
 
 // One API message's usage, from a Claude Code transcript (one record per
-// assistant message, deduped by message id) or a Codex rollout (token_count
+// assistant message, deduped by message id), a Pi session file (one message
+// entry per model call) or a Codex rollout (token_count
 // events are cumulative; each entry here is the delta from the previous one).
 export interface UsageEntry {
   ts: string;
@@ -62,10 +63,12 @@ export interface UsageEntry {
 
 interface ClaudeUsageRecord {
   type?: string;
+  id?: string;
   timestamp?: string;
   thinkingDurationMs?: number;
   message?: {
     id?: string;
+    role?: string;
     model?: string;
     usage?: {
       input_tokens?: number;
@@ -73,6 +76,12 @@ interface ClaudeUsageRecord {
       cache_read_input_tokens?: number;
       cache_creation_input_tokens?: number;
       output_tokens_details?: { thinking_tokens?: number };
+      // Pi (pi.dev) session files name the same counts differently.
+      input?: number;
+      output?: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      reasoning?: number;
     };
   };
   payload?: {
@@ -126,6 +135,25 @@ export function readUsage(transcriptPath: string): UsageEntry[] | null {
         cache_creation_tokens: u.cache_creation_input_tokens ?? 0,
         thinking_tokens: u.output_tokens_details?.thinking_tokens ?? null,
         thinking_ms: rec.thinkingDurationMs ?? null,
+      });
+      continue;
+    }
+    // Pi: one "message" entry per model call, usage on the assistant
+    // message. usage.input already excludes cache reads and writes.
+    if (rec.type === "message" && rec.message?.role === "assistant" && rec.message.usage) {
+      const id = rec.id ?? `${rec.timestamp}-${out.length}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const u = rec.message.usage;
+      out.push({
+        ts: rec.timestamp,
+        model: rec.message.model ?? null,
+        input_tokens: u.input ?? 0,
+        output_tokens: u.output ?? 0,
+        cache_read_tokens: u.cacheRead ?? 0,
+        cache_creation_tokens: u.cacheWrite ?? 0,
+        thinking_tokens: u.reasoning ?? null,
+        thinking_ms: null,
       });
       continue;
     }

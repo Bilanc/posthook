@@ -30,6 +30,9 @@ func DetectPi() bool {
 }
 
 func renderPiExtension(binaryPath string) (string, error) {
+	if !isPosthookPiExtension(piExtensionTemplate) {
+		return "", fmt.Errorf("pi_extension.ts must start with %q", piExtensionHeader)
+	}
 	quoted, err := json.Marshal(binaryPath)
 	if err != nil {
 		return "", err
@@ -37,10 +40,23 @@ func renderPiExtension(binaryPath string) (string, error) {
 	return strings.Replace(piExtensionTemplate, "__POSTHOOK_BIN__", string(quoted), 1), nil
 }
 
+// piExtensionHeader opens every extension posthook writes (pi_extension.ts),
+// whatever the release or binary path. Ownership is decided by this exact
+// header, not by the file merely mentioning posthook: a posthook.ts the user
+// wrote must never be replaced or deleted.
+const piExtensionHeader = "// posthook ingest --agent pi\n//\n// Installed by `posthook init`"
+
 // isPosthookPiExtension reports whether content is an extension posthook
-// wrote (any release, any binary path).
+// wrote.
 func isPosthookPiExtension(content string) bool {
-	return IsPosthookCommand(content, piAgentSlug)
+	return strings.HasPrefix(content, piExtensionHeader)
+}
+
+// PiExtensionInstalled reports whether posthook's own Pi extension is in
+// place.
+func PiExtensionInstalled() bool {
+	data, err := os.ReadFile(paths.PiExtensionPath())
+	return err == nil && isPosthookPiExtension(string(data))
 }
 
 // InstallPiExtension writes posthook's extension to

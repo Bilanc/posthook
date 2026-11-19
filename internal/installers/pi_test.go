@@ -57,8 +57,8 @@ func TestInstallPiExtension(t *testing.T) {
 	if strings.Contains(src, "__POSTHOOK_BIN__") {
 		t.Error("placeholder left in the installed extension")
 	}
-	if !IsPosthookCommand(src, "pi") {
-		t.Error("installed file does not carry the posthook marker uninstall looks for")
+	if !PiExtensionInstalled() {
+		t.Error("PiExtensionInstalled does not recognise the installed extension")
 	}
 
 	again, err := InstallPiExtension(bin)
@@ -80,10 +80,11 @@ func TestInstallPiExtension(t *testing.T) {
 }
 
 // A posthook.ts that posthook did not write is the user's: never replace or
-// delete it.
+// delete it, even when it mentions posthook ingest (and, like most code,
+// words containing "pi").
 func TestPiExtensionLeavesSomeoneElsesFileAlone(t *testing.T) {
 	isolate(t)
-	mine := "export default function (pi) {}\n"
+	mine := "// My own wrapper: pipes events to `posthook ingest` via an api.\nexport default function (pi) {}\n"
 	mustWrite(t, paths.PiExtensionPath(), mine)
 
 	if _, err := InstallPiExtension(testBin); err == nil {
@@ -91,6 +92,9 @@ func TestPiExtensionLeavesSomeoneElsesFileAlone(t *testing.T) {
 	}
 	if res, err := UninstallPiExtension(); err != nil || res.Changed {
 		t.Errorf("uninstall = %+v, %v; want it to leave the file", res, err)
+	}
+	if PiExtensionInstalled() {
+		t.Error("PiExtensionInstalled reports someone else's file as posthook's")
 	}
 	if data, _ := os.ReadFile(paths.PiExtensionPath()); string(data) != mine {
 		t.Errorf("file changed to:\n%s", data)
