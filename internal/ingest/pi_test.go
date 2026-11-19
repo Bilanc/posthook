@@ -199,24 +199,34 @@ func TestNormalizePiPayloadEditPatch(t *testing.T) {
 	}
 }
 
-func TestAddBOMToFirstLine(t *testing.T) {
+// Pi patches a file's text without its BOM and writes the BOM back, so its
+// patch has to be applied to the text after the BOM, with the BOM put back
+// on whatever line 1 is afterwards. The patches here are the ones Pi 1.5.2
+// produces for these edits.
+func TestApplyPatchToAFileWithABOM(t *testing.T) {
 	const bom = "\uFEFF"
-	hunks := func(oldStart, newStart float64, lines ...any) []any {
-		return []any{map[string]any{"oldStart": oldStart, "newStart": newStart, "lines": lines}}
-	}
 	for _, tc := range []struct {
-		name     string
-		in, want []any
+		name, original, patch, want string
 	}{
-		{"changed first line", hunks(1, 1, "-a", "+A", " b"), hunks(1, 1, "-"+bom+"a", "+"+bom+"A", " b")},
-		{"context first line", hunks(1, 1, " a", "+x"), hunks(1, 1, " "+bom+"a", "+x")},
-		{"line inserted above line 1", hunks(1, 1, "+x", " a"), hunks(1, 1, "+"+bom+"x", " "+bom+"a")},
-		{"hunk below line 1", hunks(5, 5, " e", "-f", "+F"), hunks(5, 5, " e", "-f", "+F")},
+		{"change line 1", bom + "a\nb\n", "@@ -1,2 +1,2 @@\n-a\n+A\n b\n", bom + "A\nb\n"},
+		{"insert above line 1", bom + "a\nb\n", "@@ -1,2 +1,3 @@\n+x\n a\n b\n", bom + "x\na\nb\n"},
+		{"delete line 1", bom + "a\nb\n", "@@ -1,2 +1,1 @@\n-a\n b\n", bom + "b\n"},
+		{"edit below line 1", bom + "A\nb\n", "@@ -1,2 +1,3 @@\n A\n b\n+c\n", bom + "A\nb\nc\n"},
+		{"no BOM", "a\nb\n", "@@ -1,2 +1,3 @@\n+x\n a\n b\n", "x\na\nb\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			addBOMToFirstLine(tc.in)
-			if !reflect.DeepEqual(tc.in, tc.want) {
-				t.Errorf("got %#v\nwant %#v", tc.in, tc.want)
+			resp := normalizePiPayload(map[string]any{
+				"tool_name":     "edit",
+				"tool_input":    map[string]any{"path": "f", "edits": []any{map[string]any{"oldText": "a", "newText": "b"}}},
+				"tool_response": map[string]any{"patch": tc.patch, "originalFile": tc.original},
+			})["tool_response"].(map[string]any)
+			hunks, ok := structuredPatch(resp)
+			if !ok {
+				t.Fatalf("no structured patch in %#v", resp)
+			}
+			got, ok := applyPatch(tc.original, hunks)
+			if !ok || got != tc.want {
+				t.Errorf("applyPatch = %q, %v; want %q", got, ok, tc.want)
 			}
 		})
 	}

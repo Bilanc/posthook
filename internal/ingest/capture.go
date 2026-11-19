@@ -198,7 +198,7 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 		// The patch's line numbers are positions in the file as this edit
 		// left it. That content is known whatever the disk holds by now: the
 		// text a Write carries, or the patch applied to the previous content.
-		switch after, applied := applyHunks(original, hunks); {
+		switch after, applied := applyPatch(original, hunks); {
 		case toolName == "Write" && input.Content != "":
 			fc.snapshotOf(input.Content, firedAt)
 			fc.wrote(fc.change.Ranges)

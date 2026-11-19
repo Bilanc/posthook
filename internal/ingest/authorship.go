@@ -312,6 +312,26 @@ func applyHunks(original string, hunks []lineranges.PatchHunk) (after string, ok
 	return strings.Join(out, "\n") + "\n", true
 }
 
+const utf8BOM = "\uFEFF"
+
+// applyPatch applies a patch to the file it was made against. Some agents
+// make the patch against the file's text without its UTF-8 BOM and write the
+// BOM back after (Pi strips it before matching and patching). When the patch
+// does not fit the file as it is and the file starts with a BOM, it is
+// applied to the text after the BOM and the BOM is put back on the result,
+// as such an agent writes it.
+func applyPatch(original string, hunks []lineranges.PatchHunk) (after string, ok bool) {
+	if after, ok := applyHunks(original, hunks); ok {
+		return after, true
+	}
+	if rest, hadBOM := strings.CutPrefix(original, utf8BOM); hadBOM {
+		if after, ok := applyHunks(rest, hunks); ok {
+			return utf8BOM + after, true
+		}
+	}
+	return "", false
+}
+
 func sameText(a, b string) bool {
 	return strings.TrimSuffix(a, "\r") == strings.TrimSuffix(b, "\r")
 }

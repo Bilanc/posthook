@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -247,39 +248,80 @@ func TestQueuedPiEditsKeepTheirLines(t *testing.T) {
 	}
 }
 
-// A file that starts with a UTF-8 BOM: Pi strips it before matching and
-// patching, then writes it back. The extension sends the file as it was, BOM
-// and all, so the patch's first line has to carry the BOM too, or the
-// rebuilt line 1 never matches the committed one. The second edit leaves
-// the disk different from the first edit's post-image, so that post-image
-// (not the disk) is what the first edit's lines are recorded against.
+// Files that start with a UTF-8 BOM: Pi strips it before matching and
+// patching, then writes it back, so its patches never show it. Two edits are
+// queued each time, so the first edit's lines are recorded against its own
+// rebuilt post-image, not the disk, and that post-image has to carry the BOM
+// on line 1 for the commit to match, including when line 1 is a new line or
+// the old line 1 is gone. The patches are the ones Pi 1.5.2 produces.
 func TestPiEditOfAFileWithABOM(t *testing.T) {
-	_ = store.Close()
-	home := isolateIngest(t)
-	t.Cleanup(func() { _ = store.Close() })
-
 	const bom = "\uFEFF"
-	session := "pi-bom"
-	repo := filepath.Join(home, "repo-pi-bom")
-	initRepo(t, repo)
-	path := filepath.Join(repo, "list.txt")
-	writeFile(t, path, bom+"a\nb\n")
-	gitIn(t, repo, "add", "-A")
-	gitIn(t, repo, "commit", "-q", "-m", "init")
+	type step struct{ before, patch string }
+	for _, tc := range []struct {
+		name     string
+		after    string
+		steps    []step
+		added    int
+		credited int
+	}{
+		{
+			name:  "change line 1, then add a line",
+			after: bom + "A\nb\nc\n",
+			steps: []step{
+				{bom + "a\nb\n", "--- f\n+++ f\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n"},
+				{bom + "A\nb\n", "--- f\n+++ f\n@@ -1,2 +1,3 @@\n A\n b\n+c\n"},
+			},
+			added: 2, credited: 2,
+		},
+		{
+			name:  "insert above line 1, then add a line",
+			after: bom + "x\na\nb\nc\n",
+			steps: []step{
+				{bom + "a\nb\n", "--- f\n+++ f\n@@ -1,2 +1,3 @@\n+x\n a\n b\n"},
+				{bom + "x\na\nb\n", "--- f\n+++ f\n@@ -1,3 +1,4 @@\n x\n a\n b\n+c\n"},
+			},
+			// The BOM moves off "a" onto "x", so git counts "a" as changed
+			// too; neither edit wrote "a", so it stays unattributed.
+			added: 3, credited: 2,
+		},
+		{
+			name:  "delete line 1, then add a line",
+			after: bom + "b\nc\n",
+			steps: []step{
+				{bom + "a\nb\n", "--- f\n+++ f\n@@ -1,2 +1,1 @@\n-a\n b\n"},
+				{bom + "b\n", "--- f\n+++ f\n@@ -1 +1,2 @@\n b\n+c\n"},
+			},
+			// Removing line 1 moves the BOM onto "b", which git counts as a
+			// changed line; neither edit wrote "b", so it stays unattributed.
+			added: 2, credited: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = store.Close()
+			home := isolateIngest(t)
+			t.Cleanup(func() { _ = store.Close() })
 
-	writeFile(t, path, bom+"A\nb\nc\n")
-	edit := func(id, before, patch string, firedAt time.Time) {
-		deliverAt(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
-			"tool_name": "edit", "tool_use_id": id,
-			"tool_input":    map[string]any{"path": "list.txt", "edits": []any{map[string]any{"oldText": "x", "newText": "y"}}},
-			"tool_response": map[string]any{"is_error": false, "patch": patch, "originalFile": before},
-		}), firedAt)
-	}
-	fired := time.Now().Add(-3 * time.Second)
-	edit("t1", bom+"a\nb\n", "--- list.txt\n+++ list.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n", fired)
-	edit("t2", bom+"A\nb\n", "--- list.txt\n+++ list.txt\n@@ -1,2 +1,3 @@\n A\n b\n+c\n", fired.Add(time.Second))
+			session := "pi-bom"
+			repo := filepath.Join(home, "repo-pi-bom")
+			initRepo(t, repo)
+			path := filepath.Join(repo, "list.txt")
+			writeFile(t, path, bom+"a\nb\n")
+			gitIn(t, repo, "add", "-A")
+			gitIn(t, repo, "commit", "-q", "-m", "init")
 
-	if added, attributed := commitAndAttribute(t, repo, session); added != 2 || attributed != 2 {
-		t.Errorf("commit added %d lines, %d attributed to the Pi session; want 2 and 2", added, attributed)
+			writeFile(t, path, tc.after)
+			fired := time.Now().Add(-3 * time.Second)
+			for i, s := range tc.steps {
+				deliverAt(t, piAgentSlug, repo, piEvent("PostToolUse", session, repo, map[string]any{
+					"tool_name": "edit", "tool_use_id": fmt.Sprintf("t%d", i),
+					"tool_input":    map[string]any{"path": "list.txt", "edits": []any{map[string]any{"oldText": "x", "newText": "y"}}},
+					"tool_response": map[string]any{"is_error": false, "patch": s.patch, "originalFile": s.before},
+				}), fired.Add(time.Duration(i)*time.Second))
+			}
+
+			if added, attributed := commitAndAttribute(t, repo, session); added != tc.added || attributed != tc.credited {
+				t.Errorf("commit added %d lines, %d attributed to the Pi session; want %d and %d", added, attributed, tc.added, tc.credited)
+			}
+		})
 	}
 }
