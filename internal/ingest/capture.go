@@ -30,9 +30,11 @@ import (
 // Where the answer comes from, most exact first:
 //
 //  1. Claude Code reports each Edit, MultiEdit and Write as a patch against
-//     the file it read (tool_response.structuredPatch). The patch is used as
-//     is. It is only in the hook payload: TrimPayload drops it before the
-//     event is stored, so it has to be read here.
+//     the file it read (tool_response.structuredPatch), and Pi each edit
+//     (its unified patch, turned into the same shape in pi.go, with the file
+//     as it was before as originalFile). The patch is
+//     used as is. It is only in the hook payload: TrimPayload drops it before
+//     the event is stored, so it has to be read here.
 //  2. An old/new string pair from any other agent is diffed line by line at
 //     the place the new string sits in the file, so the unchanged lines the
 //     agent repeated around its change are not counted.
@@ -180,7 +182,11 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 	if hunks, ok := structuredPatch(resp); ok && (len(hunks) > 0 || toolName == "Write") {
 		switch {
 		case len(hunks) > 0:
-			fc.setChange(lineranges.ChangeFromHunks(hunks), 0)
+			change := lineranges.ChangeFromHunks(hunks)
+			if original, _ := resp["originalFile"].(string); patchOmitsBOM(original, hunks) {
+				bomOnFirstLines(&change, hunks)
+			}
+			fc.setChange(change, 0)
 		case createdFile(resp):
 			fc.setChange(lineranges.DiffChange("", writtenContent(*input, fc.post)), 0)
 		default:
@@ -196,7 +202,7 @@ func captureToolEdit(db *store.DB, path, toolName string, payload map[string]any
 		// The patch's line numbers are positions in the file as this edit
 		// left it. That content is known whatever the disk holds by now: the
 		// text a Write carries, or the patch applied to the previous content.
-		switch after, applied := applyHunks(original, hunks); {
+		switch after, applied := applyPatch(original, hunks); {
 		case toolName == "Write" && input.Content != "":
 			fc.snapshotOf(input.Content, firedAt)
 			fc.wrote(fc.change.Ranges)

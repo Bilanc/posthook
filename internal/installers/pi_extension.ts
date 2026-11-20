@@ -9,7 +9,10 @@
 // commits that ship them:
 //
 //   before_agent_start (a user prompt)  -> UserPromptSubmit  (no prompt text; prompts are read from the session file)
-//   tool_result                         -> PostToolUse       (the tool's name and arguments, never its output)
+//   tool_result                         -> PostToolUse       (the tool's name and arguments, never its output; for an
+//                                                             edit, the whole-line patch Pi computed and the file as it
+//                                                             was before, so posthook can count it exactly; neither is
+//                                                             stored)
 //   agent_settled                       -> Stop              (posthook reads model, tokens and prompts from the session file)
 //
 // Each event runs `posthook ingest --agent pi`, which only writes the event to
@@ -41,16 +44,22 @@ function toolPath(input: any, cwd: string): string | undefined {
 	return isAbsolute(p) ? p : resolve(cwd, p);
 }
 
-// A fingerprint of a file's current state: "missing", or a content hash.
-function fingerprint(path: string): string {
+// A file's current state: a fingerprint ("missing", or a content hash), and
+// for files up to MAX_HASH_BYTES the content itself.
+function readState(path: string): { state: string; content?: Buffer } {
 	try {
 		const st = statSync(path);
-		if (!st.isFile()) return `other:${st.mode}`;
-		if (st.size > MAX_HASH_BYTES) return `stat:${st.size}:${st.mtimeMs}`;
-		return createHash("sha256").update(readFileSync(path)).digest("hex");
+		if (!st.isFile()) return { state: `other:${st.mode}` };
+		if (st.size > MAX_HASH_BYTES) return { state: `stat:${st.size}:${st.mtimeMs}` };
+		const content = readFileSync(path);
+		return { state: createHash("sha256").update(content).digest("hex"), content };
 	} catch {
-		return "missing";
+		return { state: "missing" };
 	}
+}
+
+function fingerprint(path: string): string {
+	return readState(path).state;
 }
 
 type Context = {
@@ -117,13 +126,19 @@ export default function posthook(pi: Api) {
 	// The state of each file an edit or write is about to change, so a failed
 	// call can be checked against the disk: most failures (no match, no
 	// permission) write nothing, but a call cancelled after its write reached
-	// the disk also ends in an error.
-	const before = new Map<string, { path: string; state: string }>();
+	// the disk also ends in an error. For an edit the content is kept too:
+	// its patch is made against it.
+	const before = new Map<string, { path: string; state: string; original?: string }>();
 
 	pi.on("tool_call", (event, ctx) => {
 		if (!FILE_TOOLS.has(event.toolName)) return;
 		const path = toolPath(event.input, ctx.cwd);
-		if (path) before.set(event.toolCallId, { path, state: fingerprint(path) });
+		if (!path) return;
+		const { state, content } = readState(path);
+		// As on disk, BOM included: posthook puts the BOM Pi strips before
+		// patching back on the patch's first line, since Pi writes it back.
+		const original = event.toolName === "edit" && content ? content.toString("utf8") : undefined;
+		before.set(event.toolCallId, { path, state, original });
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -139,7 +154,18 @@ export default function posthook(pi: Api) {
 		payload.tool_name = event.toolName;
 		payload.tool_use_id = event.toolCallId;
 		payload.tool_input = event.input;
-		payload.tool_response = { is_error: Boolean(event.isError) };
+		const response: Record<string, unknown> = { is_error: Boolean(event.isError) };
+		// oldText/newText can cut through lines; the patch Pi built from them
+		// covers whole lines. With the file as it was before the edit,
+		// posthook applies the patch to it, as it does with Claude Code's
+		// originalFile, so the edit's lines keep their author even when a
+		// later edit has moved them by the time posthook reads the file.
+		// Neither is stored.
+		if (event.toolName === "edit" && !event.isError && typeof event.details?.patch === "string") {
+			response.patch = event.details.patch;
+			if (prior?.original !== undefined) response.originalFile = prior.original;
+		}
+		payload.tool_response = response;
 		if (event.parentToolCallId) payload.parent_tool_use_id = event.parentToolCallId;
 		send(payload);
 	});

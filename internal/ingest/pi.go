@@ -2,6 +2,8 @@ package ingest
 
 import (
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/bilanc/posthook/internal/paths"
@@ -26,8 +28,17 @@ const piAgentSlug = "pi"
 //	read  {path, offset?, limit?}               -> Read {file_path, offset?, limit?}
 //	bash  {command, timeout?}                  -> Bash {command, timeout?}
 //
-// Pi's own name is kept under pi_tool_name. Typed prompts, model and token
-// usage come from the Pi session file at Stop (transcript/pi.go).
+// Pi's own name is kept under pi_tool_name. An edit's result also carries the
+// unified patch Pi computed from whole lines (details.patch, sent as
+// tool_response.patch), with the file as it was before the edit
+// (tool_response.originalFile). The patch is turned into Claude Code's
+// structuredPatch, so the edit is counted and placed exactly as Claude
+// Code's are, its post-image rebuilt from originalFile. (oldText/newText are
+// substrings and can cut through lines, which a string diff would credit
+// only in part.) Like every tool_response, both are dropped before the event
+// is stored. Typed
+// prompts, model and token usage come from the Pi session file at Stop
+// (transcript/pi.go).
 
 // normalizePiPayload rewrites a Pi payload in place into the canonical form
 // and returns it. Tools without a canonical counterpart, and edits whose
@@ -45,7 +56,58 @@ func normalizePiPayload(payload map[string]any) map[string]any {
 	payload["pi_tool_name"] = toolName
 	payload["tool_name"] = name
 	payload["tool_input"] = canonical
+	if resp, ok := payload["tool_response"].(map[string]any); ok && toolName == "edit" {
+		if patch, ok := resp["patch"].(string); ok {
+			delete(resp, "patch")
+			if hunks, ok := piPatchHunks(patch); ok {
+				resp["structuredPatch"] = hunks
+			}
+		}
+	}
 	return payload
+}
+
+var piHunkHeader = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
+
+// piPatchHunks reads a unified patch (as Pi's edit tool reports it, with
+// "--- path" / "+++ path" headers) into structuredPatch hunks:
+// {oldStart, newStart, lines}, each line keeping its ' ', '+', '-' or '\'
+// marker. ok is false for a patch with no hunks or a line it cannot place,
+// so a malformed patch is never half-used.
+func piPatchHunks(patch string) ([]any, bool) {
+	var hunks []any
+	var lines []any
+	flush := func() {
+		if hunks != nil {
+			hunks[len(hunks)-1].(map[string]any)["lines"] = lines
+		}
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(patch, "\n"), "\n") {
+		if m := piHunkHeader.FindStringSubmatch(line); m != nil {
+			flush()
+			oldStart, _ := strconv.Atoi(m[1])
+			newStart, _ := strconv.Atoi(m[2])
+			hunks = append(hunks, map[string]any{"oldStart": float64(oldStart), "newStart": float64(newStart)})
+			lines = []any{}
+			continue
+		}
+		if hunks == nil {
+			// File headers come before the first hunk; nothing else may.
+			if strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "Index: ") || strings.HasPrefix(line, "====") {
+				continue
+			}
+			return nil, false
+		}
+		if line == "" || !strings.ContainsRune(" +-\\", rune(line[0])) {
+			return nil, false
+		}
+		lines = append(lines, line)
+	}
+	if hunks == nil {
+		return nil, false
+	}
+	flush()
+	return hunks, true
 }
 
 func canonicalPiTool(toolName string, input map[string]any) (string, map[string]any, bool) {
