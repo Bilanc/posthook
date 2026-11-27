@@ -195,3 +195,54 @@ func TestAResumedDisabledSessionIsDroppedBeforeTheSpool(t *testing.T) {
 		t.Errorf("%d payload(s) in the spool for an unmarked session, want 1", n)
 	}
 }
+
+// A marker older than the retention window has expired whether or not the
+// worker has pruned it: the session is recorded again and the marker goes.
+func TestAnExpiredDisabledSessionIsRecordedAgain(t *testing.T) {
+	isolateIngest(t)
+	t.Setenv("POSTHOOK_RETENTION_DAYS", "1")
+	t.Setenv("POSTHOOK_DISABLE", "1")
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"old-bot"}`, func() { DropAgentEvent("claude-code") })
+	t.Setenv("POSTHOOK_DISABLE", "")
+	marker := disabledSessionMarker("claude-code", "old-bot")
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(marker, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	var wake bool
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"old-bot"}`, func() {
+		var err error
+		if wake, err = HandleAgentHook("claude-code"); err != nil {
+			t.Errorf("the hook failed: %v", err)
+		}
+	})
+	if n, _ := spool.Pending(); n != 1 || !wake {
+		t.Errorf("%d payload(s) spooled, wake %v; want the expired session's event spooled and the worker woken", n, wake)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the expired marker is still there")
+	}
+}
+
+// Nothing is left for the worker by an event that is not recorded, except at
+// a turn's end in a repository.
+func TestHandleAgentHookWakesOnlyWhenThereIsWork(t *testing.T) {
+	isolateIngest(t)
+	hook := func(payload string) bool {
+		var wake bool
+		feedStdin(t, payload, func() { wake, _ = HandleAgentHook("claude-code") })
+		return wake
+	}
+	t.Setenv("POSTHOOK_DISABLE", "1")
+	if hook(`{"hook_event_name":"UserPromptSubmit","session_id":"w"}`) {
+		t.Error("a disabled prompt woke the worker")
+	}
+	t.Setenv("POSTHOOK_DISABLE", "")
+	if hook(`{"hook_event_name":"UserPromptSubmit","session_id":"w","prompt":"resumed"}`) {
+		t.Error("a resumed disabled session's prompt woke the worker")
+	}
+	if !hook(`{"hook_event_name":"UserPromptSubmit","session_id":"someone"}`) {
+		t.Error("a recorded event did not wake the worker")
+	}
+}

@@ -57,23 +57,30 @@ var devinEditTools = map[string]string{
 // so the hook stays fast and can't pile up under tool-call bursts — the worker
 // drains the spool and does the real ingest via ProcessAgentEnvelope.
 func SpoolAgentEvent(agentSlug string) error {
+	_, err := HandleAgentHook(agentSlug)
+	return err
+}
+
+// HandleAgentHook is SpoolAgentEvent, reporting whether it left the worker
+// anything to do: an event in the spool, or a commit job. An event that is not
+// recorded (POSTHOOK_DISABLE=1, or a session that once ran with it) leaves
+// nothing, except the commit job a turn's end queues.
+func HandleAgentHook(agentSlug string) (wake bool, err error) {
 	if AgentEventsDisabled() {
-		DropAgentEvent(agentSlug)
-		return nil
+		return DropAgentEvent(agentSlug), nil
 	}
 	raw, err := readStdin()
 	if err != nil {
-		return err
+		return false, err
 	}
 	// A session that once ran with POSTHOOK_DISABLE=1, resumed without it,
 	// stays unrecorded: its events are dropped here, before anything of them
 	// reaches the spool.
 	if resumedDisabledPayload(agentSlug, raw) {
-		dropPayload(agentSlug, raw)
-		return nil
+		return dropPayload(agentSlug, raw), nil
 	}
 	cwd, _ := os.Getwd()
-	return spool.Write(spool.Envelope{
+	return true, spool.Write(spool.Envelope{
 		Agent:      agentSlug,
 		Cwd:        cwd,
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),

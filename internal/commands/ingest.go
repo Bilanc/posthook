@@ -45,22 +45,18 @@ func newIngestCmd() *cobra.Command {
 			case agent != "":
 				// Watchdog: never let a hook outlive a few seconds.
 				time.AfterFunc(ingestWatchdog, func() { os.Exit(0) })
-				if ingest.AgentEventsDisabled() {
-					// A run that is not recorded: nothing is spooled, so the
-					// worker is only woken for the commit job a turn's end
-					// queues.
-					if ingest.DropAgentEvent(agent) {
-						wakeWorker()
-					}
-					return nil
-				}
-				if err := ingest.SpoolAgentEvent(agent); err != nil {
+				wake, err := ingest.HandleAgentHook(agent)
+				if err != nil {
 					return err
 				}
 				// Kick the background worker so the spooled event gets drained
 				// into the store. Best-effort and near-free when one already
-				// runs; never blocks the hook.
-				wakeWorker()
+				// runs; never blocks the hook. An event that is not recorded
+				// leaves it nothing to do, unless a turn's end queued a
+				// commit job.
+				if wake {
+					wakeWorker()
+				}
 				return nil
 			default:
 				return errors.New("ingest requires either --agent <slug> or --kind git-commit")

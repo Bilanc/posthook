@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/bilanc/posthook/internal/config"
 	"github.com/bilanc/posthook/internal/gitx"
 	"github.com/bilanc/posthook/internal/logx"
 	"github.com/bilanc/posthook/internal/paths"
@@ -44,9 +45,31 @@ func disabledSessionMarker(agentSlug, rawSessionID string) string {
 	return filepath.Join(disabledSessionsDir(), hex.EncodeToString(sum[:16]))
 }
 
+// sessionDisabled reports whether the session ran with POSTHOOK_DISABLE=1 and
+// has been used since within the retention window. A marker older than that
+// is gone whether or not the worker has pruned it yet, so the answer does not
+// depend on when the worker last ran.
 func sessionDisabled(agentSlug, rawSessionID string) bool {
-	_, err := os.Stat(disabledSessionMarker(agentSlug, rawSessionID))
-	return err == nil
+	marker := disabledSessionMarker(agentSlug, rawSessionID)
+	info, err := os.Stat(marker)
+	if err != nil {
+		return false
+	}
+	if ttl := disabledSessionTTL(); ttl > 0 && time.Since(info.ModTime()) > ttl {
+		_ = os.Remove(marker)
+		return false
+	}
+	return true
+}
+
+// disabledSessionTTL is how long a marker lasts without use: the retention
+// window, as for prompts. Zero keeps markers for ever.
+func disabledSessionTTL() time.Duration {
+	cfg, err := config.Load()
+	if err != nil {
+		return 0
+	}
+	return time.Duration(cfg.RetentionDays()) * 24 * time.Hour
 }
 
 // DropAgentEvent handles one hook event of a run that is not recorded: it
