@@ -44,6 +44,9 @@ func newIngestCmd() *cobra.Command {
 				if err := ingest.SpoolAgentEvent(agent); err != nil {
 					return err
 				}
+				if ingest.AgentEventsDisabled() {
+					return nil // nothing spooled, so no worker to wake
+				}
 				// Kick the background worker so the spooled event gets drained
 				// into the store. Best-effort and near-free when one already
 				// runs; never blocks the hook.

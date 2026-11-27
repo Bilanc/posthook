@@ -205,6 +205,7 @@ All installers are idempotent and preserve pre-existing user hooks. Re-running `
 - `POSTHOOK_BIN` — override the binary path written into hook configs (useful for dev installs).
 - `POSTHOOK_DEBUG=1` — verbose stderr logging from every command.
 - `POSTHOOK_NOTES_SYNC=0` — stop the git shadow pushing and fetching `refs/notes/posthook`. Attribution then stays local unless you run `posthook notes push` yourself.
+- `POSTHOOK_DISABLE=1` — don't record agent sessions started with this set. Meant for scripts and bots that run an agent unattended: their prompts aren't stored and their runs don't count as anyone's sessions. Every agent's hook drops its events (Pi's extension sends none). Commits are still recorded.
 - `POSTHOOK_BYPASS=1` — make the git shadow pass straight through. Used internally to prevent recursion; useful manually to run a one-off command under plain-git semantics without uninstalling the shadow.
 - `POSTHOOK_DB` — override the SQLite path the dashboard reads (default `~/.posthook/posthook.db`).
 - `POSTHOOK_DASH_PORT` / `POSTHOOK_DASH_HOSTNAME` — override where `posthook dash` binds (default `127.0.0.1:3847`). Read by both the Go command and the dashboard server so they always agree.

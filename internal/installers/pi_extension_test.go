@@ -215,3 +215,21 @@ func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 		t.Errorf("write tool_response = %#v, want only is_error", got["w1"])
 	}
 }
+
+// With POSTHOOK_DISABLE=1 the extension sends nothing, so a Pi run by a script
+// or bot is never recorded.
+func TestPiExtensionSendsNothingWhenDisabled(t *testing.T) {
+	node := requireNodeTS(t)
+	events := t.TempDir()
+	t.Setenv("POSTHOOK_DISABLE", "1")
+	runPiExtension(t, node, fakePosthook(t, events), `
+		await fire("before_agent_start", {});
+		await fire("tool_call", { toolName: "write", toolCallId: "w1", input: { path: "a.txt", content: "x" } });
+		write("a.txt", "x");
+		await fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: "a.txt", content: "x" }, isError: false });
+		await fire("agent_settled", {});
+	`)
+	if files, _ := filepath.Glob(filepath.Join(events, "*.json")); len(files) != 0 {
+		t.Errorf("sent %d event(s) with POSTHOOK_DISABLE=1, want none", len(files))
+	}
+}

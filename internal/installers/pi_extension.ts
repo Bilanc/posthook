@@ -17,7 +17,8 @@
 //
 // Each event runs `posthook ingest --agent pi`, which only writes the event to
 // a spool file and returns; nothing here waits on it or can fail a Pi run, and
-// the ingest processes never keep Pi from exiting.
+// the ingest processes never keep Pi from exiting. With POSTHOOK_DISABLE=1 in
+// Pi's environment nothing is sent at all.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -76,6 +77,10 @@ type Api = {
 };
 
 export default function posthook(pi: Api) {
+	// POSTHOOK_DISABLE=1: a Pi run by a script or bot is not recorded. Return
+	// before registering anything, so no ingest process is ever started.
+	if (process.env.POSTHOOK_DISABLE === "1") return;
+
 	const pending = new Set<Promise<void>>();
 
 	function send(payload: Record<string, unknown>): void {
