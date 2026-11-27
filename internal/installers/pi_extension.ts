@@ -135,16 +135,20 @@ export default function posthook(pi: Api) {
 	});
 
 	// POSTHOOK_DISABLE=1: a Pi run by a script or bot is not recorded. posthook
-	// is sent no prompt, tool call or file: only the session's id, once, so the
-	// session stays unrecorded if it is resumed without the variable, and the
-	// end of each turn with its directory, so commits made there are still
-	// recorded.
+	// is sent no prompt, tool call or file content: only the session's id and
+	// session file path, once, so the session stays unrecorded if it is resumed
+	// without the variable, and the end of each turn with its directory, so
+	// commits made there are still recorded.
 	if (process.env.POSTHOOK_DISABLE === "1") {
 		const marked = new Set<string>();
 		const minimal = (event: string, ctx: Context): Record<string, unknown> => {
 			const out: Record<string, unknown> = { hook_event_name: event, cwd: ctx.cwd };
 			try {
 				out.session_id = ctx.sessionManager.getSessionId();
+				// Where the session's prompts are kept, so posthook can keep
+				// the session unrecorded for as long as that file exists.
+				const file = ctx.sessionManager.getSessionFile();
+				if (file) out.transcript_path = file;
 			} catch {}
 			return out;
 		};

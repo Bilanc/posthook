@@ -85,7 +85,7 @@ func TestADisabledAgentEventIsNotSpooled(t *testing.T) {
 	entries, _ := os.ReadDir(disabledSessionsDir())
 	for _, e := range entries {
 		if data, _ := os.ReadFile(filepath.Join(disabledSessionsDir(), e.Name())); len(data) != 0 {
-			t.Errorf("a marker holds %q; it must hold nothing", data)
+			t.Errorf("a marker holds %q; with no transcript path given it must hold nothing", data)
 		}
 	}
 }
@@ -196,32 +196,49 @@ func TestAResumedDisabledSessionIsDroppedBeforeTheSpool(t *testing.T) {
 	}
 }
 
-// A marker older than the retention window has expired whether or not the
-// worker has pruned it: the session is recorded again and the marker goes.
-func TestAnExpiredDisabledSessionIsRecordedAgain(t *testing.T) {
-	isolateIngest(t)
+// However long ago it last ran, a disabled session whose transcript still
+// exists stays unrecorded: resuming it would import the unrecorded prompts.
+// Once the transcript is gone the marker is pruned.
+func TestAnOldDisabledSessionStaysUnrecordedWhileItsTranscriptExists(t *testing.T) {
+	_ = store.Close()
+	home := isolateIngest(t)
+	t.Cleanup(func() { _ = store.Close() })
 	t.Setenv("POSTHOOK_RETENTION_DAYS", "1")
+	const session = "pi-old"
+	transcriptPath := filepath.Join(home, ".pi", "agent", "sessions", "old.jsonl")
+	writeFile(t, transcriptPath, piSessionFixture)
 	t.Setenv("POSTHOOK_DISABLE", "1")
-	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"old-bot"}`, func() { DropAgentEvent("claude-code") })
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"`+session+`","transcript_path":"`+transcriptPath+`"}`, func() { DropAgentEvent(piAgentSlug) })
 	t.Setenv("POSTHOOK_DISABLE", "")
-	marker := disabledSessionMarker("claude-code", "old-bot")
-	past := time.Now().Add(-48 * time.Hour)
+	marker := disabledSessionMarker(piAgentSlug, session)
+	past := time.Now().Add(-30 * 24 * time.Hour)
 	if err := os.Chtimes(marker, past, past); err != nil {
 		t.Fatal(err)
 	}
-
-	var wake bool
-	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"old-bot"}`, func() {
-		var err error
-		if wake, err = HandleAgentHook("claude-code"); err != nil {
-			t.Errorf("the hook failed: %v", err)
-		}
-	})
-	if n, _ := spool.Pending(); n != 1 || !wake {
-		t.Errorf("%d payload(s) spooled, wake %v; want the expired session's event spooled and the worker woken", n, wake)
+	if n := PruneDisabledSessions(24 * time.Hour); n != 0 {
+		t.Errorf("pruned %d marker(s) of a session whose transcript exists", n)
 	}
-	if _, err := os.Stat(marker); err == nil {
-		t.Error("the expired marker is still there")
+
+	// Resumed a month later, through the hook and through the worker.
+	stop := `{"hook_event_name":"Stop","session_id":"` + session + `","cwd":"` + home + `","transcript_path":"` + transcriptPath + `"}`
+	feedStdin(t, stop, func() { _ = SpoolAgentEvent(piAgentSlug) })
+	if n, _ := spool.Pending(); n != 0 {
+		t.Errorf("%d payload(s) spooled for the resumed session, want 0", n)
+	}
+	deliver(t, piAgentSlug, home, piEvent("Stop", session, home, map[string]any{"transcript_path": transcriptPath}))
+	db := openDB(t)
+	var prompts, sessions int
+	db.QueryRow(`SELECT COUNT(*) FROM session_prompts WHERE session_id = ?`, session).Scan(&prompts)
+	db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = ?`, session).Scan(&sessions)
+	if prompts+sessions != 0 {
+		t.Errorf("resumed old session recorded: %d session(s), %d prompt(s)", sessions, prompts)
+	}
+
+	if err := os.Remove(transcriptPath); err != nil {
+		t.Fatal(err)
+	}
+	if n := PruneDisabledSessions(24 * time.Hour); n != 1 || sessionDisabled(piAgentSlug, session) {
+		t.Errorf("pruned %d, want the marker of a session whose transcript is gone", n)
 	}
 }
 

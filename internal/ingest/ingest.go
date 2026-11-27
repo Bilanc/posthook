@@ -173,7 +173,11 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		// marker is refreshed and a turn's end still looks for missed
 		// commits.
 		logx.Debugf("ingest --agent %s: session %s ran with POSTHOOK_DISABLE=1, not recorded", agentSlug, rawSessionID)
-		markSessionDisabled(agentSlug, rawSessionID)
+		transcriptPath := pickString(payload, "transcript_path", "transcriptPath")
+		if agentSlug == copilotAgentSlug {
+			transcriptPath = copilotTranscriptPath(transcriptPath, rawSessionID)
+		}
+		markSessionDisabled(agentSlug, rawSessionID, transcriptPath)
 		if eventType == "Stop" {
 			dir := pickString(payload, "cwd")
 			if dir == "" {
