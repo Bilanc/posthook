@@ -2,6 +2,7 @@ package installers
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,9 @@ import (
 
 func requireNodeTS(t *testing.T) string {
 	t.Helper()
+	// An exported POSTHOOK_DISABLE=1 must not leak into the recording tests;
+	// the disabled-path test sets it again itself.
+	t.Setenv("POSTHOOK_DISABLE", "")
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")
@@ -216,20 +220,44 @@ func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 	}
 }
 
-// With POSTHOOK_DISABLE=1 the extension sends nothing, so a Pi run by a script
-// or bot is never recorded.
-func TestPiExtensionSendsNothingWhenDisabled(t *testing.T) {
+// With POSTHOOK_DISABLE=1 the extension sends no prompt, tool call or file:
+// the session's id once, and the end of each turn, each with only the event,
+// session id and cwd.
+func TestPiExtensionSendsOnlyTheSessionWhenDisabled(t *testing.T) {
 	node := requireNodeTS(t)
 	events := t.TempDir()
 	t.Setenv("POSTHOOK_DISABLE", "1")
 	runPiExtension(t, node, fakePosthook(t, events), `
-		await fire("before_agent_start", {});
+		await fire("before_agent_start", { messageType: "user" });
 		await fire("tool_call", { toolName: "write", toolCallId: "w1", input: { path: "a.txt", content: "x" } });
 		write("a.txt", "x");
 		await fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: "a.txt", content: "x" }, isError: false });
 		await fire("agent_settled", {});
+		await fire("before_agent_start", { messageType: "user" });
+		await fire("agent_settled", {});
 	`)
-	if files, _ := filepath.Glob(filepath.Join(events, "*.json")); len(files) != 0 {
-		t.Errorf("sent %d event(s) with POSTHOOK_DISABLE=1, want none", len(files))
+	files, _ := filepath.Glob(filepath.Join(events, "*.json"))
+	counts := map[string]int{}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p map[string]any
+		if err := json.Unmarshal(data, &p); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		for k := range p {
+			if k != "hook_event_name" && k != "session_id" && k != "cwd" {
+				t.Errorf("a disabled run sent %q: %s", k, data)
+			}
+		}
+		if p["session_id"] != "s1" {
+			t.Errorf("event without the session id: %s", data)
+		}
+		counts[fmt.Sprint(p["hook_event_name"])]++
+	}
+	if len(counts) != 2 || counts["UserPromptSubmit"] != 1 || counts["Stop"] != 2 {
+		t.Errorf("sent %v, want the session once (UserPromptSubmit) and each turn's Stop", counts)
 	}
 }

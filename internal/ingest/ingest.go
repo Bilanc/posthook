@@ -56,19 +56,9 @@ var devinEditTools = map[string]string{
 // hand them to the spool, then return. It deliberately does no DB or git work
 // so the hook stays fast and can't pile up under tool-call bursts — the worker
 // drains the spool and does the real ingest via ProcessAgentEnvelope.
-// AgentEventsDisabled reports whether POSTHOOK_DISABLE=1 is set. Scripts and
-// bots that run an agent unattended set it so their runs are not recorded:
-// their prompts are not stored and they don't count as an engineer's
-// sessions. Only agent events are affected; commits are still recorded.
-func AgentEventsDisabled() bool {
-	return os.Getenv("POSTHOOK_DISABLE") == "1"
-}
-
 func SpoolAgentEvent(agentSlug string) error {
 	if AgentEventsDisabled() {
-		// Drain the payload so the agent never sees a broken pipe, and keep
-		// none of it.
-		_, _ = io.Copy(io.Discard, os.Stdin)
+		DropAgentEvent(agentSlug)
 		return nil
 	}
 	raw, err := readStdin()
@@ -159,6 +149,14 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	}
 	eventType := normalizeEventType(rawEventType)
 	rawSessionID := pickString(payload, "session_id", "sessionId")
+	if rawSessionID != "" && sessionDisabled(agentSlug, rawSessionID) {
+		// The session once ran with POSTHOOK_DISABLE=1 and has been resumed
+		// without it. Its transcript still holds the prompts that run kept
+		// out of the store, and a Stop would import them, so none of it is
+		// recorded.
+		logx.Debugf("ingest --agent %s: session %s ran with POSTHOOK_DISABLE=1, not recorded", agentSlug, rawSessionID)
+		return nil
+	}
 	sessionID := ""
 	if rawSessionID != "" {
 		sessionID = resolveSessionID(db, agentSlug, rawSessionID)

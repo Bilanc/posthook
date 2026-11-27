@@ -33,6 +33,8 @@ func isolateIngest(t *testing.T) string {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, ".gitconfig"))
 	t.Setenv("POSTHOOK_BYPASS", "1")
+	// Recording tests must not inherit an exported POSTHOOK_DISABLE=1.
+	t.Setenv("POSTHOOK_DISABLE", "")
 	if err := os.MkdirAll(filepath.Join(home, ".posthook"), 0o755); err != nil {
 		t.Fatal(err)
 	}

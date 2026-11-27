@@ -18,6 +18,10 @@ import (
 // CPU-pileup failure mode.
 const ingestWatchdog = 3 * time.Second
 
+// wakeWorker starts the spool worker if none runs. A variable so tests can
+// see whether the hook woke it.
+var wakeWorker = ensureWorker
+
 func newIngestCmd() *cobra.Command {
 	var (
 		agent    string
@@ -41,16 +45,22 @@ func newIngestCmd() *cobra.Command {
 			case agent != "":
 				// Watchdog: never let a hook outlive a few seconds.
 				time.AfterFunc(ingestWatchdog, func() { os.Exit(0) })
+				if ingest.AgentEventsDisabled() {
+					// A run that is not recorded: nothing is spooled, so the
+					// worker is only woken for the commit job a turn's end
+					// queues.
+					if ingest.DropAgentEvent(agent) {
+						wakeWorker()
+					}
+					return nil
+				}
 				if err := ingest.SpoolAgentEvent(agent); err != nil {
 					return err
-				}
-				if ingest.AgentEventsDisabled() {
-					return nil // nothing spooled, so no worker to wake
 				}
 				// Kick the background worker so the spooled event gets drained
 				// into the store. Best-effort and near-free when one already
 				// runs; never blocks the hook.
-				ensureWorker()
+				wakeWorker()
 				return nil
 			default:
 				return errors.New("ingest requires either --agent <slug> or --kind git-commit")

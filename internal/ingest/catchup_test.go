@@ -145,6 +145,7 @@ func TestCommitCatchUp(t *testing.T) {
 	openDB(t)
 
 	t.Run("a commit made by a git posthook never saw is recorded when the turn ends", func(t *testing.T) { testCatchUpOnStop(t, home) })
+	t.Run("a commit made by a git posthook never saw is recorded when an unrecorded turn ends", func(t *testing.T) { testCatchUpOnDisabledStop(t, home) })
 	t.Run("commits fetched from a teammate are not recorded; a local merge commit is", func(t *testing.T) { testCatchUpSkipsFetched(t, home) })
 	t.Run("commits made before posthook was installed are not recorded", func(t *testing.T) { testCatchUpSkipsPreInstall(t, home) })
 	t.Run("a rebased commit gets its lines and the original gives them up", func(t *testing.T) { testCatchUpRebase(t, home) })
@@ -526,6 +527,36 @@ func testCatchUpOnStop(t *testing.T, home string) {
 	catchUpMu.Unlock()
 	deliver(t, "claude-code", repo, map[string]any{"hook_event_name": "Stop", "session_id": "stop-1", "cwd": repo})
 	wantCommit(t, db, "the commit after the turn ended", sha, 5)
+}
+
+// A run with POSTHOOK_DISABLE=1 records no session, but the end of its turn
+// still has posthook look for commits it missed, through a commit job.
+func testCatchUpOnDisabledStop(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "bot")
+	writeFile(t, filepath.Join(repo, "bot.txt"), numbered(3, "bot %d"))
+	sha := commitAll(t, repo, "bot commit")
+	db := openDB(t)
+	wantNotRecorded(t, db, "the commit before the turn ended", sha)
+
+	t.Setenv("POSTHOOK_DISABLE", "1")
+	var queued bool
+	feedStdin(t, `{"hook_event_name":"Stop","session_id":"bot-turn","cwd":"`+repo+`"}`, func() { queued = DropAgentEvent("claude-code") })
+	t.Setenv("POSTHOOK_DISABLE", "")
+	if !queued {
+		t.Fatal("no commit job was queued for the turn's end")
+	}
+	catchUpMu.Lock()
+	lastCatchUp = map[string]time.Time{}
+	catchUpMu.Unlock()
+	if n, err := spool.DrainCommitJobs(ProcessCommitJob); err != nil || n != 1 {
+		t.Fatalf("drained %d commit job(s) (err %v), want 1", n, err)
+	}
+	wantCommit(t, db, "the commit after the unrecorded turn ended", sha, 0)
+	var sessions int
+	db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = 'bot-turn'`).Scan(&sessions)
+	if sessions != 0 {
+		t.Error("the unrecorded run has a session")
+	}
 }
 
 func testCatchUpSkipsFetched(t *testing.T, home string) {

@@ -49,7 +49,7 @@ func TestHookCommandPrintsNothingAndExitsZero(t *testing.T) {
 	}
 	for name, payload := range payloads {
 		cmd := exec.Command(bin, "ingest", "--agent", "claude-code")
-		cmd.Env = append(os.Environ(), "HOME="+home, "POSTHOOK_DEBUG=")
+		cmd.Env = append(os.Environ(), "HOME="+home, "POSTHOOK_DEBUG=", "POSTHOOK_DISABLE=")
 		cmd.Stdin = strings.NewReader(payload)
 		var stdout bytes.Buffer
 		cmd.Stdout = &stdout
@@ -60,5 +60,70 @@ func TestHookCommandPrintsNothingAndExitsZero(t *testing.T) {
 		if stdout.Len() != 0 {
 			t.Errorf("%s: the hook command printed %q", name, stdout.String())
 		}
+	}
+}
+
+// With POSTHOOK_DISABLE=1 the hook command spools nothing and, for a prompt,
+// does not start the worker: there is nothing for it to do. The end of a turn
+// in a repository queues a commit job and does start it.
+func TestDisabledHookCommandWakesTheWorkerOnlyForATurnsEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin := filepath.Join(t.TempDir(), "posthook")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v: %s", err, out)
+	}
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".posthook"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := filepath.Join(home, ".posthook", "worker.lock")
+	t.Cleanup(func() {
+		data, err := os.ReadFile(lock)
+		if err != nil {
+			return
+		}
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && pid > 1 {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+		}
+	})
+	run := func(payload string) {
+		t.Helper()
+		cmd := exec.Command(bin, "ingest", "--agent", "claude-code")
+		cmd.Env = append(os.Environ(), "HOME="+home, "POSTHOOK_DEBUG=", "POSTHOOK_DISABLE=1")
+		cmd.Stdin = strings.NewReader(payload)
+		var stdout bytes.Buffer
+		cmd.Stdout = &stdout
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("the hook command failed: %v", err)
+		}
+		if stdout.Len() != 0 {
+			t.Errorf("the hook command printed %q", stdout.String())
+		}
+	}
+	spooled := func() []string {
+		files, _ := filepath.Glob(filepath.Join(home, ".posthook", "spool", "*.json"))
+		return files
+	}
+
+	run(`{"hook_event_name":"UserPromptSubmit","session_id":"bot","cwd":"` + home + `","prompt":"an email"}`)
+	if files := spooled(); len(files) != 0 {
+		t.Errorf("spooled %v for a disabled prompt", files)
+	}
+	if _, err := os.Stat(lock); err == nil {
+		t.Error("a disabled prompt started the worker")
+	}
+
+	repo := filepath.Join(home, "repo")
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	run(`{"hook_event_name":"Stop","session_id":"bot","cwd":"` + repo + `"}`)
+	if files := spooled(); len(files) != 0 {
+		t.Errorf("spooled %v for a disabled Stop", files)
+	}
+	if _, err := os.Stat(lock); err != nil {
+		t.Error("a disabled Stop in a repository did not start the worker for its commit job")
 	}
 }
