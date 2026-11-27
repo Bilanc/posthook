@@ -176,6 +176,15 @@ func TestAnOldDisabledSessionStaysUnrecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The retention prune runs in between, as the worker's would, and leaves
+	// the marker alone.
+	if _, err := openDB(t).Prune(store.PruneOptions{OlderThan: 24 * time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if !sessionDisabled(piAgentSlug, session) {
+		t.Fatal("the retention prune removed the marker")
+	}
+
 	// Resumed long after, through the hook and through the worker.
 	stop := `{"hook_event_name":"Stop","session_id":"` + session + `","cwd":"` + home + `","transcript_path":"` + transcriptPath + `"}`
 	feedStdin(t, stop, func() { _ = SpoolAgentEvent(piAgentSlug) })
