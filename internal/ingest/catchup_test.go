@@ -146,6 +146,7 @@ func TestCommitCatchUp(t *testing.T) {
 
 	t.Run("a commit made by a git posthook never saw is recorded when the turn ends", func(t *testing.T) { testCatchUpOnStop(t, home) })
 	t.Run("a commit made by a git posthook never saw is recorded when an unrecorded turn ends", func(t *testing.T) { testCatchUpOnDisabledStop(t, home) })
+	t.Run("a commit made by a git posthook never saw is recorded when a resumed unrecorded session's turn ends", func(t *testing.T) { testCatchUpOnResumedDisabledStop(t, home) })
 	t.Run("commits fetched from a teammate are not recorded; a local merge commit is", func(t *testing.T) { testCatchUpSkipsFetched(t, home) })
 	t.Run("commits made before posthook was installed are not recorded", func(t *testing.T) { testCatchUpSkipsPreInstall(t, home) })
 	t.Run("a rebased commit gets its lines and the original gives them up", func(t *testing.T) { testCatchUpRebase(t, home) })
@@ -556,6 +557,42 @@ func testCatchUpOnDisabledStop(t *testing.T, home string) {
 	db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = 'bot-turn'`).Scan(&sessions)
 	if sessions != 0 {
 		t.Error("the unrecorded run has a session")
+	}
+}
+
+// A session that ran disabled and is resumed without the variable stays
+// unrecorded, but its turns still look for missed commits: in the hook, as a
+// commit job, and in the worker for an event spooled before the marker.
+func testCatchUpOnResumedDisabledStop(t *testing.T, home string) {
+	repo, _ := repoWithRemote(t, home, "resumed")
+	t.Setenv("POSTHOOK_DISABLE", "1")
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"resumed-1","cwd":"`+repo+`"}`, func() { DropAgentEvent("claude-code") })
+	t.Setenv("POSTHOOK_DISABLE", "")
+	db := openDB(t)
+
+	writeFile(t, filepath.Join(repo, "one.txt"), "one\n")
+	first := commitAll(t, repo, "first")
+	feedStdin(t, `{"hook_event_name":"Stop","session_id":"resumed-1","cwd":"`+repo+`"}`, func() { _ = SpoolAgentEvent("claude-code") })
+	catchUpMu.Lock()
+	lastCatchUp = map[string]time.Time{}
+	catchUpMu.Unlock()
+	if n, err := spool.DrainCommitJobs(ProcessCommitJob); err != nil || n != 1 {
+		t.Fatalf("drained %d commit job(s) (err %v), want 1", n, err)
+	}
+	wantCommit(t, db, "the commit of a resumed turn, seen by the hook", first, 0)
+
+	writeFile(t, filepath.Join(repo, "two.txt"), "two\n")
+	second := commitAll(t, repo, "second")
+	catchUpMu.Lock()
+	lastCatchUp = map[string]time.Time{}
+	catchUpMu.Unlock()
+	deliver(t, "claude-code", repo, map[string]any{"hook_event_name": "Stop", "session_id": "resumed-1", "cwd": repo})
+	wantCommit(t, db, "the commit of a resumed turn, seen by the worker", second, 0)
+
+	var sessions int
+	db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE id = 'resumed-1'`).Scan(&sessions)
+	if sessions != 0 {
+		t.Error("the resumed unrecorded session has a session row")
 	}
 }
 

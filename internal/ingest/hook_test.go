@@ -124,6 +124,16 @@ func TestAResumedDisabledSessionIsNotRecorded(t *testing.T) {
 	if sessions+prompts+events != 0 {
 		t.Errorf("resumed session recorded: %d session(s), %d prompt(s), %d event(s)", sessions, prompts, events)
 	}
+	// An event that reached the worker refreshes the marker as the hook does.
+	marker := disabledSessionMarker(piAgentSlug, session)
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(marker, past, past); err != nil {
+		t.Fatal(err)
+	}
+	deliver(t, piAgentSlug, home, piEvent("UserPromptSubmit", session, home, nil))
+	if info, err := os.Stat(marker); err != nil || time.Since(info.ModTime()) > time.Hour {
+		t.Errorf("the worker did not refresh the resumed session's marker (err %v)", err)
+	}
 
 	// Another session is recorded as usual.
 	deliver(t, piAgentSlug, home, piEvent("Stop", "pi-other", home, map[string]any{"transcript_path": transcriptPath}))
@@ -150,5 +160,38 @@ func TestPruneDisabledSessions(t *testing.T) {
 	}
 	if sessionDisabled("claude-code", "old") || !sessionDisabled("claude-code", "new") {
 		t.Error("pruned the wrong marker")
+	}
+}
+
+// A marked session resumed without the variable is dropped by the hook,
+// before its prompt reaches the spool, and its marker is refreshed so it is
+// not pruned while the session is in use.
+func TestAResumedDisabledSessionIsDroppedBeforeTheSpool(t *testing.T) {
+	isolateIngest(t)
+	t.Setenv("POSTHOOK_DISABLE", "1")
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"bot-2"}`, func() { DropAgentEvent("claude-code") })
+	t.Setenv("POSTHOOK_DISABLE", "")
+	marker := disabledSessionMarker("claude-code", "bot-2")
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(marker, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"bot-2","prompt":"a resumed prompt"}`, func() {
+		if err := SpoolAgentEvent("claude-code"); err != nil {
+			t.Errorf("the hook failed: %v", err)
+		}
+	})
+	if n, err := spool.Pending(); err != nil || n != 0 {
+		t.Errorf("%d payload(s) in the spool (err %v), want 0", n, err)
+	}
+	if info, err := os.Stat(marker); err != nil || time.Since(info.ModTime()) > time.Hour {
+		t.Errorf("the resumed session did not refresh its marker (err %v)", err)
+	}
+
+	// Other sessions are spooled as usual.
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"someone"}`, func() { _ = SpoolAgentEvent("claude-code") })
+	if n, _ := spool.Pending(); n != 1 {
+		t.Errorf("%d payload(s) in the spool for an unmarked session, want 1", n)
 	}
 }

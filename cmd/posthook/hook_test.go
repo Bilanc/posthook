@@ -9,6 +9,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // The hook command as an agent runs it: `posthook ingest --agent <slug>` with
@@ -123,7 +124,22 @@ func TestDisabledHookCommandWakesTheWorkerOnlyForATurnsEnd(t *testing.T) {
 	if files := spooled(); len(files) != 0 {
 		t.Errorf("spooled %v for a disabled Stop", files)
 	}
-	if _, err := os.Stat(lock); err != nil {
-		t.Error("a disabled Stop in a repository did not start the worker for its commit job")
+	// The worker ran and took the commit job: the commit spool empties.
+	jobs := filepath.Join(home, ".posthook", "spool", "commits")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		files, _ := os.ReadDir(jobs)
+		if len(files) == 0 && fileExists(jobs) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the commit job for a disabled Stop was not processed (spool: %d file(s))", len(files))
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

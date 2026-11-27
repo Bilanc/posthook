@@ -59,23 +59,18 @@ func DropAgentEvent(agentSlug string) (queued bool) {
 	if err != nil || len(raw) == 0 {
 		return false
 	}
-	var payload map[string]any
-	if json.Unmarshal(raw, &payload) != nil {
+	return dropPayload(agentSlug, raw)
+}
+
+// dropPayload keeps none of raw: it refreshes the session's marker and, at
+// the end of a turn, queues a commit job for the repository.
+func dropPayload(agentSlug string, raw []byte) (queued bool) {
+	payload := parseHookPayload(agentSlug, raw)
+	if payload == nil {
 		return false
 	}
-	if agentSlug == copilotAgentSlug {
-		payload = normalizeCopilotPayload(payload)
-	}
 	if session := pickString(payload, "session_id", "sessionId"); session != "" {
-		marker := disabledSessionMarker(agentSlug, session)
-		if err := os.MkdirAll(disabledSessionsDir(), 0o755); err == nil {
-			// Created, or touched so pruning keeps it while it is in use.
-			if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-				f.Close()
-				now := time.Now()
-				_ = os.Chtimes(marker, now, now)
-			}
-		}
+		markSessionDisabled(agentSlug, session)
 	}
 	if normalizeEventType(pickString(payload, "hook_event_name", "event", "type")) != "Stop" {
 		return false
@@ -96,6 +91,48 @@ func DropAgentEvent(agentSlug string) (queued bool) {
 		return false
 	}
 	return true
+}
+
+func parseHookPayload(agentSlug string, raw []byte) map[string]any {
+	var payload map[string]any
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	if agentSlug == copilotAgentSlug {
+		payload = normalizeCopilotPayload(payload)
+	}
+	return payload
+}
+
+// markSessionDisabled creates the session's marker, or refreshes it: every
+// event of the session, recorded or not, keeps it from being pruned while
+// the session is in use.
+func markSessionDisabled(agentSlug, rawSessionID string) {
+	marker := disabledSessionMarker(agentSlug, rawSessionID)
+	if err := os.MkdirAll(disabledSessionsDir(), 0o755); err != nil {
+		return
+	}
+	if f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		f.Close()
+		now := time.Now()
+		_ = os.Chtimes(marker, now, now)
+	}
+}
+
+// resumedDisabledPayload reports whether raw belongs to a session that ran
+// with POSTHOOK_DISABLE=1 and is running again without it. The marker
+// directory only exists once something ran disabled, so until then this
+// costs one stat and the payload is not parsed.
+func resumedDisabledPayload(agentSlug string, raw []byte) bool {
+	if _, err := os.Stat(disabledSessionsDir()); err != nil {
+		return false
+	}
+	payload := parseHookPayload(agentSlug, raw)
+	if payload == nil {
+		return false
+	}
+	session := pickString(payload, "session_id", "sessionId")
+	return session != "" && sessionDisabled(agentSlug, session)
 }
 
 // PruneDisabledSessions removes the markers of sessions that have not run

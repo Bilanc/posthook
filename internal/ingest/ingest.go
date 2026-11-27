@@ -65,6 +65,13 @@ func SpoolAgentEvent(agentSlug string) error {
 	if err != nil {
 		return err
 	}
+	// A session that once ran with POSTHOOK_DISABLE=1, resumed without it,
+	// stays unrecorded: its events are dropped here, before anything of them
+	// reaches the spool.
+	if resumedDisabledPayload(agentSlug, raw) {
+		dropPayload(agentSlug, raw)
+		return nil
+	}
 	cwd, _ := os.Getwd()
 	return spool.Write(spool.Envelope{
 		Agent:      agentSlug,
@@ -154,7 +161,23 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		// without it. Its transcript still holds the prompts that run kept
 		// out of the store, and a Stop would import them, so none of it is
 		// recorded.
+		// The hook drops these before spooling; this catches an event
+		// spooled before the session's marker was written. As there, the
+		// marker is refreshed and a turn's end still looks for missed
+		// commits.
 		logx.Debugf("ingest --agent %s: session %s ran with POSTHOOK_DISABLE=1, not recorded", agentSlug, rawSessionID)
+		markSessionDisabled(agentSlug, rawSessionID)
+		if eventType == "Stop" {
+			dir := pickString(payload, "cwd")
+			if dir == "" {
+				dir = env.Cwd
+			}
+			if root := gitx.FindRepoRoot(dir); root != "" {
+				if _, err := CatchUpRepo(root); err != nil {
+					logx.Warnf("commit catch-up failed in %s: %v", root, err)
+				}
+			}
+		}
 		return nil
 	}
 	sessionID := ""
