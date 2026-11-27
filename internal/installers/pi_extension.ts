@@ -17,7 +17,9 @@
 //
 // Each event runs `posthook ingest --agent pi`, which only writes the event to
 // a spool file and returns; nothing here waits on it or can fail a Pi run, and
-// the ingest processes never keep Pi from exiting.
+// the ingest processes never keep Pi from exiting. With POSTHOOK_DISABLE=1 in
+// Pi's environment the run is not recorded and only a session id and the end
+// of each turn are sent.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -118,6 +120,45 @@ export default function posthook(pi: Api) {
 		return out;
 	}
 
+	// `pi -p` exits as soon as the run ends: give the last events a moment to
+	// reach posthook.
+	pi.on("session_shutdown", async () => {
+		if (pending.size === 0) return;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			Promise.all([...pending]),
+			new Promise((resolve) => {
+				timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
+			}),
+		]);
+		clearTimeout(timer);
+	});
+
+	// POSTHOOK_DISABLE=1: a Pi run by a script or bot is not recorded. posthook
+	// is sent no prompt, tool call or file: only the session's id, once, so the
+	// session stays unrecorded if it is resumed without the variable, and the
+	// end of each turn with its directory, so commits made there are still
+	// recorded.
+	if (process.env.POSTHOOK_DISABLE === "1") {
+		const marked = new Set<string>();
+		const minimal = (event: string, ctx: Context): Record<string, unknown> => {
+			const out: Record<string, unknown> = { hook_event_name: event, cwd: ctx.cwd };
+			try {
+				out.session_id = ctx.sessionManager.getSessionId();
+			} catch {}
+			return out;
+		};
+		pi.on("before_agent_start", (_event, ctx) => {
+			const payload = minimal("UserPromptSubmit", ctx);
+			const id = String(payload.session_id ?? "");
+			if (marked.has(id)) return;
+			marked.add(id);
+			send(payload);
+		});
+		pi.on("agent_settled", (_event, ctx) => send(minimal("Stop", ctx)));
+		return;
+	}
+
 	pi.on("before_agent_start", (event, ctx) => {
 		if (event?.messageType !== "user") return;
 		send(base("UserPromptSubmit", ctx));
@@ -176,17 +217,4 @@ export default function posthook(pi: Api) {
 		send(payload);
 	});
 
-	// `pi -p` exits as soon as the run ends: give the last events a moment to
-	// reach posthook.
-	pi.on("session_shutdown", async () => {
-		if (pending.size === 0) return;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		await Promise.race([
-			Promise.all([...pending]),
-			new Promise((resolve) => {
-				timer = setTimeout(resolve, FLUSH_TIMEOUT_MS);
-			}),
-		]);
-		clearTimeout(timer);
-	});
 }

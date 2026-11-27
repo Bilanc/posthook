@@ -29,7 +29,8 @@ import (
 // So at two moments posthook looks for what it missed in a repository:
 //
 //   - when an agent turn ends (Stop), in every repository the session worked
-//     in;
+//     in (for a run that is not recorded, in the repository it ran in:
+//     see DropAgentEvent);
 //   - when the shadow sees `git push`, for the repository being pushed (the
 //     shadow lists the commits and the worker does the rest).
 //
@@ -88,7 +89,15 @@ func UnpushedCommitsArgs() []string {
 // the pushed commits gets their notes without waiting for the next push.
 // Best-effort, like all notes transport: a failure leaves them for that next
 // push.
+//
+// A job with no commits was queued when a turn ended in a run that is not
+// recorded (POSTHOOK_DISABLE=1): it looks for what posthook missed in that
+// repository, as a recorded turn's Stop does.
 func ProcessCommitJob(job spool.CommitJob) error {
+	if len(job.SHAs) == 0 {
+		_, err := CatchUpRepo(job.RepoRoot)
+		return err
+	}
 	before := notesTip(job.RepoRoot)
 	_, err := RecordMissingCommits(job.RepoRoot, job.SHAs)
 	if job.NotesRemote != "" && notes.Enabled() {

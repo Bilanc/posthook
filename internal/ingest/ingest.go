@@ -57,12 +57,30 @@ var devinEditTools = map[string]string{
 // so the hook stays fast and can't pile up under tool-call bursts — the worker
 // drains the spool and does the real ingest via ProcessAgentEnvelope.
 func SpoolAgentEvent(agentSlug string) error {
+	_, err := HandleAgentHook(agentSlug)
+	return err
+}
+
+// HandleAgentHook is SpoolAgentEvent, reporting whether it left the worker
+// anything to do: an event in the spool, or a commit job. An event that is not
+// recorded (POSTHOOK_DISABLE=1, or a session that once ran with it) leaves
+// nothing, except the commit job a turn's end queues.
+func HandleAgentHook(agentSlug string) (wake bool, err error) {
+	if AgentEventsDisabled() {
+		return DropAgentEvent(agentSlug), nil
+	}
 	raw, err := readStdin()
 	if err != nil {
-		return err
+		return false, err
+	}
+	// A session that once ran with POSTHOOK_DISABLE=1, resumed without it,
+	// stays unrecorded: its events are dropped here, before anything of them
+	// reaches the spool.
+	if resumedDisabledPayload(agentSlug, raw) {
+		return dropPayload(agentSlug, raw), nil
 	}
 	cwd, _ := os.Getwd()
-	return spool.Write(spool.Envelope{
+	return true, spool.Write(spool.Envelope{
 		Agent:      agentSlug,
 		Cwd:        cwd,
 		ReceivedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -145,6 +163,28 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 	}
 	eventType := normalizeEventType(rawEventType)
 	rawSessionID := pickString(payload, "session_id", "sessionId")
+	if rawSessionID != "" && sessionDisabled(agentSlug, rawSessionID) {
+		// The session once ran with POSTHOOK_DISABLE=1 and has been resumed
+		// without it. Its transcript still holds the prompts that run kept
+		// out of the store, and a Stop would import them, so none of it is
+		// recorded.
+		// The hook drops these before spooling; this catches an event
+		// spooled before the session's marker was written. As there, a
+		// turn's end still looks for missed commits.
+		logx.Debugf("ingest --agent %s: session %s ran with POSTHOOK_DISABLE=1, not recorded", agentSlug, rawSessionID)
+		if eventType == "Stop" {
+			dir := pickString(payload, "cwd")
+			if dir == "" {
+				dir = env.Cwd
+			}
+			if root := gitx.FindRepoRoot(dir); root != "" {
+				if _, err := CatchUpRepo(root); err != nil {
+					logx.Warnf("commit catch-up failed in %s: %v", root, err)
+				}
+			}
+		}
+		return nil
+	}
 	sessionID := ""
 	if rawSessionID != "" {
 		sessionID = resolveSessionID(db, agentSlug, rawSessionID)
