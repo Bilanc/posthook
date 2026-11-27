@@ -85,7 +85,7 @@ func TestADisabledAgentEventIsNotSpooled(t *testing.T) {
 	entries, _ := os.ReadDir(disabledSessionsDir())
 	for _, e := range entries {
 		if data, _ := os.ReadFile(filepath.Join(disabledSessionsDir(), e.Name())); len(data) != 0 {
-			t.Errorf("a marker holds %q; with no transcript path given it must hold nothing", data)
+			t.Errorf("a marker holds %q; it must hold nothing", data)
 		}
 	}
 }
@@ -124,16 +124,6 @@ func TestAResumedDisabledSessionIsNotRecorded(t *testing.T) {
 	if sessions+prompts+events != 0 {
 		t.Errorf("resumed session recorded: %d session(s), %d prompt(s), %d event(s)", sessions, prompts, events)
 	}
-	// An event that reached the worker refreshes the marker as the hook does.
-	marker := disabledSessionMarker(piAgentSlug, session)
-	past := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(marker, past, past); err != nil {
-		t.Fatal(err)
-	}
-	deliver(t, piAgentSlug, home, piEvent("UserPromptSubmit", session, home, nil))
-	if info, err := os.Stat(marker); err != nil || time.Since(info.ModTime()) > time.Hour {
-		t.Errorf("the worker did not refresh the resumed session's marker (err %v)", err)
-	}
 
 	// Another session is recorded as usual.
 	deliver(t, piAgentSlug, home, piEvent("Stop", "pi-other", home, map[string]any{"transcript_path": transcriptPath}))
@@ -143,40 +133,13 @@ func TestAResumedDisabledSessionIsNotRecorded(t *testing.T) {
 	}
 }
 
-// Markers go once they are older than the window, and are kept while their
-// session runs.
-func TestPruneDisabledSessions(t *testing.T) {
-	isolateIngest(t)
-	t.Setenv("POSTHOOK_DISABLE", "1")
-	for _, id := range []string{"old", "new"} {
-		feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"`+id+`"}`, func() { DropAgentEvent("claude-code") })
-	}
-	past := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(disabledSessionMarker("claude-code", "old"), past, past); err != nil {
-		t.Fatal(err)
-	}
-	if n := PruneDisabledSessions(24 * time.Hour); n != 1 {
-		t.Errorf("pruned %d, want 1", n)
-	}
-	if sessionDisabled("claude-code", "old") || !sessionDisabled("claude-code", "new") {
-		t.Error("pruned the wrong marker")
-	}
-}
-
 // A marked session resumed without the variable is dropped by the hook,
-// before its prompt reaches the spool, and its marker is refreshed so it is
-// not pruned while the session is in use.
+// before its prompt reaches the spool.
 func TestAResumedDisabledSessionIsDroppedBeforeTheSpool(t *testing.T) {
 	isolateIngest(t)
 	t.Setenv("POSTHOOK_DISABLE", "1")
 	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"bot-2"}`, func() { DropAgentEvent("claude-code") })
 	t.Setenv("POSTHOOK_DISABLE", "")
-	marker := disabledSessionMarker("claude-code", "bot-2")
-	past := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(marker, past, past); err != nil {
-		t.Fatal(err)
-	}
-
 	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"bot-2","prompt":"a resumed prompt"}`, func() {
 		if err := SpoolAgentEvent("claude-code"); err != nil {
 			t.Errorf("the hook failed: %v", err)
@@ -184,9 +147,6 @@ func TestAResumedDisabledSessionIsDroppedBeforeTheSpool(t *testing.T) {
 	})
 	if n, err := spool.Pending(); err != nil || n != 0 {
 		t.Errorf("%d payload(s) in the spool (err %v), want 0", n, err)
-	}
-	if info, err := os.Stat(marker); err != nil || time.Since(info.ModTime()) > time.Hour {
-		t.Errorf("the resumed session did not refresh its marker (err %v)", err)
 	}
 
 	// Other sessions are spooled as usual.
@@ -196,10 +156,10 @@ func TestAResumedDisabledSessionIsDroppedBeforeTheSpool(t *testing.T) {
 	}
 }
 
-// However long ago it last ran, a disabled session whose transcript still
-// exists stays unrecorded: resuming it would import the unrecorded prompts.
-// Once the transcript is gone the marker is pruned.
-func TestAnOldDisabledSessionStaysUnrecordedWhileItsTranscriptExists(t *testing.T) {
+// However long ago it ran, a disabled session stays unrecorded: its
+// transcript can outlive any retention window, and resuming it would import
+// the unrecorded prompts.
+func TestAnOldDisabledSessionStaysUnrecorded(t *testing.T) {
 	_ = store.Close()
 	home := isolateIngest(t)
 	t.Cleanup(func() { _ = store.Close() })
@@ -208,18 +168,15 @@ func TestAnOldDisabledSessionStaysUnrecordedWhileItsTranscriptExists(t *testing.
 	transcriptPath := filepath.Join(home, ".pi", "agent", "sessions", "old.jsonl")
 	writeFile(t, transcriptPath, piSessionFixture)
 	t.Setenv("POSTHOOK_DISABLE", "1")
-	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"`+session+`","transcript_path":"`+transcriptPath+`"}`, func() { DropAgentEvent(piAgentSlug) })
+	feedStdin(t, `{"hook_event_name":"UserPromptSubmit","session_id":"`+session+`"}`, func() { DropAgentEvent(piAgentSlug) })
 	t.Setenv("POSTHOOK_DISABLE", "")
 	marker := disabledSessionMarker(piAgentSlug, session)
-	past := time.Now().Add(-30 * 24 * time.Hour)
+	past := time.Now().Add(-400 * 24 * time.Hour)
 	if err := os.Chtimes(marker, past, past); err != nil {
 		t.Fatal(err)
 	}
-	if n := PruneDisabledSessions(24 * time.Hour); n != 0 {
-		t.Errorf("pruned %d marker(s) of a session whose transcript exists", n)
-	}
 
-	// Resumed a month later, through the hook and through the worker.
+	// Resumed long after, through the hook and through the worker.
 	stop := `{"hook_event_name":"Stop","session_id":"` + session + `","cwd":"` + home + `","transcript_path":"` + transcriptPath + `"}`
 	feedStdin(t, stop, func() { _ = SpoolAgentEvent(piAgentSlug) })
 	if n, _ := spool.Pending(); n != 0 {
@@ -233,12 +190,8 @@ func TestAnOldDisabledSessionStaysUnrecordedWhileItsTranscriptExists(t *testing.
 	if prompts+sessions != 0 {
 		t.Errorf("resumed old session recorded: %d session(s), %d prompt(s)", sessions, prompts)
 	}
-
-	if err := os.Remove(transcriptPath); err != nil {
-		t.Fatal(err)
-	}
-	if n := PruneDisabledSessions(24 * time.Hour); n != 1 || sessionDisabled(piAgentSlug, session) {
-		t.Errorf("pruned %d, want the marker of a session whose transcript is gone", n)
+	if info, err := os.Stat(marker); err != nil || info.Size() != 0 || info.Mode().Perm() != 0o600 {
+		t.Errorf("marker should be an empty owner-only file: %v %v", info, err)
 	}
 }
 

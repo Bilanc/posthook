@@ -189,12 +189,6 @@ func pruneIfDue() {
 		logx.Debugf("worker: dropped %d stale edit-state row(s)", removed)
 	}
 	days := cfg.RetentionDays()
-	// Sessions that ran with POSTHOOK_DISABLE=1 are remembered while their
-	// transcript exists; ones with no known transcript for the retention
-	// window. Runs whether or not event retention is on.
-	if n := ingest.PruneDisabledSessions(time.Duration(days) * 24 * time.Hour); n > 0 {
-		logx.Debugf("worker: forgot %d unrecorded session(s)", n)
-	}
 	if days == 0 {
 		return
 	}

@@ -169,15 +169,9 @@ func ProcessAgentEnvelope(env spool.Envelope) error {
 		// out of the store, and a Stop would import them, so none of it is
 		// recorded.
 		// The hook drops these before spooling; this catches an event
-		// spooled before the session's marker was written. As there, the
-		// marker is refreshed and a turn's end still looks for missed
-		// commits.
+		// spooled before the session's marker was written. As there, a
+		// turn's end still looks for missed commits.
 		logx.Debugf("ingest --agent %s: session %s ran with POSTHOOK_DISABLE=1, not recorded", agentSlug, rawSessionID)
-		transcriptPath := pickString(payload, "transcript_path", "transcriptPath")
-		if agentSlug == copilotAgentSlug {
-			transcriptPath = copilotTranscriptPath(transcriptPath, rawSessionID)
-		}
-		markSessionDisabled(agentSlug, rawSessionID, transcriptPath)
 		if eventType == "Stop" {
 			dir := pickString(payload, "cwd")
 			if dir == "" {

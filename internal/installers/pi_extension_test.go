@@ -222,7 +222,7 @@ func TestPiExtensionSendsTheEditPatch(t *testing.T) {
 
 // With POSTHOOK_DISABLE=1 the extension sends no prompt, tool call or file:
 // the session's id once, and the end of each turn, each with only the event,
-// session id, session file path and cwd.
+// session id and cwd.
 func TestPiExtensionSendsOnlyTheSessionWhenDisabled(t *testing.T) {
 	node := requireNodeTS(t)
 	events := t.TempDir()
@@ -248,12 +248,12 @@ func TestPiExtensionSendsOnlyTheSessionWhenDisabled(t *testing.T) {
 			t.Fatalf("%s: %v", f, err)
 		}
 		for k := range p {
-			if k != "hook_event_name" && k != "session_id" && k != "cwd" && k != "transcript_path" {
+			if k != "hook_event_name" && k != "session_id" && k != "cwd" {
 				t.Errorf("a disabled run sent %q: %s", k, data)
 			}
 		}
-		if p["session_id"] != "s1" || p["transcript_path"] == nil {
-			t.Errorf("event without the session id and file: %s", data)
+		if p["session_id"] != "s1" {
+			t.Errorf("event without the session id: %s", data)
 		}
 		counts[fmt.Sprint(p["hook_event_name"])]++
 	}
